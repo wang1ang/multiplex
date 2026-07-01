@@ -5,3 +5,8 @@ __pycache__/
 # docs (not committed for now)
 PLAN.md
 m0-interfaces.html
+
+# local-only launcher
+serve-webui.sh
+open-webui.log
+.webui_secret_key
