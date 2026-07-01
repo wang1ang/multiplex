@@ -21,45 +21,14 @@ import os
 import json
 import time
 import uuid
-from http.server import BaseHTTPRequestHandler, HTTPServer
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-import mlx.core as mx
-
-from .engine import Engine
-from .mtp import Drafter, speculative_generate_batch
+from .hub import Hub
 
 
-# --- core: one internal generate bridge every endpoint shares -----------------
-class _Backend:
-    """Owns the engine + drafter. Turns (prompt_ids, params) into a token stream.
-
-    TEMP serialization: the server is single-threaded (HTTPServer), so requests
-    are processed one at a time — that IS the temporary queue. MLX's GPU stream
-    is thread-bound, which also forces single-threaded here. L3/L4 replaces this
-    with real batched scheduling.
-    """
-
-    def __init__(self, model_path: str, mtp_path: str, bits: int | None = 4):
-        self.eng = Engine(model_path)
-        self.drafter = Drafter(self.eng, mtp_path, bits=bits)
-        self.model_id = model_path.rstrip("/").split("/")[-1]
-
-    def prompt_ids(self, messages: list[dict]) -> list[int]:
-        return self.eng.tokenizer.apply_chat_template(
-            messages, add_generation_prompt=True
-        )
-
-    def stream_text(self, prompt_ids, max_tokens, k=1):
-        """Yield decoded text deltas for one request."""
-        produced, shown = [], ""
-        for _row_ids, step in speculative_generate_batch(
-            self.eng, self.drafter, [prompt_ids], max_tokens=max_tokens, k=k
-        ):
-            produced.extend(step[0])   # single request here -> always row 0
-            full = self.eng.decode(produced)
-            if full != shown:
-                yield full[len(shown):]
-                shown = full
+# The backend is the L4 Hub: it runs the scheduler on one engine thread and lets
+# many HTTP handler threads submit requests + drain their text streams. So the
+# HTTP server can be multi-threaded (handlers only touch queues, never MLX).
 
 
 def _hex(prefix):
@@ -160,7 +129,7 @@ def _responses_body(backend, text):
 
 
 # --- HTTP handler -------------------------------------------------------------
-def make_handler(backend: _Backend):
+def make_handler(backend: Hub):
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
             pass
@@ -219,8 +188,8 @@ def make_handler(backend: _Backend):
 
 
 def serve(model_path: str, mtp_path: str, host="127.0.0.1", port=8000, bits=4):
-    backend = _Backend(model_path, mtp_path, bits=bits)
-    httpd = HTTPServer((host, port), make_handler(backend))
+    backend = Hub(model_path, mtp_path, bits=bits)
+    httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
           f"(/v1/chat/completions, /v1/responses, /v1/models)]")
     httpd.serve_forever()

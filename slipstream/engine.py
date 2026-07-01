@@ -152,26 +152,44 @@ class Engine:
             c.filter(keep)
         state.lengths = [state.lengths[i] for i in keep]
 
+    def extract_row(self, state: BatchState, i: int) -> BatchState:
+        """Pull row ``i`` out of a batched state into its own single-row state,
+        WITHOUT modifying ``state`` (each cache layer's extract(i) copies the
+        row). Used to peel a freshly-prefilled request out of a prefill group."""
+        cache = [c.extract(i) for c in state.cache]
+        return BatchState(cache=cache, lengths=[state.lengths[i]])
+
     def merge_states(self, states: list[BatchState]) -> BatchState:
         """Merge several single-row states into one batched state (for "入":
-        adding a freshly-prefilled request into the running batch).
+        adding freshly-prefilled requests into the running batch).
 
-        Attention (BatchKVCache): rows may have different lengths, so left-pad
-        every row's KV to the max length (records per-row left_padding).
-        SSM (ArraysCache): recurrent state is fixed-size regardless of length, so
-        just stack along the batch dim — no alignment needed.
+        Attention: rows may differ in length, so left-pad every row's KV to the
+        max length (per-row left_padding). SSM (ArraysCache): recurrent state is
+        fixed-size, so just stack along the batch dim.
         """
         nlayers = len(states[0].cache)
         merged = []
         for li in range(nlayers):
-            layer_caches = [s.cache[li] for s in states]
-            merged.append(self._merge_layer(layer_caches))
+            merged.append(self._merge_layer([s.cache[li] for s in states]))
         lengths = [s.lengths[0] for s in states]
         return BatchState(cache=merged, lengths=lengths)
 
+    @staticmethod
+    def _row_view(c):
+        """Return (valid_keys, valid_values, length) for a SINGLE-row attention
+        cache, skipping any existing left_padding. Handles both a plain KVCache
+        (from extract; scalar offset, no padding) and a 1-row BatchKVCache (from
+        a prior merge; [1] offset with left_padding)."""
+        off = c.offset
+        if hasattr(off, "shape") and off.shape:      # BatchKVCache (1 row)
+            pad = int(c.left_padding[0])
+            end = int(c._idx)
+            return c.keys[:, :, pad:end, :], c.values[:, :, pad:end, :], end - pad
+        n = int(off)                                  # plain KVCache
+        return c.keys[..., :n, :], c.values[..., :n, :], n
+
     def _merge_layer(self, caches):
         if isinstance(caches[0], ArraysCache):
-            # SSM: stack each state tensor along batch dim (fixed size).
             out = ArraysCache(len(caches[0].cache))
             out.cache = [
                 mx.concatenate([c.cache[si] for c in caches], axis=0)
@@ -179,8 +197,9 @@ class Engine:
                 for si in range(len(caches[0].cache))
             ]
             return out
-        # Attention BatchKVCache: left-pad each row's KV to the max length.
-        lengths = [int(c.offset[0]) for c in caches]
+        # Attention: left-pad each row's valid KV to the max length.
+        views = [self._row_view(c) for c in caches]
+        lengths = [v[2] for v in views]
         max_len = max(lengths)
         B = len(caches)
         k0 = caches[0].keys
@@ -188,9 +207,9 @@ class Engine:
         keys = mx.zeros((B, H, max_len, Dk), dtype=k0.dtype)
         values = mx.zeros((B, H, max_len, Dv), dtype=k0.dtype)
         padding = [max_len - n for n in lengths]
-        for i, (p, c) in enumerate(zip(padding, caches)):
-            keys[i:i + 1, :, p:p + lengths[i]] = c.keys[..., :lengths[i], :]
-            values[i:i + 1, :, p:p + lengths[i]] = c.values[..., :lengths[i], :]
+        for i, (vk, vv, n) in enumerate(views):
+            keys[i:i + 1, :, padding[i]:padding[i] + n] = vk
+            values[i:i + 1, :, padding[i]:padding[i] + n] = vv
         out = BatchKVCache(padding)
         out.keys, out.values = keys, values
         out.offset = out.offset + max_len
