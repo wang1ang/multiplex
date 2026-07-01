@@ -19,9 +19,10 @@ Correctness facts (verified by experiment):
     pure floating-point accumulation (batch reduction order differs from B=1).
     This is inherent to batched inference — NOT a bug — and both trajectories are
     valid samples. It shows up only after many steps as an occasional token flip.
-  * The cache is ours to trim: ``rollback(state, keep)`` shrinks each row's
-    cache. Attention layers trim; SSM layers can't yet (see rollback()) — a
-    real MTP verify path will need SSM-state rollback too.
+  * The cache is ours to roll back for speculative verify: ``snapshot_ssm`` /
+    ``restore_ssm`` save & restore SSM recurrent state (it can't be trimmed),
+    and ``trim_attention`` trims attention KV. Together they undo a rejected
+    verify forward.
 """
 
 from __future__ import annotations
@@ -68,22 +69,23 @@ class Engine:
     def eos_token_ids(self) -> set[int]:
         return set(self.tokenizer.eos_token_ids)
 
-    # --- batched forward primitives ---
-    def prefill(self, prompts: list[list[int]]) -> tuple[BatchState, mx.array]:
-        """Prefill B prompts. Returns (state, logits).
+    def logits(self, hidden: mx.array) -> mx.array:
+        """Trunk lm_head over hidden -> logits ``[..., vocab]``."""
+        return self.model.language_model.lm_head(hidden)
 
-        ``logits`` is ``[B, max_len, vocab]``; row i's next-token logits are at
-        position ``lengths[i]-1`` (prompts are right-padded to max_len). The
-        caller samples — the engine doesn't.
+    # --- batched forward primitives (always [B, ...]; B=1 is just a batch of 1) ---
+    def prefill(self, prompts: list[list[int]]) -> tuple[BatchState, mx.array]:
+        """Prefill B prompts. Returns (state, hidden ``[B, max_len, H]``).
+
+        Row i's next-token hidden is at position ``lengths[i]-1`` (prompts are
+        right-padded to max_len). Returns pre-lm_head hidden; get logits with
+        ``logits(hidden)``. The caller samples — the engine doesn't.
         """
-        B = len(prompts)
         lengths = [len(p) for p in prompts]
         max_len = max(lengths)
         padding = [max_len - n for n in lengths]
-
-        cache = _make_cache(self.model, [0] * B, None)
+        cache = _make_cache(self.model, [0] * len(prompts), None)
         tokens = _right_pad_prompts(prompts, max_length=max_len)
-
         for c in cache:
             c.prepare(lengths=lengths, right_padding=padding)
             # mlx-lm bug: _make_cache sets ArraysCache.left_padding = [0,...],
@@ -93,47 +95,50 @@ class Engine:
             # masks the pad positions. (padding=0 -> masks nothing, still correct.)
             if isinstance(c, ArraysCache):
                 c.left_padding = None
-
-        logits = self.model(tokens, cache=cache)
-
+        h = self.model.language_model.model(tokens, cache=cache)
         for c in cache:
             c.finalize()
-
-        state = BatchState(cache=cache, lengths=list(lengths))
-        return state, logits
+        return BatchState(cache=cache, lengths=list(lengths)), h
 
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:
-        """Feed ``tokens`` (``[B, k]``) for every row and return ``[B, k, vocab]``.
+        """Feed ``tokens`` (``[B, k]``) per row, return hidden ``[B, k, H]``.
 
-        AR is k=1; speculative verify is k>1. The engine returns ALL k positions'
-        logits — it does not slice to the last one, does not sample. The cache
-        advances by k for every row; use ``rollback`` afterwards to discard
-        positions the caller rejected.
+        k=1 is AR; k>1 is speculative verify. Returns ALL k positions' hidden
+        (pre-lm_head; use ``logits()``); does not slice or sample. Advances the
+        cache by k; use snapshot/trim to discard rejected positions.
         """
         k = int(tokens.shape[1])
-        logits = self.model(tokens, cache=state.cache)
+        h = self.model.language_model.model(tokens, cache=state.cache)
         state.lengths = [n + k for n in state.lengths]
-        return logits
+        return h
 
-    def rollback(self, state: BatchState, keep: list[int]) -> None:
-        """Drop the last tokens so row i keeps ``keep[i]`` positions.
+    def snapshot_ssm(self, state: BatchState) -> list:
+        """Clone the SSM (ArraysCache) recurrent state of every SSM layer.
 
-        Discards rejected speculative tokens. All rows drop the same count (the
-        batched cache trims uniformly) — the take-min speculative scheme
-        guarantees it, since all rows commit the min accepted length.
-
-        SSM (ArraysCache) recurrent-state rollback is not implemented yet, so
-        this raises if the cache has SSM layers. It must be solved before MTP
-        verify can use rollback.
+        SSM state can't be trimmed (it evolves sequentially), so speculative
+        verify saves it here and restores after. Attention layers are skipped
+        (they trim instead). The clone forces evaluation off the lazy graph
+        (``v + 0``) so later cache writes don't mutate the snapshot.
         """
-        drop = [old - new for old, new in zip(state.lengths, keep)]
-        if len(set(drop)) != 1:
-            raise ValueError(f"rollback needs equal drop per row, got {drop}")
-        n = drop[0]
+        snap = []
+        for c in state.cache:
+            if isinstance(c, ArraysCache):
+                snap.append([None if v is None else v + 0 for v in c.cache])
+            else:
+                snap.append(None)
+        return snap
+
+    def restore_ssm(self, state: BatchState, snap: list) -> None:
+        """Write a snapshot_ssm() result back into the SSM layers."""
+        for c, s in zip(state.cache, snap):
+            if s is not None:
+                c.cache = [None if v is None else v + 0 for v in s]
+
+    def trim_attention(self, state: BatchState, n: int) -> None:
+        """Trim n positions off every attention (KVCache) layer. SSM layers are
+        left untouched — restore them with restore_ssm()."""
         if n <= 0:
             return
         for c in state.cache:
-            if isinstance(c, ArraysCache):
-                raise NotImplementedError("SSM-layer rollback not implemented")
-            c.trim(n)
-        state.lengths = list(keep)
+            if not isinstance(c, ArraysCache):
+                c.trim(n)
