@@ -15,6 +15,7 @@ the result. It does NOT decide single-vs-batch or AR-vs-speculative — the batc
 entry handles 1..N rows uniformly.
 """
 
+import os
 import argparse
 import sys
 import time
@@ -23,7 +24,7 @@ import mlx.core as mx
 from slipstream.engine import Engine
 from slipstream.mtp import Drafter, speculative_generate_batch
 
-MODEL = "~/.mtplx/models/Agents-A1-MTPLX"
+MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
 MTP = MODEL + "/mtp.safetensors"
 
 

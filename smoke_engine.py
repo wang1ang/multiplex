@@ -11,11 +11,12 @@ Verifies:
 Run:  python smoke_engine.py [model_path]
 """
 
+import os
 import sys
 import mlx.core as mx
 from slipstream.engine import Engine
 
-DEFAULT_MODEL = "~/.mtplx/models/Agents-A1-MTPLX"
+DEFAULT_MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
 N = 12
 
 

@@ -17,6 +17,7 @@ with it directly (no async bridge).
 
 from __future__ import annotations
 
+import os
 import json
 import time
 import uuid
@@ -228,7 +229,7 @@ def serve(model_path: str, mtp_path: str, host="127.0.0.1", port=8000, bits=4):
 if __name__ == "__main__":
     import argparse
 
-    MODEL = "~/.mtplx/models/Agents-A1-MTPLX"
+    MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--mtp", default=MODEL + "/mtp.safetensors")
