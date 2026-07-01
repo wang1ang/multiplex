@@ -63,7 +63,8 @@ class Engine:
         return self.tokenizer.encode(text)
 
     def decode(self, token_ids: list[int]) -> str:
-        return self.tokenizer.decode(token_ids)
+        # skip_special_tokens drops <|im_end|>/<|endoftext|> etc from the text.
+        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
 
     @property
     def eos_token_ids(self) -> set[int]:
