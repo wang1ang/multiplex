@@ -48,9 +48,11 @@ def run(eng, drafter, prompts, cfg):
     t0 = time.time()
     if B > 1:
         print(f"--- prompt 1: {prompts[0][:50]!r}")
-    for step in speculative_generate_batch(eng, drafter, ids, max_tokens=cfg["n"], k=cfg["k"]):
-        for i in range(B):
-            produced[i].extend(step[i])
+    for row_ids, step in speculative_generate_batch(
+        eng, drafter, ids, max_tokens=cfg["n"], k=cfg["k"]
+    ):
+        for rid, toks in zip(row_ids, step):    # rid = original prompt index
+            produced[rid].extend(toks)
         full = eng.decode(produced[0])          # stream row 0
         if full != shown:
             print(full[len(shown):], end="", flush=True)

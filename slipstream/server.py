@@ -52,10 +52,10 @@ class _Backend:
     def stream_text(self, prompt_ids, max_tokens, k=1):
         """Yield decoded text deltas for one request."""
         produced, shown = [], ""
-        for step in speculative_generate_batch(
+        for _row_ids, step in speculative_generate_batch(
             self.eng, self.drafter, [prompt_ids], max_tokens=max_tokens, k=k
         ):
-            produced.extend(step[0])
+            produced.extend(step[0])   # single request here -> always row 0
             full = self.eng.decode(produced)
             if full != shown:
                 yield full[len(shown):]

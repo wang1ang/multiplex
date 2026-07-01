@@ -143,3 +143,11 @@ class Engine:
         for c in state.cache:
             if not isinstance(c, ArraysCache):
                 c.trim(n)
+
+    def filter(self, state: BatchState, keep: list[int]) -> None:
+        """Keep only rows ``keep`` (by row index) in the batched cache; drop the
+        rest. Used to remove finished (EOS) rows so the batch shrinks. Every cache
+        layer (BatchKVCache / ArraysCache) supports filter(indices)."""
+        for c in state.cache:
+            c.filter(keep)
+        state.lengths = [state.lengths[i] for i in keep]
