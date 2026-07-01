@@ -1,0 +1,16 @@
+[project]
+name = "slipstream"
+version = "0.0.0"
+description = "Local LLM inference framework on mlx-lm: MTP speculative decoding with yieldable scheduling."
+requires-python = ">=3.10"
+dependencies = [
+    "mlx>=0.20",
+    "mlx-lm>=0.31",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+include = ["slipstream*"]

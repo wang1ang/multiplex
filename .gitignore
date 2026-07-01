@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+# docs (not committed for now)
+PLAN.md
+m0-interfaces.html
