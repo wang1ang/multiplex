@@ -10,3 +10,7 @@ m0-interfaces.html
 serve-webui.sh
 open-webui.log
 .webui_secret_key
+# build artifacts
+dist/
+build/
+*.egg-info/

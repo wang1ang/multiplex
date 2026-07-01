@@ -1,0 +1,6 @@
+# Core runtime (engine / speculative decoding / scheduler / HTTP server)
+mlx>=0.20
+mlx-lm>=0.31
+
+# Optional: interactive REPL (try_engine.py) only
+prompt_toolkit>=3.0
