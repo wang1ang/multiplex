@@ -1,28 +1,30 @@
-"""Interactive REPL to feel batched speculative decoding. Loads the model once.
+"""Interactive REPL for the dynamic-batch scheduler — test "入" (mid-flight join).
 
-    python try_engine.py [--model PATH] [--raw] [-n N] [-d DEPTH]
+    python try_engine.py [--model PATH] [--raw] [-n N] [-d DEPTH] [--debug]
 
--d is the draft depth k (tokens drafted per step); d=0 is pure AR (no draft).
+A fixed input box sits at the bottom (like most CLIs); generated text scrolls
+above it. Type a prompt + Enter to start; type another WHILE it runs to add it
+into the live batch (that's "入"). :q or Ctrl-C quits.
 
-Enter prompts one per line; a BLANK line runs them together (batched speculative,
-take-min aligned). Greedy; each row's output == plain AR. Commands:
-    :n <int>   set max tokens
-    :raw       toggle chat-template on/off
-    :q         quit
-
-This layer only feeds prompts to the batched speculative entry point and shows
-the result. It does NOT decide single-vs-batch or AR-vs-speculative — the batch
-entry handles 1..N rows uniformly.
+Drives slipstream.scheduler.Scheduler: new requests are chunk-prefilled and
+merged into the running batch. -d = draft depth k (0 = pure AR).
 """
 
 import os
 import argparse
-import sys
-import time
+import asyncio
 
 import mlx.core as mx
+from prompt_toolkit import Application
+from prompt_toolkit.buffer import Buffer
+from prompt_toolkit.layout import Layout, HSplit, Window
+from prompt_toolkit.layout.controls import BufferControl
+from prompt_toolkit.key_binding import KeyBindings
+from prompt_toolkit.document import Document
+
 from slipstream.engine import Engine
-from slipstream.mtp import Drafter, speculative_generate_batch
+from slipstream.mtp import Drafter
+from slipstream.scheduler import Scheduler
 
 MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
 MTP = MODEL + "/mtp.safetensors"
@@ -36,84 +38,90 @@ def to_ids(eng, text, raw):
     )
 
 
-def run(eng, drafter, prompts, cfg):
-    """Speculative decode for 1..N prompts — one parallel batch, streamed.
-
-    Streams row 0 live (token by token as steps arrive); other rows accumulate
-    and print when done."""
-    ids = [to_ids(eng, p, cfg["raw"]) for p in prompts]
-    B = len(prompts)
-    produced = [[] for _ in range(B)]
-    shown = ""
-    t0 = time.time()
-    if B > 1:
-        print(f"--- prompt 1: {prompts[0][:50]!r}")
-    for row_ids, step in speculative_generate_batch(
-        eng, drafter, ids, max_tokens=cfg["n"], k=cfg["k"]
-    ):
-        for rid, toks in zip(row_ids, step):    # rid = original prompt index
-            produced[rid].extend(toks)
-        full = eng.decode(produced[0])          # stream row 0
-        if full != shown:
-            print(full[len(shown):], end="", flush=True)
-            shown = full
-    print()
-    dt = time.time() - t0
-    for i in range(1, B):
-        print(f"--- prompt {i + 1}: {prompts[i][:50]!r}")
-        print(eng.decode(produced[i]))
-        print()
-    total = sum(len(p) for p in produced)
-    print(f"[{total} tok, {dt:.1f}s, {total/dt:.1f} tok/s]", file=sys.stderr)
-
-
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=MODEL)
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=8192)
-    ap.add_argument("-d", "--depth", type=int, default=1,
-                    help="draft depth k (tokens drafted per step)")
+    ap.add_argument("-d", "--depth", type=int, default=1)
+    ap.add_argument("--debug", action="store_true")
     args = ap.parse_args()
 
+    print("[loading model + MTP head...]")
     eng = Engine(args.model)
-    print(f"[loaded in {eng.load_seconds:.1f}s, loading MTP head...]")
     drafter = Drafter(eng, MTP, bits=4)
+    sch = Scheduler(eng, drafter, k=args.depth, chunk=512, debug=args.debug)
 
-    cfg = {"n": args.max_tokens, "raw": args.raw, "k": args.depth}
-    buf = []
+    prompts = {}         # rid -> prompt text
+    produced_text = {}   # rid -> decoded output so far
+    output_lines = [""]
 
-    while True:
+    # output shown via a read-only Buffer: putting the cursor at the end makes
+    # the window auto-scroll to the bottom (follow latest output).
+    output_buf = Buffer(read_only=True)
+
+    def render():
+        lines = ["[Type a prompt + Enter. Add more while it runs (入). :q quits.]", ""]
+        for rid in sorted(produced_text):
+            lines.append(f"--- req{rid}: {prompts.get(rid, '')[:50]!r}")
+            lines.extend(produced_text[rid].split("\n"))
+            lines.append("")
+        text = "\n".join(lines)
+        output_buf.set_document(
+            Document(text, cursor_position=len(text)), bypass_readonly=True
+        )
+
+    # --- UI: scrolling output on top, fixed input box at bottom ---
+    output_win = Window(content=BufferControl(buffer=output_buf), wrap_lines=True)
+    input_buf = Buffer(multiline=False)
+    input_win = Window(content=BufferControl(buffer=input_buf), height=1)
+    layout = Layout(
+        HSplit([output_win, Window(height=1, char="─"), input_win]),
+        focused_element=input_win,
+    )
+
+    def add(text):
+        rid = sch.add(to_ids(eng, text, args.raw), args.max_tokens)
+        prompts[rid] = text
+        produced_text[rid] = ""
+        render()
+
+    kb = KeyBindings()
+
+    @kb.add("enter")
+    def _(event):
+        text = input_buf.text.strip()
+        input_buf.reset()
+        if text == ":q":
+            event.app.exit()
+        elif text:
+            add(text)
+
+    @kb.add("c-c")
+    def _(event):
+        event.app.exit()
+
+    app = Application(layout=layout, key_bindings=kb, full_screen=True,
+                      mouse_support=True, refresh_interval=0.1)
+
+    async def driver():
+        # one scheduler step per loop iteration; yield to the UI between steps
+        while True:
+            if sch.active():
+                for rid, toks in sch.step():
+                    produced_text[rid] = produced_text.get(rid, "") + eng.decode(toks)
+                render()
+                app.invalidate()
+            await asyncio.sleep(0.001)
+
+    async def run_app():
+        task = asyncio.create_task(driver())
         try:
-            line = input(f"{len(buf) + 1}> ")
-        except (EOFError, KeyboardInterrupt):
-            print()
-            break
+            await app.run_async()
+        finally:
+            task.cancel()
 
-        if line.strip() == "":
-            if buf:
-                run(eng, drafter, buf, cfg)
-                buf = []
-            continue
-
-        s = line.strip()
-        if s in (":q", ":quit", ":exit"):
-            break
-        if s in (":help", ":h"):
-            print(__doc__)
-            continue
-        if s == ":raw":
-            cfg["raw"] = not cfg["raw"]
-            print(f"[raw={cfg['raw']}]")
-            continue
-        if s.startswith(":n "):
-            cfg["n"] = int(s[3:]); continue
-        if s.startswith(":"):
-            print(f"[unknown command {s!r}; :help for list]")
-            continue
-
-        buf.append(line)
-
+    asyncio.run(run_app())
     return 0
 
 

@@ -34,7 +34,7 @@ from typing import Any
 import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import _make_cache, _right_pad_prompts
-from mlx_lm.models.cache import ArraysCache
+from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 
 @dataclass
@@ -151,3 +151,48 @@ class Engine:
         for c in state.cache:
             c.filter(keep)
         state.lengths = [state.lengths[i] for i in keep]
+
+    def merge_states(self, states: list[BatchState]) -> BatchState:
+        """Merge several single-row states into one batched state (for "入":
+        adding a freshly-prefilled request into the running batch).
+
+        Attention (BatchKVCache): rows may have different lengths, so left-pad
+        every row's KV to the max length (records per-row left_padding).
+        SSM (ArraysCache): recurrent state is fixed-size regardless of length, so
+        just stack along the batch dim — no alignment needed.
+        """
+        nlayers = len(states[0].cache)
+        merged = []
+        for li in range(nlayers):
+            layer_caches = [s.cache[li] for s in states]
+            merged.append(self._merge_layer(layer_caches))
+        lengths = [s.lengths[0] for s in states]
+        return BatchState(cache=merged, lengths=lengths)
+
+    def _merge_layer(self, caches):
+        if isinstance(caches[0], ArraysCache):
+            # SSM: stack each state tensor along batch dim (fixed size).
+            out = ArraysCache(len(caches[0].cache))
+            out.cache = [
+                mx.concatenate([c.cache[si] for c in caches], axis=0)
+                if caches[0].cache[si] is not None else None
+                for si in range(len(caches[0].cache))
+            ]
+            return out
+        # Attention BatchKVCache: left-pad each row's KV to the max length.
+        lengths = [int(c.offset[0]) for c in caches]
+        max_len = max(lengths)
+        B = len(caches)
+        k0 = caches[0].keys
+        H, Dk, Dv = k0.shape[1], k0.shape[3], caches[0].values.shape[3]
+        keys = mx.zeros((B, H, max_len, Dk), dtype=k0.dtype)
+        values = mx.zeros((B, H, max_len, Dv), dtype=k0.dtype)
+        padding = [max_len - n for n in lengths]
+        for i, (p, c) in enumerate(zip(padding, caches)):
+            keys[i:i + 1, :, p:p + lengths[i]] = c.keys[..., :lengths[i], :]
+            values[i:i + 1, :, p:p + lengths[i]] = c.values[..., :lengths[i], :]
+        out = BatchKVCache(padding)
+        out.keys, out.values = keys, values
+        out.offset = out.offset + max_len
+        out._idx = max_len
+        return out
