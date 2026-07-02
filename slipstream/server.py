@@ -1,18 +1,17 @@
 """L5 — HTTP / OpenAI-compatible layer. PROTOCOL TRANSLATION ONLY.
 
-Translates HTTP requests <-> an internal (prompt_ids, params) request and back
-to JSON / SSE. It does NOT schedule, batch, or manage cache — those belong to
-L3/L4 (not written yet). Until then a single lock serializes requests (TEMP,
-replace with L3/L4).
+Translates HTTP requests <-> internal (prompt_ids, tools, params) and back to
+JSON / SSE. It does NOT schedule, batch, or manage cache: requests go to the L4
+Hub, which runs the L3 scheduler on one engine thread and serves many HTTP
+handler threads concurrently. Tool-call text <-> structured tool_calls is
+handled by the bridge layer.
 
-Endpoints (each a different wire format, all translating to the same internal
-generate call):
+Endpoints (each a different wire format, all funneled to the same Hub):
   * POST /v1/chat/completions   — classic Chat Completions (+ SSE)
   * POST /v1/responses          — OpenAI Responses API (what Codex uses; +SSE)
   * GET  /v1/models
 
-Sync stdlib http.server: the engine is a sync generator, so a sync server pairs
-with it directly (no async bridge).
+Sync stdlib http.server pairs with the Hub's blocking text queues directly.
 """
 
 from __future__ import annotations
@@ -267,7 +266,7 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
-          bits=4, debug=False):
+          debug=False):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
     if mtp_path is None:
@@ -275,7 +274,7 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
     elif not os.path.exists(mtp_path):
         mtp_path = None
     print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
-    backend = Hub(model_path, mtp_path, bits=bits, debug=debug)
+    backend = Hub(model_path, mtp_path, debug=debug)
     httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
           f"(/v1/chat/completions, /v1/responses, /v1/models)]")

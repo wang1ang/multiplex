@@ -50,7 +50,7 @@ def main() -> int:
     mtp = find_mtp(entry.path)
     print(f"[loading {entry.name}{' + MTP head' if mtp else ' (headless, pure AR)'}...]")
     eng = Engine(entry.path)
-    drafter = Drafter(eng, mtp, bits=4) if mtp else None
+    drafter = Drafter(eng, mtp) if mtp else None
     sch = Scheduler(eng, drafter, k=args.depth, chunk=512, debug=args.debug)
 
     prompts = {}         # rid -> prompt text

@@ -87,7 +87,7 @@ def main():
     global _DR
     model_path = sys.argv[1] if len(sys.argv) > 1 else MODEL
     eng = Engine(model_path)
-    _DR = Drafter(eng, model_path + "/mtp.safetensors", bits=4)
+    _DR = Drafter(eng, model_path + "/mtp.safetensors")
     enc = eng.encode
     N = 20
     ok = True
@@ -127,7 +127,7 @@ def main():
     ok &= check("story (long)", got[1], ref["story"])
 
     print("5) hub: concurrent submits from many threads == each solo")
-    hub = Hub(model_path, model_path + "/mtp.safetensors", bits=4, k=0)
+    hub = Hub(model_path, model_path + "/mtp.safetensors", k=0)
     results = {}
 
     def worker(name):

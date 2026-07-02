@@ -28,9 +28,9 @@ _DONE = object()   # sentinel pushed to a request's queue when it finishes
 
 
 class Hub:
-    def __init__(self, model_path, mtp_path, *, bits=4, k=1, chunk=512, debug=False):
+    def __init__(self, model_path, mtp_path, *, k=1, chunk=512, debug=False):
         self.model_id = model_path.rstrip("/").split("/")[-1]
-        self._cfg = dict(model_path=model_path, mtp_path=mtp_path, bits=bits,
+        self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug)
         self._lock = threading.Lock()
         self._incoming = []                       # [Req] submitted, not yet added
@@ -80,7 +80,7 @@ class Hub:
         c = self._cfg
         self.eng = Engine(c["model_path"])
         # No MTP head path -> run pure AR (scheduler forces k=0).
-        self.drafter = (Drafter(self.eng, c["mtp_path"], bits=c["bits"])
+        self.drafter = (Drafter(self.eng, c["mtp_path"])
                         if c["mtp_path"] is not None else None)
         self._sched = Scheduler(self.eng, self.drafter,
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"])
