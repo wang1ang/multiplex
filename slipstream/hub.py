@@ -45,8 +45,8 @@ class Hub:
         self._ready.wait()
 
     # --- API side (any HTTP thread) -----------------------------------------
-    def prompt_ids(self, messages):
-        return self.eng.apply_chat_template(messages)
+    def prompt_ids(self, messages, tools=None):
+        return self.eng.apply_chat_template(messages, tools=tools)
 
     def stream_text(self, prompt_ids, max_tokens):
         """Yield decoded text deltas for one request until it finishes."""

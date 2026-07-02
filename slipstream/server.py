@@ -23,8 +23,18 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
+from .bridge import extract_tool_calls_with_thinking
 from .engine import find_mtp
 from .hub import Hub
+
+
+def _split_tool_calls(text, tools):
+    """Parse the model's generated text into (visible_text, tool_calls). Only
+    attempts parsing when tools were offered; returns [] calls otherwise."""
+    if not tools:
+        return text, []
+    res = extract_tool_calls_with_thinking("", text, None, tools)
+    return res.cleaned_text, res.tool_calls or []
 
 
 # The backend is the L4 Hub: it runs the scheduler on one engine thread and lets
@@ -114,23 +124,36 @@ def _responses_stream(backend, prompt_ids, max_tokens):
 
 
 # --- non-stream bodies --------------------------------------------------------
-def _chat_body(backend, text):
+def _chat_body(backend, text, tool_calls=None):
+    message = {"role": "assistant", "content": text or None}
+    if tool_calls:
+        message["tool_calls"] = tool_calls
     return {
         "id": _hex("chatcmpl-"), "object": "chat.completion",
         "created": int(time.time()), "model": backend.model_id,
-        "choices": [{"index": 0, "finish_reason": "stop",
-                     "message": {"role": "assistant", "content": text}}],
+        "choices": [{"index": 0,
+                     "finish_reason": "tool_calls" if tool_calls else "stop",
+                     "message": message}],
     }
 
 
-def _responses_body(backend, text):
-    mid = _hex("msg_")
+def _responses_body(backend, text, tool_calls=None):
+    # Responses uses separate output items: a message for text, a function_call
+    # item per tool call (call_id/name/arguments), mirroring llama.cpp's mapping.
+    output = []
+    if text:
+        output.append({"id": _hex("msg_"), "type": "message", "role": "assistant",
+                       "status": "completed",
+                       "content": [{"type": "output_text", "text": text, "annotations": []}]})
+    for c in tool_calls or []:
+        fn = c.get("function") or {}
+        output.append({"type": "function_call", "status": "completed",
+                       "call_id": "fc_" + str(c.get("id") or ""),
+                       "name": fn.get("name") or "",
+                       "arguments": fn.get("arguments") or ""})
     return {
         "id": _hex("resp_"), "object": "response", "created_at": int(time.time()),
-        "status": "completed", "model": backend.model_id,
-        "output": [{"id": mid, "type": "message", "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": text, "annotations": []}]}],
+        "status": "completed", "model": backend.model_id, "output": output,
     }
 
 
@@ -171,22 +194,25 @@ def make_handler(backend: Hub):
             max_tokens = int(body.get("max_output_tokens")
                              or body.get("max_tokens") or 2048)
 
+            tools = body.get("tools")
             if path == "/v1/chat/completions":
                 msgs = _messages_from_chat(body)
-                ids = backend.prompt_ids(msgs)
+                ids = backend.prompt_ids(msgs, tools)
                 if stream:
                     self._sse_stream(_chat_stream(backend, ids, max_tokens))
                 else:
                     text = "".join(backend.stream_text(ids, max_tokens))
-                    self._json(200, _chat_body(backend, text))
+                    clean, calls = _split_tool_calls(text, tools)
+                    self._json(200, _chat_body(backend, clean, calls))
             elif path == "/v1/responses":
                 msgs = _messages_from_responses(body)
-                ids = backend.prompt_ids(msgs)
+                ids = backend.prompt_ids(msgs, tools)
                 if stream:
                     self._sse_stream(_responses_stream(backend, ids, max_tokens))
                 else:
                     text = "".join(backend.stream_text(ids, max_tokens))
-                    self._json(200, _responses_body(backend, text))
+                    clean, calls = _split_tool_calls(text, tools)
+                    self._json(200, _responses_body(backend, clean, calls))
             else:
                 self._json(404, {"error": "not found"})
 
