@@ -37,6 +37,7 @@ class Hub:
         self._queues: dict[int, queue.Queue] = {}  # rid -> text-delta queue
         self._toks: dict[int, list] = {}           # rid -> all tokens (hub's copy)
         self._shown: dict[int, int] = {}           # rid -> chars already emitted
+        self._cancelled: set[int] = set()          # rids whose client went away
         self._rid = 0
         # The model must be loaded AND used on the same thread (MLX's GPU stream
         # is thread-bound), so the engine thread loads it. Wait until ready.
@@ -49,7 +50,10 @@ class Hub:
         return self.eng.apply_chat_template(messages, tools=tools)
 
     def stream_text(self, prompt_ids, max_tokens):
-        """Yield decoded text deltas for one request until it finishes."""
+        """Yield decoded text deltas for one request until it finishes. If the
+        consumer stops early (client disconnects -> the SSE handler stops
+        iterating -> this generator is closed), mark the request cancelled so the
+        engine thread drops it instead of finishing generation for no one."""
         q: queue.Queue = queue.Queue()
         with self._lock:
             r = Req(self._rid, list(prompt_ids), max_tokens)
@@ -58,11 +62,18 @@ class Hub:
             self._queues[r.rid] = q
             self._toks[r.rid] = []
             self._shown[r.rid] = 0
-        while True:
-            item = q.get()
-            if item is _DONE:
-                return
-            yield item
+        try:
+            while True:
+                item = q.get()
+                if item is _DONE:
+                    return
+                yield item
+        finally:
+            # Normal completion already cleaned up; this matters on early close.
+            self._cancelled.add(r.rid)
+
+    def cancelled(self, rid) -> bool:
+        return rid in self._cancelled
 
     # --- engine thread (only thread that touches MLX) -----------------------
     def _run(self):
@@ -79,17 +90,25 @@ class Hub:
             # admit newly submitted requests: prefill them (batched) and merge in
             with self._lock:
                 pending, self._incoming = self._incoming, []
+            # Skip any request whose client already went away before we started.
+            pending = [r for r in pending if not self.cancelled(r.rid)]
             if pending:
                 group = PrefillGroup(reqs=pending)
-                while not sched.prefill_chunk(group):
+                # prefill_chunk aborts (returns None) if the request is cancelled
+                # mid-prefill, so a 60k-token prompt for a gone client stops early.
+                while (done := sched.prefill_chunk(group, self.cancelled)) is False:
                     pass
-                # merge_ready returns each joined request's FIRST token — emit it
-                # (it's not part of the next step()'s output).
-                self._emit([(rid, [first]) for rid, first in sched.merge_ready(group)])
+                if done:
+                    self._emit([(rid, [first]) for rid, first in sched.merge_ready(group)])
 
             if not sched.has_rows():
                 time.sleep(0.003)   # idle; wait for work
                 continue
+
+            # Drop live rows whose client disconnected mid-generation.
+            gone = [rid for rid in sched.live_rids() if self.cancelled(rid)]
+            if gone:
+                sched.drop(gone)
 
             live_before = sched.live_rids()
             self._emit(sched.step())

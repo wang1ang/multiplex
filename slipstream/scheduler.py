@@ -73,11 +73,15 @@ class Scheduler:
         return {r.rid for r in self.rows}
 
     # --- prefill mechanism -------------------------------------------------
-    def prefill_chunk(self, group: PrefillGroup) -> bool:
+    def prefill_chunk(self, group: PrefillGroup, cancelled=None):
         """Prefill the group by LENGTH-SUBGROUP: requests of equal length are
         prefilled together (equal length = no padding = no SSM conv contamination
         from pad tokens); odd lengths prefill alone. Fills per-request single-row
-        states + first tokens. Returns True (done in one call).
+        states + first tokens. Returns True when done, or None if a request was
+        cancelled mid-prefill (client gone) — the caller then abandons the group.
+
+        ``cancelled(rid)`` (optional) is polled between prefill chunks so a long
+        prompt for a departed client stops instead of running to completion.
 
         Unequal-length prefill in one batch would left/right-pad the short rows
         and the pad tokens leak into the GatedDeltaNet conv — verified to corrupt
@@ -90,8 +94,14 @@ class Scheduler:
         group.firsts = [None] * len(group.reqs)
         group.last_h = [None] * len(group.reqs)
         for L, idxs in by_len.items():
+            rids = [group.reqs[i].rid for i in idxs]
+            stop = (lambda: cancelled and any(cancelled(r) for r in rids))
             prompts = [group.reqs[i].prompt for i in idxs]
-            state, hidden = self.eng.prefill(prompts, chunk=self.chunk, log=self._log)
+            state, hidden = self.eng.prefill(prompts, chunk=self.chunk,
+                                             log=self._log, stop=stop)
+            if hidden is None:            # cancelled mid-prefill
+                self._log(f"PREFILL CANCELLED rids={rids}")
+                return None
             # Chunked prefill (single long prompt) returns only the last chunk's
             # hidden, so the next-token position is that block's last, not L-1.
             pos = min(L - 1, hidden.shape[1] - 1)
@@ -187,17 +197,28 @@ class Scheduler:
 
         if finished:
             self._log(f"EXIT {[rows[i].rid for i in finished]}")
-            keep = [i for i in range(B) if i not in finished]
-            if keep:
-                eng.filter(self.state, keep)
-                if dr is not None:
-                    dr.filter_cache(self.dcache, keep)
-                self.primary = self.primary[mx.array(keep)]
-                self.h = self.h[mx.array(keep)]
-                self.rows = [rows[i] for i in keep]
-            else:
-                self.state = self.h = self.primary = None
-                self.rows = []
-                self.dcache = dr.make_cache() if dr is not None else None
+            self._keep([i for i in range(B) if i not in finished])
 
         return emitted
+
+    def _keep(self, keep: list[int]) -> None:
+        """Retain only the given row indices in the live batch, dropping the
+        rest from every parallel structure (state cache, draft cache, primary,
+        hidden, rows). Empty keep clears the batch."""
+        if keep:
+            self.eng.filter(self.state, keep)
+            if self.dr is not None:
+                self.dr.filter_cache(self.dcache, keep)
+            self.primary = self.primary[mx.array(keep)]
+            self.h = self.h[mx.array(keep)]
+            self.rows = [self.rows[i] for i in keep]
+        else:
+            self.state = self.h = self.primary = None
+            self.rows = []
+            self.dcache = self.dr.make_cache() if self.dr is not None else None
+
+    def drop(self, rids) -> None:
+        """Remove rows for the given request ids (client disconnected)."""
+        rids = set(rids)
+        self._log(f"DROP {list(rids)}")
+        self._keep([i for i, r in enumerate(self.rows) if r.rid not in rids])

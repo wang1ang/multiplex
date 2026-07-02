@@ -115,7 +115,7 @@ class Engine:
         return lm.lm_head(hidden)
 
     # --- batched forward primitives (always [B, ...]; B=1 is just a batch of 1) ---
-    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None) -> tuple[BatchState, mx.array]:
+    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None, stop=None) -> tuple[BatchState, mx.array]:
         """Prefill B prompts. Returns (state, hidden ``[B, max_len, H]``).
 
         Row i's next-token hidden is at position ``lengths[i]-1`` (prompts are
@@ -137,8 +137,10 @@ class Engine:
             model = self.model.language_model.model
             ids = prompts[0]
             h = None
+            nchunks = -(-max_len // chunk)
             for s in range(0, max_len, chunk):
                 piece = mx.array([ids[s:s + chunk]])
+                t0 = time.time()
                 h = model(piece, cache=cache)   # cache accumulates; attn is incremental
                 # Force each chunk to evaluate before building the next, so the
                 # attention scratch is freed per-chunk (not held in one growing
@@ -146,8 +148,13 @@ class Engine:
                 # are side effects that h alone may not pull).
                 mx.eval(h, *(c.state for c in cache))
                 if log:
-                    log(f"prefill chunk {s // chunk + 1}/{-(-max_len // chunk)} "
-                        f"({min(s + chunk, max_len)}/{max_len} tok)")
+                    n = min(s + chunk, max_len) - s
+                    dt = time.time() - t0
+                    log(f"prefill chunk {s // chunk + 1}/{nchunks} "
+                        f"({min(s + chunk, max_len)}/{max_len} tok) "
+                        f"{n / dt:.0f} tok/s")
+                if stop and stop():   # client gone -> abandon the rest of prefill
+                    return BatchState(cache=cache, lengths=list(lengths)), None
             return BatchState(cache=cache, lengths=list(lengths)), h
 
         padding = [max_len - n for n in lengths]
