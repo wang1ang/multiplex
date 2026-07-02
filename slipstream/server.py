@@ -294,8 +294,9 @@ if __name__ == "__main__":
     ap.add_argument("--mtp", default=None)
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--debug", action="store_true",
-                    help="log scheduler activity (prefill/join/advance/exit)")
+    ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
+                    help="log scheduler activity (prefill/join/advance/exit); "
+                         "on by default, --no-debug to silence")
     args = ap.parse_args()
 
     # registry.select behaves per-environment: a server run without a tty gets

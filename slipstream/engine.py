@@ -115,7 +115,8 @@ class Engine:
         return lm.lm_head(hidden)
 
     # --- batched forward primitives (always [B, ...]; B=1 is just a batch of 1) ---
-    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None, stop=None) -> tuple[BatchState, mx.array]:
+    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None, stop=None,
+                on_ssm=None, snapshot_tail: int = 3) -> tuple[BatchState, mx.array]:
         """Prefill B prompts. Returns (state, hidden ``[B, max_len, H]``).
 
         Row i's next-token hidden is at position ``lengths[i]-1`` (prompts are
@@ -147,12 +148,17 @@ class Engine:
                 # lazy graph). Eval both h and the cache state (the cache writes
                 # are side effects that h alone may not pull).
                 mx.eval(h, *(c.state for c in cache))
+                end = min(s + chunk, max_len)
                 if log:
-                    n = min(s + chunk, max_len) - s
                     dt = time.time() - t0
                     log(f"prefill chunk {s // chunk + 1}/{nchunks} "
-                        f"({min(s + chunk, max_len)}/{max_len} tok) "
-                        f"{n / dt:.0f} tok/s")
+                        f"({end}/{max_len} tok) {(end - s) / dt:.0f} tok/s")
+                # Snapshot the SSM state at the last few chunk boundaries for
+                # prefix reuse next turn (SSM is fixed-size and cannot be
+                # truncated, so it must be captured per boundary; attention KV is
+                # truncatable and kept whole in the final state). on_ssm(pos, snap)
+                if on_ssm is not None and end >= max_len - snapshot_tail * chunk:
+                    on_ssm(end, self.clone_ssm(cache))
                 if stop and stop():   # client gone -> abandon the rest of prefill
                     return BatchState(cache=cache, lengths=list(lengths)), None
             return BatchState(cache=cache, lengths=list(lengths)), h
@@ -231,6 +237,37 @@ class Engine:
         row). Used to peel a freshly-prefilled request out of a prefill group."""
         cache = [c.extract(i) for c in state.cache]
         return BatchState(cache=cache, lengths=[state.lengths[i]])
+
+    def clone_state(self, state: BatchState):
+        """Deep-copy the FULL single-row state (all layers: attention KV + SSM),
+        cloned off the lazy graph. Kept once per cached prompt as the whole KV
+        that shallower reuse positions truncate from."""
+        snap = [[None if v is None else v + 0 for v in c.state] for c in state.cache]
+        return (snap, int(state.lengths[0]))
+
+    def clone_ssm(self, cache: list):
+        """Deep-copy ONLY the SSM (ArraysCache) layers — the small (~50MB),
+        fixed-size recurrent state that cannot be truncated, so it must be
+        captured per chunk boundary. Attention layers -> None (truncated from the
+        full KV at restore). Cheap enough to snapshot several boundaries."""
+        return [[None if v is None else v + 0 for v in c.cache]
+                if isinstance(c, ArraysCache) else None for c in cache]
+
+    def restore_at(self, full_snapshot, ssm_snapshot, pos: int) -> BatchState:
+        """Rebuild a state good for the first ``pos`` tokens: attention KV taken
+        from the full snapshot and TRUNCATED to pos; SSM taken from the
+        per-boundary ssm_snapshot (which is exactly the state at pos). Continue
+        with forward()."""
+        full, full_len = full_snapshot
+        cache = _make_cache(self.model, [0], None)
+        for c, layer_full, layer_ssm in zip(cache, full, ssm_snapshot):
+            if isinstance(c, ArraysCache):
+                c.cache = [None if v is None else v + 0 for v in layer_ssm]
+            else:
+                c.state = [None if v is None else v + 0 for v in layer_full]
+                if pos < full_len:
+                    c.trim(full_len - pos)   # KV has a position axis -> truncate
+        return BatchState(cache=cache, lengths=[pos])
 
     def merge_states(self, states: list[BatchState]) -> BatchState:
         """Merge several single-row states into one batched state (for "入":

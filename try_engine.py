@@ -43,7 +43,7 @@ def main() -> int:
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=8192)
     ap.add_argument("-d", "--depth", type=int, default=1)
-    ap.add_argument("--debug", action="store_true")
+    ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True)
     args = ap.parse_args()
 
     entry = registry.select(args.model)

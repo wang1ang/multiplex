@@ -24,6 +24,7 @@ import mlx.core as mx
 
 from .engine import Engine, BatchState
 from .mtp import Drafter
+from .prefixcache import PrefixCache
 
 
 @dataclass
@@ -45,7 +46,8 @@ class PrefillGroup:
 
 
 class Scheduler:
-    def __init__(self, engine: Engine, drafter: Drafter | None, *, k=1, chunk=512, debug=False):
+    def __init__(self, engine: Engine, drafter: Drafter | None, *, k=1, chunk=512,
+                 prefix_cache=8, debug=False):
         self.eng = engine
         self.dr = drafter
         # No MTP head -> no speculation possible; k is forced to 0 (pure AR).
@@ -54,6 +56,9 @@ class Scheduler:
         self.eos = engine.eos_token_ids
         self.debug = debug
         self._t = 0
+        # Prefix KV-cache: snapshots taken during prefill; a new prompt that
+        # continues a cached prefix restores its state and prefills only the tail.
+        self.pc = PrefixCache(capacity=prefix_cache) if prefix_cache else None
 
         # live decode batch
         self.state: BatchState | None = None
@@ -86,13 +91,20 @@ class Scheduler:
         Unequal-length prefill in one batch would left/right-pad the short rows
         and the pad tokens leak into the GatedDeltaNet conv — verified to corrupt
         the short row. Grouping by length avoids padding entirely."""
-        by_len: dict[int, list[int]] = {}
-        for i, r in enumerate(group.reqs):
-            by_len.setdefault(len(r.prompt), []).append(i)
-        # placeholders so we can fill by original index
         group.singles = [None] * len(group.reqs)
         group.firsts = [None] * len(group.reqs)
         group.last_h = [None] * len(group.reqs)
+
+        # A single request can reuse a cached prefix (concurrency is rare, so
+        # long prompts arrive alone); batched prefill has per-row prefixes and
+        # keeps the plain length-grouped path.
+        if self.pc is not None and len(group.reqs) == 1:
+            self._prefill_one(group, 0, cancelled)
+            return None if group.singles[0] is None else True
+
+        by_len: dict[int, list[int]] = {}
+        for i, r in enumerate(group.reqs):
+            by_len.setdefault(len(r.prompt), []).append(i)
         for L, idxs in by_len.items():
             rids = [group.reqs[i].rid for i in idxs]
             stop = (lambda: cancelled and any(cancelled(r) for r in rids))
@@ -114,6 +126,52 @@ class Scheduler:
                 group.last_h[i] = last_h
             self._log(f"PREFILL len={L} rids={[group.reqs[i].rid for i in idxs]}")
         return True
+
+    def _prefill_one(self, group, i, cancelled):
+        """Prefill one request, reusing a cached prefix when possible. On a hit,
+        restore the snapshot and forward only the tail; otherwise cold-prefill.
+        Either way, cache the finished state's snapshot for the next turn. Fills
+        group.singles[i] / firsts[i] / last_h[i]; leaves singles[i] None if
+        cancelled mid-prefill."""
+        req = group.reqs[i]
+        ids = req.prompt
+        eng = self.eng
+        match = self.pc.find(ids)
+
+        if match is not None:
+            # Reuse: restore at the matched boundary (attention KV truncated from
+            # the shared full snapshot, SSM from that boundary's snapshot), then
+            # forward only the tail. prefix_len is always < len(ids) — the tail
+            # is at least the trailing generation prompt, which differs each turn.
+            full, ssm, pos = match.payload
+            state = eng.restore_at(full, ssm, pos)
+            tail = mx.array([ids[pos:]], dtype=mx.int32)
+            h = eng.forward(state, tail)[:, -1:, :]
+            first = int(mx.argmax(eng.logits(h)[0, -1]))
+            self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
+                      f"rid={req.rid}")
+        else:
+            # Cold prefill; capture SSM snapshots at the last few chunk boundaries.
+            ssm_snaps: dict[int, list] = {}
+            stop = (lambda: cancelled and cancelled(req.rid))
+            state, hh = eng.prefill([ids], chunk=self.chunk, log=self._log, stop=stop,
+                                    on_ssm=lambda p, s: ssm_snaps.__setitem__(p, s))
+            if hh is None:                          # cancelled mid-prefill
+                self._log(f"PREFILL CANCELLED rid={req.rid}")
+                return
+            h = hh[:, -1:, :]
+            first = int(mx.argmax(eng.logits(h)[0, -1]))
+            self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
+            # Store one entry per SSM boundary, all sharing this full KV snapshot.
+            # The set of boundaries = the set of reusable prefixes (SSM-bound).
+            full = eng.clone_state(state)
+            for pos, ssm in ssm_snaps.items():
+                self.pc.store(ids[:pos], (full, ssm, pos))
+
+        req.out.append(first)
+        group.singles[i] = eng.extract_row(state, 0)
+        group.firsts[i] = first
+        group.last_h[i] = h
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
         """Merge prefilled requests into the live batch. Rebuilds the batch from
