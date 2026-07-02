@@ -23,7 +23,7 @@ import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .bridge import extract_tool_calls_with_thinking
+from .bridge import ToolCallStreamFilter, extract_tool_calls_with_thinking
 from .engine import find_mtp
 from .hub import Hub
 
@@ -80,7 +80,27 @@ def _sse(data, event=None):
     return f"{head}data: {json.dumps(data)}\n\n"
 
 
-def _chat_stream(backend, prompt_ids, max_tokens):
+def _stream_visible(backend, prompt_ids, max_tokens, tools):
+    """Yield (visible_text_chunk, tool_calls). Visible chunks come as generated,
+    with tool-call markup filtered out by the bridge when tools are offered; the
+    final yield has an empty chunk and the tool_calls parsed from the full text
+    (the oMLX contract: filter markup live, parse tool calls at completion)."""
+    filt = ToolCallStreamFilter() if tools else None
+    full = ""
+    for text in backend.stream_text(prompt_ids, max_tokens):
+        full += text
+        visible = filt.feed(text) if filt else text
+        if visible:
+            yield visible, None
+    if filt:
+        tail = filt.finish()
+        if tail:
+            yield tail, None
+        _, calls = _split_tool_calls(full, tools)
+        yield "", calls
+
+
+def _chat_stream(backend, prompt_ids, max_tokens, tools=None):
     rid, created = _hex("chatcmpl-"), int(time.time())
 
     def chunk(delta, finish=None):
@@ -91,13 +111,23 @@ def _chat_stream(backend, prompt_ids, max_tokens):
         })
 
     yield chunk({"role": "assistant"})
-    for text in backend.stream_text(prompt_ids, max_tokens):
-        yield chunk({"content": text})
-    yield chunk({}, finish="stop")
+    calls = []
+    for visible, tool_calls in _stream_visible(backend, prompt_ids, max_tokens, tools):
+        if visible:
+            yield chunk({"content": visible})
+        if tool_calls:
+            calls = tool_calls
+    if calls:
+        yield chunk({"tool_calls": [
+            {"index": i, "id": c.get("id"), "type": "function",
+             "function": c.get("function")} for i, c in enumerate(calls)]})
+        yield chunk({}, finish="tool_calls")
+    else:
+        yield chunk({}, finish="stop")
     yield "data: [DONE]\n\n"
 
 
-def _responses_stream(backend, prompt_ids, max_tokens):
+def _responses_stream(backend, prompt_ids, max_tokens, tools=None):
     rid, mid = _hex("resp_"), _hex("msg_")
     base = {"id": rid, "object": "response", "model": backend.model_id}
 
@@ -107,19 +137,36 @@ def _responses_stream(backend, prompt_ids, max_tokens):
                 {"id": mid, "type": "message", "role": "assistant", "content": [],
                  "status": "in_progress"}}, "response.output_item.added")
 
-    full = ""
-    for text in backend.stream_text(prompt_ids, max_tokens):
-        full += text
-        yield _sse({"type": "response.output_text.delta", "item_id": mid, "delta": text},
-                   "response.output_text.delta")
-
+    full, calls = "", []
+    for visible, tool_calls in _stream_visible(backend, prompt_ids, max_tokens, tools):
+        if visible:
+            full += visible
+            yield _sse({"type": "response.output_text.delta", "item_id": mid, "delta": visible},
+                       "response.output_text.delta")
+        if tool_calls:
+            calls = tool_calls
     yield _sse({"type": "response.output_text.done", "item_id": mid, "text": full},
                "response.output_text.done")
+
+    output = [{"id": mid, "type": "message", "role": "assistant", "status": "completed",
+               "content": [{"type": "output_text", "text": full, "annotations": []}]}]
+    # A function_call output item per parsed tool call (added -> args delta -> done).
+    for c in calls:
+        fn = c.get("function") or {}
+        item = {"type": "function_call", "call_id": "fc_" + str(c.get("id") or ""),
+                "name": fn.get("name") or "", "arguments": fn.get("arguments") or ""}
+        yield _sse({"type": "response.output_item.added",
+                    "item": {**item, "status": "in_progress", "arguments": ""}},
+                   "response.output_item.added")
+        yield _sse({"type": "response.function_call_arguments.delta",
+                    "item_id": item["call_id"], "delta": item["arguments"]},
+                   "response.function_call_arguments.delta")
+        yield _sse({"type": "response.output_item.done", "item": {**item, "status": "completed"}},
+                   "response.output_item.done")
+        output.append({**item, "status": "completed"})
+
     yield _sse({"type": "response.completed", "response": {
-        **base, "status": "completed", "created_at": int(time.time()),
-        "output": [{"id": mid, "type": "message", "role": "assistant",
-                    "status": "completed",
-                    "content": [{"type": "output_text", "text": full, "annotations": []}]}],
+        **base, "status": "completed", "created_at": int(time.time()), "output": output,
     }}, "response.completed")
 
 
@@ -199,7 +246,7 @@ def make_handler(backend: Hub):
                 msgs = _messages_from_chat(body)
                 ids = backend.prompt_ids(msgs, tools)
                 if stream:
-                    self._sse_stream(_chat_stream(backend, ids, max_tokens))
+                    self._sse_stream(_chat_stream(backend, ids, max_tokens, tools))
                 else:
                     text = "".join(backend.stream_text(ids, max_tokens))
                     clean, calls = _split_tool_calls(text, tools)
@@ -208,7 +255,7 @@ def make_handler(backend: Hub):
                 msgs = _messages_from_responses(body)
                 ids = backend.prompt_ids(msgs, tools)
                 if stream:
-                    self._sse_stream(_responses_stream(backend, ids, max_tokens))
+                    self._sse_stream(_responses_stream(backend, ids, max_tokens, tools))
                 else:
                     text = "".join(backend.stream_text(ids, max_tokens))
                     clean, calls = _split_tool_calls(text, tools)
