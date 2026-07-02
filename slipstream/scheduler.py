@@ -138,35 +138,34 @@ class Scheduler:
         eng = self.eng
         match = self.pc.find(ids)
 
+        # Continue from a reused prefix (restore at the matched boundary), or
+        # cold-start from scratch — both then run the remaining tokens chunked,
+        # snapshotting SSM at the tail boundaries so THIS turn's deeper prefix is
+        # cached for the next turn (a hit must still refresh the cache, else the
+        # pool stays stuck at the first turn's shallow boundaries).
+        ssm_snaps: dict[int, list] = {}
+        stop = (lambda: cancelled and cancelled(req.rid))
         if match is not None:
-            # Reuse: restore at the matched boundary (attention KV truncated from
-            # the shared full snapshot, SSM from that boundary's snapshot), then
-            # forward only the tail. prefix_len is always < len(ids) — the tail
-            # is at least the trailing generation prompt, which differs each turn.
-            full, ssm, pos = match.payload
-            state = eng.restore_at(full, ssm, pos)
-            tail = mx.array([ids[pos:]], dtype=mx.int32)
-            h = eng.forward(state, tail)[:, -1:, :]
-            first = int(mx.argmax(eng.logits(h)[0, -1]))
+            full, base_ssm, pos = match.payload
+            state = eng.restore_at(full, base_ssm, pos)
             self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
                       f"rid={req.rid}")
         else:
-            # Cold prefill; capture SSM snapshots at the last few chunk boundaries.
-            ssm_snaps: dict[int, list] = {}
-            stop = (lambda: cancelled and cancelled(req.rid))
-            state, hh = eng.prefill([ids], chunk=self.chunk, log=self._log, stop=stop,
-                                    on_ssm=lambda p, s: ssm_snaps.__setitem__(p, s))
-            if hh is None:                          # cancelled mid-prefill
-                self._log(f"PREFILL CANCELLED rid={req.rid}")
-                return
-            h = hh[:, -1:, :]
-            first = int(mx.argmax(eng.logits(h)[0, -1]))
+            state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
+            pos = 0
             self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
-            # Store one entry per SSM boundary, all sharing this full KV snapshot.
-            # The set of boundaries = the set of reusable prefixes (SSM-bound).
-            full = eng.clone_state(state)
-            for pos, ssm in ssm_snaps.items():
-                self.pc.store(ids[:pos], (full, ssm, pos))
+
+        h = eng._run_chunked(state, ids[pos:], self.chunk, log=self._log, stop=stop,
+                             on_ssm=lambda p, s: ssm_snaps.__setitem__(p, s))
+        if h is None:                               # cancelled mid-prefill
+            self._log(f"PREFILL CANCELLED rid={req.rid}")
+            return
+        h = h[:, -1:, :]
+        first = int(mx.argmax(eng.logits(h)[0, -1]))
+        # Cache this turn's boundary snapshots, all sharing this full KV snapshot.
+        full = eng.clone_state(state)
+        for p, ssm in ssm_snaps.items():
+            self.pc.store(ids[:p], (full, ssm, p))
 
         req.out.append(first)
         group.singles[i] = eng.extract_row(state, 0)

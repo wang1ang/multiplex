@@ -135,33 +135,10 @@ class Engine:
 
         if chunk and len(prompts) == 1 and max_len > chunk:
             cache = _make_cache(self.model, [0], None)
-            model = self.model.language_model.model
-            ids = prompts[0]
-            h = None
-            nchunks = -(-max_len // chunk)
-            for s in range(0, max_len, chunk):
-                piece = mx.array([ids[s:s + chunk]])
-                t0 = time.time()
-                h = model(piece, cache=cache)   # cache accumulates; attn is incremental
-                # Force each chunk to evaluate before building the next, so the
-                # attention scratch is freed per-chunk (not held in one growing
-                # lazy graph). Eval both h and the cache state (the cache writes
-                # are side effects that h alone may not pull).
-                mx.eval(h, *(c.state for c in cache))
-                end = min(s + chunk, max_len)
-                if log:
-                    dt = time.time() - t0
-                    log(f"prefill chunk {s // chunk + 1}/{nchunks} "
-                        f"({end}/{max_len} tok) {(end - s) / dt:.0f} tok/s")
-                # Snapshot the SSM state at the last few chunk boundaries for
-                # prefix reuse next turn (SSM is fixed-size and cannot be
-                # truncated, so it must be captured per boundary; attention KV is
-                # truncatable and kept whole in the final state). on_ssm(pos, snap)
-                if on_ssm is not None and end >= max_len - snapshot_tail * chunk:
-                    on_ssm(end, self.clone_ssm(cache))
-                if stop and stop():   # client gone -> abandon the rest of prefill
-                    return BatchState(cache=cache, lengths=list(lengths)), None
-            return BatchState(cache=cache, lengths=list(lengths)), h
+            state = BatchState(cache=cache, lengths=[0])
+            h = self._run_chunked(state, prompts[0], chunk, log=log, stop=stop,
+                                   on_ssm=on_ssm, snapshot_tail=snapshot_tail)
+            return state, h
 
         padding = [max_len - n for n in lengths]
         cache = _make_cache(self.model, [0] * len(prompts), None)
@@ -179,6 +156,41 @@ class Engine:
         for c in cache:
             c.finalize()
         return BatchState(cache=cache, lengths=list(lengths)), h
+
+    def _make_empty_cache(self) -> list:
+        """A fresh single-row cache (all layers) to prefill into from scratch."""
+        return _make_cache(self.model, [0], None)
+
+    def _run_chunked(self, state: BatchState, ids: list[int], chunk: int, *,
+                     log=None, stop=None, on_ssm=None, snapshot_tail: int = 3):
+        """Feed ``ids`` into a single-row ``state`` in chunks (cache accumulates,
+        attention stays incremental so the scratch is bounded). Snapshots SSM
+        state at the last few FULL chunk boundaries via on_ssm(abs_pos, snap) —
+        the final partial chunk (holding the per-turn generation prompt) is never
+        snapshotted, so the next turn's real content matches cleanly. Used for
+        both cold prefill (base 0) and continuing a reused prefix (base = pos).
+        Advances state.lengths; returns the last chunk's hidden. Returns None if
+        stop() fires between chunks."""
+        model = self.model.language_model.model
+        base = state.lengths[0]
+        total = base + len(ids)
+        h = None
+        for s in range(0, len(ids), chunk):
+            piece = mx.array([ids[s:s + chunk]], dtype=mx.int32)
+            t0 = time.time()
+            h = model(piece, cache=state.cache)
+            mx.eval(h, *(c.state for c in state.cache))
+            end = base + min(s + chunk, len(ids))       # absolute position
+            state.lengths[0] = end
+            if log:
+                dt = time.time() - t0
+                log(f"prefill {end}/{total} tok {(min(s + chunk, len(ids)) - s) / dt:.0f} tok/s")
+            if (on_ssm is not None and (s + chunk) <= len(ids)   # full chunk only
+                    and end >= total - snapshot_tail * chunk):
+                on_ssm(end, self.clone_ssm(state.cache))
+            if stop and stop():
+                return None
+        return h
 
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:
         """Feed ``tokens`` (``[B, k]``) per row, return hidden ``[B, k, H]``.
