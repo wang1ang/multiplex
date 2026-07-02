@@ -115,15 +115,41 @@ class Engine:
         return lm.lm_head(hidden)
 
     # --- batched forward primitives (always [B, ...]; B=1 is just a batch of 1) ---
-    def prefill(self, prompts: list[list[int]]) -> tuple[BatchState, mx.array]:
+    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None) -> tuple[BatchState, mx.array]:
         """Prefill B prompts. Returns (state, hidden ``[B, max_len, H]``).
 
         Row i's next-token hidden is at position ``lengths[i]-1`` (prompts are
         right-padded to max_len). Returns pre-lm_head hidden; get logits with
         ``logits(hidden)``. The caller samples — the engine doesn't.
+
+        A single long prompt whose length exceeds ``chunk`` (>0) is fed in
+        chunks so the attention scratch stays bounded (a 30k-token prompt's
+        full-sequence attention would be tens of GB). The cache accumulates
+        across chunks; only the last chunk's hidden is returned (all the caller
+        needs is the final position). Batched or short prompts take the
+        one-shot path unchanged.
         """
         lengths = [len(p) for p in prompts]
         max_len = max(lengths)
+
+        if chunk and len(prompts) == 1 and max_len > chunk:
+            cache = _make_cache(self.model, [0], None)
+            model = self.model.language_model.model
+            ids = prompts[0]
+            h = None
+            for s in range(0, max_len, chunk):
+                piece = mx.array([ids[s:s + chunk]])
+                h = model(piece, cache=cache)   # cache accumulates; attn is incremental
+                # Force each chunk to evaluate before building the next, so the
+                # attention scratch is freed per-chunk (not held in one growing
+                # lazy graph). Eval both h and the cache state (the cache writes
+                # are side effects that h alone may not pull).
+                mx.eval(h, *(c.state for c in cache))
+                if log:
+                    log(f"prefill chunk {s // chunk + 1}/{-(-max_len // chunk)} "
+                        f"({min(s + chunk, max_len)}/{max_len} tok)")
+            return BatchState(cache=cache, lengths=list(lengths)), h
+
         padding = [max_len - n for n in lengths]
         cache = _make_cache(self.model, [0] * len(prompts), None)
         tokens = _right_pad_prompts(prompts, max_length=max_len)

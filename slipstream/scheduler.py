@@ -91,9 +91,12 @@ class Scheduler:
         group.last_h = [None] * len(group.reqs)
         for L, idxs in by_len.items():
             prompts = [group.reqs[i].prompt for i in idxs]
-            state, hidden = self.eng.prefill(prompts)   # equal length -> no pad
+            state, hidden = self.eng.prefill(prompts, chunk=self.chunk, log=self._log)
+            # Chunked prefill (single long prompt) returns only the last chunk's
+            # hidden, so the next-token position is that block's last, not L-1.
+            pos = min(L - 1, hidden.shape[1] - 1)
             for j, i in enumerate(idxs):
-                last_h = hidden[j:j + 1, L - 1:L, :]
+                last_h = hidden[j:j + 1, pos:pos + 1, :]
                 first = int(mx.argmax(self.eng.logits(last_h)[0, -1]))
                 group.reqs[i].out.append(first)
                 group.singles[i] = self.eng.extract_row(state, j)
