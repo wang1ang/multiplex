@@ -294,7 +294,7 @@ class AsyncPrefixDiskStore:
         self._load_records()
         self._thread = threading.Thread(
             target=self._writer_loop,
-            name="slipstream-prefix-disk",
+            name="multiplex-prefix-disk",
             daemon=True,
         )
         self._thread.start()
@@ -306,7 +306,7 @@ class AsyncPrefixDiskStore:
         parent: str | None = None,
     ) -> str:
         h = hashlib.sha256()
-        h.update(b"slipstream-prefix-block-v1\0")
+        h.update(b"multiplex-prefix-block-v1\0")
         h.update((parent or "").encode("ascii"))
         h.update(b"\0")
         for token in tokens:

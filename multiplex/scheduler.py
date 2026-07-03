@@ -43,6 +43,8 @@ class Req:
     session_cache: bool = False
     out: list[int] = field(default_factory=list)
     session_cache_pos: set[int] = field(default_factory=set)
+    output_log_started: bool = False
+    output_log_chars: int = 0
 
 
 @dataclass
@@ -61,7 +63,7 @@ class PrefillGroup:
 
 class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *, k=1, chunk=512,
-                 prefix_cache=8, prefix_cache_dir=None, debug=False):
+                 prefix_cache=8, prefix_cache_dir=None, output_log_dir=None, debug=False):
         self.eng = engine
         self.dr = drafter
         # No MTP head -> no speculation possible; k is forced to 0 (pure AR).
@@ -70,6 +72,7 @@ class Scheduler:
         self.eos = engine.eos_token_ids
         self.debug = debug
         self._t = 0
+        self.output_log_dir = Path(output_log_dir) if output_log_dir else None
         # One prefix tree with two independent LRU pools. Prompt entries and
         # session entries share prefix structure but never evict each other.
         cache_dir = self._prefix_cache_dir(prefix_cache_dir)
@@ -181,6 +184,7 @@ class Scheduler:
         first = int(mx.argmax(eng.logits(h)[0, -1]))
 
         req.out.append(first)
+        self._log_output(req, [first])
         group.single = eng.extract_row(group.state, 0)
         group.first = first
         group.last_h = h
@@ -279,6 +283,7 @@ class Scheduler:
                     finished.append(i)
                     break
             rows[i].out.extend(toks)
+            self._log_output(rows[i], toks)
             emitted.append((rows[i].rid, toks))
 
         primary = trunk_pred[:, m]
@@ -305,6 +310,30 @@ class Scheduler:
                 self.pc.prune_unreferenced()
 
         return emitted
+
+    def _log_output(self, req: Req, toks: list[int]) -> None:
+        if self.output_log_dir is None:
+            return
+        try:
+            self.output_log_dir.mkdir(parents=True, exist_ok=True)
+            text_path = self.output_log_dir / f"req-{req.rid}.output.log"
+            tok_path = self.output_log_dir / f"req-{req.rid}.output.tokens.log"
+            if not req.output_log_started:
+                text_path.write_text("", encoding="utf-8")
+                tok_path.write_text("", encoding="utf-8")
+                req.output_log_started = True
+
+            raw = self.eng.tokenizer.decode(req.out, skip_special_tokens=False)
+            delta = raw[req.output_log_chars:]
+            if delta:
+                with text_path.open("a", encoding="utf-8") as f:
+                    f.write(delta)
+                req.output_log_chars = len(raw)
+            if toks:
+                with tok_path.open("a", encoding="utf-8") as f:
+                    f.write(" ".join(str(int(t)) for t in toks) + "\n")
+        except Exception:
+            pass
 
     def _capture_session_blocks(self, rows: list[Req], state: BatchState) -> None:
         if self.pc is None or self.pc_state is None or not self.chunk:

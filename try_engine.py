@@ -6,7 +6,7 @@ A fixed input box sits at the bottom (like most CLIs); generated text scrolls
 above it. Type a prompt + Enter to start; type another WHILE it runs to add it
 into the live batch (that's "入"). :q or Ctrl-C quits.
 
-Drives slipstream.scheduler.Scheduler: new requests are chunk-prefilled and
+Drives multiplex.scheduler.Scheduler: new requests are chunk-prefilled and
 merged into the running batch. -d = draft depth k (0 = pure AR).
 """
 
@@ -22,10 +22,10 @@ from prompt_toolkit.layout.controls import BufferControl
 from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
 
-from slipstream import registry
-from slipstream.engine import Engine, find_mtp
-from slipstream.mtp import Drafter
-from slipstream.scheduler import Scheduler, Req, PrefillGroup
+from multiplex import registry
+from multiplex.engine import Engine, find_mtp
+from multiplex.mtp import Drafter
+from multiplex.scheduler import Scheduler, Req, PrefillGroup
 
 
 def to_ids(eng, text, raw):

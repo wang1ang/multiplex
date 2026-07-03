@@ -16,10 +16,10 @@ import sys
 import threading
 
 import mlx.core as mx
-from slipstream.engine import Engine
-from slipstream.mtp import Drafter
-from slipstream.scheduler import Scheduler, Req, PrefillGroup
-from slipstream.hub import Hub
+from multiplex.engine import Engine
+from multiplex.mtp import Drafter
+from multiplex.scheduler import Scheduler, Req, PrefillGroup
+from multiplex.hub import Hub
 
 MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
 MTP = MODEL + "/mtp.safetensors"
