@@ -236,10 +236,17 @@ class Engine:
         return BatchState(cache=cache, lengths=[state.lengths[i]])
 
     def clone_state(self, state: BatchState):
-        """Deep-copy the FULL single-row state (all layers: attention KV + SSM),
-        cloned off the lazy graph. Kept once per cached prompt as the whole KV
-        that shallower reuse positions truncate from."""
-        snap = [[None if v is None else v + 0 for v in c.state] for c in state.cache]
+        """Deep-copy the full attention/KV state for one row.
+
+        SSM layers are intentionally stored as None here.  They are captured per
+        reusable boundary by clone_ssm(), while attention KV is shared by all
+        boundaries under the same full prefix and truncated during restore.
+        """
+        snap = [
+            None if isinstance(c, ArraysCache)
+            else [None if v is None else v + 0 for v in c.state]
+            for c in state.cache
+        ]
         return (snap, int(state.lengths[0]))
 
     def clone_ssm(self, cache: list):
