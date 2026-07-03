@@ -365,7 +365,7 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
-          debug=False):
+          debug=False, prefix_cache_dir="auto"):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
     if mtp_path is None:
@@ -373,7 +373,8 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
     elif not os.path.exists(mtp_path):
         mtp_path = None
     print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
-    backend = Hub(model_path, mtp_path, debug=debug)
+    backend = Hub(model_path, mtp_path, debug=debug,
+                  prefix_cache_dir=prefix_cache_dir)
     httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
           f"(/v1/chat/completions, /v1/responses, /v1/models)]")
@@ -396,6 +397,9 @@ if __name__ == "__main__":
     ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
                     help="log scheduler activity (prefill/join/advance/exit); "
                          "on by default, --no-debug to silence")
+    ap.add_argument("--prefix-cache-dir", default="auto",
+                    help="persist prefix cache under this dir; use 'auto' for "
+                         "~/.cache/multiplex/prefixcache/<model>, or 'none' to disable")
     args = ap.parse_args()
 
     # registry.select behaves per-environment: a server run without a tty gets
@@ -404,4 +408,5 @@ if __name__ == "__main__":
         entry = registry.select(args.model)
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         sys.exit(str(e))
-    serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug)
+    serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug,
+          prefix_cache_dir=args.prefix_cache_dir)

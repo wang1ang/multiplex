@@ -30,10 +30,12 @@ _DONE = object()   # sentinel pushed to a request's queue when it finishes
 
 
 class Hub:
-    def __init__(self, model_path, mtp_path, *, k=1, chunk=512, debug=False):
+    def __init__(self, model_path, mtp_path, *, k=1, chunk=512, debug=False,
+                 prefix_cache_dir="auto"):
         self.model_id = model_path.rstrip("/").split("/")[-1]
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
-                         k=k, chunk=chunk, debug=debug)
+                         k=k, chunk=chunk, debug=debug,
+                         prefix_cache_dir=prefix_cache_dir)
         self._lock = threading.Lock()
         self._incoming = []                       # [Req] submitted, not yet added
         self._queues: dict[int, queue.Queue] = {}  # rid -> text-delta queue
@@ -154,7 +156,8 @@ class Hub:
         self.drafter = (Drafter(self.eng, c["mtp_path"])
                         if c["mtp_path"] is not None else None)
         self._sched = Scheduler(self.eng, self.drafter,
-                                k=c["k"], chunk=c["chunk"], debug=c["debug"])
+                                k=c["k"], chunk=c["chunk"], debug=c["debug"],
+                                prefix_cache_dir=c["prefix_cache_dir"])
         self._ready.set()
         sched = self._sched
         while True:

@@ -17,6 +17,9 @@ thread and calls these in a loop.
 
 from __future__ import annotations
 
+import hashlib
+import os
+from pathlib import Path
 import sys
 from dataclasses import dataclass, field
 
@@ -24,7 +27,7 @@ import mlx.core as mx
 
 from .engine import Engine, BatchState
 from .mtp import Drafter
-from .prefixcache import PrefixCache
+from .prefixcache import PrefixCache, common_prefix_len
 
 
 @dataclass
@@ -54,7 +57,7 @@ class PrefillGroup:
 
 class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *, k=1, chunk=512,
-                 prefix_cache=8, debug=False):
+                 prefix_cache=8, prefix_cache_dir=None, debug=False):
         self.eng = engine
         self.dr = drafter
         # No MTP head -> no speculation possible; k is forced to 0 (pure AR).
@@ -65,7 +68,9 @@ class Scheduler:
         self._t = 0
         # Prefix KV-cache: snapshots taken during prefill; a new prompt that
         # continues a cached prefix restores its state and prefills only the tail.
-        self.pc = PrefixCache(capacity=prefix_cache) if prefix_cache else None
+        cache_dir = self._prefix_cache_dir(prefix_cache_dir)
+        self.pc = PrefixCache(capacity=prefix_cache, disk_dir=cache_dir,
+                              log=self._log) if prefix_cache else None
 
         # live decode batch
         self.state: BatchState | None = None
@@ -77,6 +82,70 @@ class Scheduler:
     def _log(self, msg):
         if self.debug:
             print(f"[sched t={self._t}] {msg}", file=sys.stderr, flush=True)
+
+    def _prefix_cache_dir(self, value):
+        if value in (None, False, "", "none", "off"):
+            return None
+        if value != "auto":
+            return value
+        model_path = os.path.abspath(os.path.expanduser(self.eng.model_path))
+        digest = hashlib.sha256(model_path.encode()).hexdigest()[:12]
+        name = os.path.basename(model_path.rstrip(os.sep)) or "model"
+        return Path.home() / ".cache" / "multiplex" / "prefixcache" / f"{name}-{digest}"
+
+    @staticmethod
+    def _short_log_text(text: str, max_chars: int = 180) -> str:
+        text = text.replace("\n", "\\n").replace("\r", "\\r")
+        if len(text) <= max_chars:
+            return text
+        return text[:max_chars] + f"...(+{len(text) - max_chars} chars)"
+
+    def _decode_for_cache_log(self, token_ids, max_chars: int = 180) -> str:
+        if not token_ids:
+            return ""
+        tok = self.eng.tokenizer
+        try:
+            text = tok.decode(list(token_ids), skip_special_tokens=False)
+        except TypeError:
+            text = tok.decode(list(token_ids))
+        return self._short_log_text(text, max_chars=max_chars)
+
+    def _cache_log_context(self, token_ids, pos: int):
+        before = token_ids[max(0, pos - 48):pos]
+        after = token_ids[pos:min(len(token_ids), pos + 96)]
+        return (self._decode_for_cache_log(before),
+                self._decode_for_cache_log(after))
+
+    def _log_prefix_cache_decision(self, req: Req, ids, match) -> None:
+        if not self.debug or self.pc is None:
+            return
+        chosen = match.prefix_len if match is not None else 0
+        source = match.source if match is not None else None
+        self._log(f"PREFIX CACHE FIND rid={req.rid} prompt_len={len(ids)} "
+                  f"chosen={chosen} source={source!r}")
+        entries = list(self.pc.iter_entries()) if hasattr(self.pc, "iter_entries") else []
+        for _group_i, snap, node in sorted(entries, key=lambda e: e[2].pos,
+                                           reverse=True):
+            cached = snap.full_prefix[:node.pos]
+            if len(cached) <= chosen:
+                continue
+            shared = common_prefix_len(cached, ids)
+            if shared == len(cached):
+                continue
+            reason = "prompt_end" if shared == len(ids) else "token_mismatch"
+            cache_tok = cached[shared] if shared < len(cached) else "<END>"
+            prompt_tok = ids[shared] if shared < len(ids) else "<END>"
+            before, prompt_after = self._cache_log_context(ids, shared)
+            _, cache_after = self._cache_log_context(cached, shared)
+            self._log(
+                f"PREFIX CACHE REJECT source={node.source!r} len={len(cached)} "
+                f"full_len={len(snap.full_prefix)} "
+                f"reason={reason} common={shared} cache_tok={cache_tok!r} "
+                f"prompt_tok={prompt_tok!r}"
+            )
+            self._log(f"  before={before!r}")
+            self._log(f"  cache_after={cache_after!r}")
+            self._log(f"  prompt_after={prompt_after!r}")
 
     def has_rows(self):
         return bool(self.rows)
@@ -144,6 +213,7 @@ class Scheduler:
         ids = req.prompt
         eng = self.eng
         match = self.pc.find(ids)
+        self._log_prefix_cache_decision(req, ids, match)
 
         # Continue from a reused prefix (restore at the matched boundary), or
         # cold-start from scratch.
@@ -157,7 +227,10 @@ class Scheduler:
                 full, base_ssm, pos, cached_h = payload
             state = eng.restore_at(full, base_ssm, pos)
             self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
-                      f"rid={req.rid}")
+                      f"rid={req.rid} source={match.source!r}")
+            before, prompt_after = self._cache_log_context(ids, pos)
+            self._log(f"  hit_before={before!r}")
+            self._log(f"  hit_prompt_after={prompt_after!r}")
             # Older prompt-block entries do not include the last hidden state.
             # An exact hit with no tail cannot produce the first sampled token
             # from KV/SSM alone, so rerun cold in that rare case.
@@ -180,9 +253,18 @@ class Scheduler:
         )
         if h is not None and match is None:
             full = eng.clone_state(state)
+            stored = False
             for p, ssm in ssm_snaps.items():
                 if p < len(ids):
-                    self.pc.store(ids[:p], (full, ssm, p))
+                    block = p // self.chunk if self.chunk else 0
+                    self.pc.store(ids, (full, ssm, p),
+                                  source=f"prompt rid={req.rid} block={block}",
+                                  save=False)
+                    stored = True
+                    self._log(f"PREFIX STORE block={block} "
+                              f"len={p}/{len(ids)} rid={req.rid}")
+            if stored:
+                self.pc.flush()
 
         if h is None:                               # cancelled mid-prefill
             self._log(f"PREFILL CANCELLED rid={req.rid}")
@@ -300,7 +382,8 @@ class Scheduler:
             mx.eval(h_final)
             self.pc.store(prefix, (self.eng.clone_state(single),
                                   self.eng.clone_ssm(single.cache),
-                                  len(prefix), h_final + 0))
+                                  len(prefix), h_final + 0),
+                          source=f"session rid={req.rid}")
             self._log(f"SESSION STORE len={len(prefix)} prompt_len={prompt_len} "
                       f"rid={req.rid}")
             return
@@ -321,7 +404,8 @@ class Scheduler:
         mx.eval(h_final)
         self.pc.store(prefix, (self.eng.clone_state(single),
                               self.eng.clone_ssm(single.cache),
-                              len(prefix), h_final + 0))
+                              len(prefix), h_final + 0),
+                      source=f"session rid={req.rid}")
         self._log(f"SESSION STORE len={len(prefix)} rid={req.rid}")
 
     def _keep(self, keep: list[int]) -> None:
