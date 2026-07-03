@@ -15,8 +15,9 @@ queues. An HTTP thread submits a request and drains its text queue for SSE.
 
 from __future__ import annotations
 
+import json
+from pathlib import Path
 import queue
-import sys
 import threading
 import time
 
@@ -43,6 +44,7 @@ class Hub:
         self._shown: dict[int, int] = {}           # rid -> chars already emitted
         self._cancelled: set[int] = set()          # rids whose client went away
         self._rid = 0
+        self._request_log_dir = Path("logs") / "requests"
         # The model must be loaded AND used on the same thread (MLX's GPU stream
         # is thread-bound), so the engine thread loads it. Wait until ready.
         self._ready = threading.Event()
@@ -124,17 +126,7 @@ class Hub:
             self._queues[r.rid] = q
             self._toks[r.rid] = []
             self._shown[r.rid] = 0
-            # if self._cfg["debug"]:
-            #     try:
-            #         prompt_text = self.eng.tokenizer.decode(
-            #             list(prompt_ids), skip_special_tokens=False
-            #         )
-            #     except TypeError:
-            #         prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
-            #     print(f"[hub] L4 OUT L3 rid={r.rid} prompt_len={len(prompt_ids)} "
-            #           f"session_prompt_len={session_prompt_len}\n"
-            #           f"{prompt_text}",
-            #           file=sys.stderr, flush=True)
+        self._write_request_log(r, prompt_ids, session_prompt_len, max_tokens)
         try:
             while True:
                 item = q.get()
@@ -144,6 +136,37 @@ class Hub:
         finally:
             # Normal completion already cleaned up; this matters on early close.
             self._cancelled.add(r.rid)
+
+    def _write_request_log(self, req, prompt_ids, session_prompt_len, max_tokens):
+        if not self._cfg["debug"]:
+            return
+        try:
+            try:
+                prompt_text = self.eng.tokenizer.decode(
+                    list(prompt_ids), skip_special_tokens=False
+                )
+            except TypeError:
+                prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
+
+            self._request_log_dir.mkdir(parents=True, exist_ok=True)
+            path = self._request_log_dir / f"req-{req.rid}.log"
+            body = [
+                f"rid={req.rid}",
+                f"prompt_len={len(prompt_ids)}",
+                f"session_prompt_len={session_prompt_len}",
+                f"max_tokens={max_tokens}",
+                "",
+                "--- prompt ---",
+                prompt_text,
+                "",
+                "--- prompt_ids ---",
+                json.dumps(list(prompt_ids), ensure_ascii=False,
+                           separators=(",", ":")),
+                "",
+            ]
+            path.write_text("\n".join(body), encoding="utf-8")
+        except Exception:
+            pass
 
     def cancelled(self, rid) -> bool:
         return rid in self._cancelled
