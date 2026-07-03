@@ -22,12 +22,13 @@ import os
 from pathlib import Path
 import sys
 from dataclasses import dataclass, field
+from typing import Any
 
 import mlx.core as mx
 
 from .engine import Engine, BatchState
 from .mtp import Drafter
-from .prefixcache import PrefixCache, common_prefix_len
+from .prefixcache import PrefixCache
 
 
 @dataclass
@@ -43,6 +44,8 @@ class Req:
     # block caching.
     session_cache: bool = False
     out: list[int] = field(default_factory=list)
+    session_base_full: Any | None = None
+    session_base_ssm: Any | None = None
 
 
 @dataclass
@@ -129,29 +132,6 @@ class Scheduler:
         source = match.source if match is not None else None
         self._log(f"PREFIX CACHE FIND rid={req.rid} prompt_len={len(ids)} "
                   f"chosen={chosen} source={source!r}")
-        entries = list(self.pc.iter_entries()) if hasattr(self.pc, "iter_entries") else []
-        for _group_i, snap, node in sorted(entries, key=lambda e: e[2].pos,
-                                           reverse=True):
-            cached = snap.full_prefix[:node.pos]
-            if len(cached) <= chosen:
-                continue
-            shared = common_prefix_len(cached, ids)
-            if shared == len(cached):
-                continue
-            reason = "prompt_end" if shared == len(ids) else "token_mismatch"
-            cache_tok = cached[shared] if shared < len(cached) else "<END>"
-            prompt_tok = ids[shared] if shared < len(ids) else "<END>"
-            before, prompt_after = self._cache_log_context(ids, shared)
-            _, cache_after = self._cache_log_context(cached, shared)
-            self._log(
-                f"PREFIX CACHE REJECT source={node.source!r} len={len(cached)} "
-                f"full_len={len(snap.full_prefix)} "
-                f"reason={reason} common={shared} cache_tok={cache_tok!r} "
-                f"prompt_tok={prompt_tok!r}"
-            )
-            self._log(f"  before={before!r}")
-            self._log(f"  cache_after={cache_after!r}")
-            self._log(f"  prompt_after={prompt_after!r}")
 
     def has_rows(self):
         return bool(self.rows)
@@ -235,9 +215,6 @@ class Scheduler:
                 group.pos = pos
                 self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
                           f"rid={req.rid} source={match.source!r}")
-                before, prompt_after = self._cache_log_context(ids, pos)
-                self._log(f"  hit_before={before!r}")
-                self._log(f"  hit_prompt_after={prompt_after!r}")
                 if group.cached_h is None and pos == len(ids):
                     group.state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
                     group.pos = 0
@@ -248,6 +225,7 @@ class Scheduler:
                 group.pos = 0
                 self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
             group.started = True
+            self._capture_session_base(req, group.state)
 
         if cancelled and cancelled(req.rid):
             self._log(f"PREFILL CANCELLED rid={req.rid}")
@@ -257,9 +235,13 @@ class Scheduler:
         if h is None:
             start = group.pos
             end = min(start + self.chunk, len(ids)) if self.chunk else len(ids)
+            prompt_len = req.session_prompt_len
+            if prompt_len is not None and start < prompt_len < end:
+                end = prompt_len
             h = eng.prefill_piece(group.state, ids[start:end], len(ids),
                                   log=self._log)
             group.pos = end
+            self._capture_session_base(req, group.state)
             if (group.cacheable and self.pc is not None and self.chunk
                     and end < len(ids) and end >= len(ids) - 3 * self.chunk
                     and end - start == self.chunk):
@@ -293,6 +275,15 @@ class Scheduler:
         group.firsts[i] = first
         group.last_h[i] = h
         return True
+
+    def _capture_session_base(self, req: Req, state: BatchState) -> None:
+        prompt_len = req.session_prompt_len
+        if (not req.session_cache or prompt_len is None
+                or req.session_base_full is not None
+                or state.lengths[0] != prompt_len):
+            return
+        req.session_base_full = self.eng.clone_state(state)
+        req.session_base_ssm = self.eng.clone_ssm(state.cache)
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
         """Merge prefilled requests into the live batch. Rebuilds the batch from
@@ -394,15 +385,26 @@ class Scheduler:
             return
 
         if prompt_len != len(req.prompt):
-            single, hidden = self.eng.prefill([prefix], chunk=self.chunk)
-            h_final = hidden[:, -1:, :]
+            if req.session_base_full is None or req.session_base_ssm is None:
+                self._log(f"SESSION STORE SKIP rid={req.rid} prompt_len={prompt_len} "
+                          f"prompt={len(req.prompt)} out={len(req.out)} "
+                          f"reason=no_session_base")
+                return
+            if not req.out:
+                self._log(f"SESSION STORE SKIP rid={req.rid} reason=no_output")
+                return
+            single = self.eng.restore_at(req.session_base_full,
+                                         req.session_base_ssm, prompt_len)
+            h_final = self.eng.forward(
+                single, mx.array([req.out], dtype=mx.int32)
+            )[:, -1:, :]
             mx.eval(h_final)
             self.pc.store(prefix, (self.eng.clone_state(single),
                                   self.eng.clone_ssm(single.cache),
                                   len(prefix), h_final + 0),
                           source=f"session rid={req.rid}", save=False)
             self._log(f"SESSION STORE len={len(prefix)} prompt_len={prompt_len} "
-                      f"rid={req.rid}")
+                      f"rid={req.rid} replay={len(req.out)}")
             return
 
         covered = state.lengths[row] - len(req.prompt)
