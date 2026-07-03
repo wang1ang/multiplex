@@ -365,7 +365,7 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
-          debug=False, prefix_cache_dir="none"):
+          debug=False, prefix_cache_dir="auto"):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
     if mtp_path is None:
@@ -397,10 +397,10 @@ if __name__ == "__main__":
     ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
                     help="log scheduler activity (prefill/join/advance/exit); "
                          "on by default, --no-debug to silence")
-    ap.add_argument("--prefix-cache-dir", default="none",
-                    help="prefix cache persistence dir; default 'none' keeps "
-                         "cache in memory only, use 'auto' for "
-                         "~/.cache/multiplex/prefixcache/<model>")
+    ap.add_argument("--prefix-cache-dir", default="auto",
+                    help="prefix cache load dir; default 'auto' reads "
+                         "~/.cache/multiplex/prefixcache/<model>. Disk writes "
+                         "are currently disabled.")
     args = ap.parse_args()
 
     # registry.select behaves per-environment: a server run without a tty gets

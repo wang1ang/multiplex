@@ -119,19 +119,13 @@ class PrefixCache:
             self._debug(f"LOAD LEGACY FAILED path={self._legacy_file} error={e!r}")
 
     def _save_disk(self, *, wait: bool = False) -> None:
+        # Load-on-start stays enabled, but writes are disabled for now because
+        # synchronous SSD persistence was hurting interactive batching latency.
+        _ = wait
         if self._store is None:
             return
-        try:
-            stats = self._store.save(self._snaps, clock=self._clock, wait=wait)
-            self._debug(f"SAVE entries={self._entry_count()} "
-                        f"groups={len(self._snaps)} "
-                        f"encoded={stats['encoded']} wrote={stats['wrote']} "
-                        f"deduped={stats['deduped']} "
-                        f"path={self._store.manifest_path}")
-            self._dirty = False
-        except Exception as e:
-            path = self._store.manifest_path if self._store is not None else None
-            self._debug(f"SAVE FAILED path={path} error={e!r}")
+        self._debug("SAVE SKIP writes_disabled=True")
+        self._dirty = False
 
     def _coerce_loaded(self, raw) -> list[Snapshot]:
         groups: list[Snapshot] = []
