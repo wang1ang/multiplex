@@ -1,10 +1,10 @@
-"""Interactive REPL for the dynamic-batch scheduler — test "入" (mid-flight join).
+"""Chat CLI for testing dynamic batching and mid-generation joins.
 
     python try_engine.py [--model PATH] [--raw] [-n N] [-d DEPTH] [--debug]
 
 A fixed input box sits at the bottom (like most CLIs); generated text scrolls
-above it. Type a prompt + Enter to start; type another WHILE it runs to add it
-into the live batch (that's "入"). :q or Ctrl-C quits.
+above it. Type a prompt + Enter to start; type another while it runs to add it
+to the live batch. :q or Ctrl-C quits.
 
 Drives multiplex.scheduler.Scheduler: new requests are chunk-prefilled and
 merged into the running batch. -d = draft depth k (0 = pure AR).
@@ -74,7 +74,7 @@ def main() -> int:
 
     def render():
         output_lines = [
-            "[Type a prompt + Enter. Add more while it runs (入). :q quits.]",
+            "[Type a prompt + Enter. Add more while it runs. :q quits.]",
             "",
         ]
         for rid in sorted(produced_text):
@@ -111,7 +111,7 @@ def main() -> int:
         next_rid[0] += 1
         prompts[rid] = text
         produced_text[rid] = ""
-        # Prefill the new request and merge it into the live batch (入). The
+        # Prefill the new request and merge it into the live batch. The
         # merge returns each joined request's FIRST token — show it now (it is
         # not part of the next step()'s output).
         group = PrefillGroup(req=Req(rid, to_ids(eng, text, args.raw), args.max_tokens))

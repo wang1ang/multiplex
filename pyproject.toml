@@ -6,10 +6,11 @@ requires-python = ">=3.10"
 dependencies = [
     "mlx>=0.20",
     "mlx-lm>=0.31",
+    "numpy>=1.26",
 ]
 
 [project.optional-dependencies]
-cli = ["prompt_toolkit>=3.0"]   # try_engine.py interactive REPL only
+cli = ["prompt_toolkit>=3.0"]   # try_engine.py Chat CLI only
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -11,6 +11,13 @@ serve-webui.sh
 open-webui.log
 .webui_secret_key
 logs/
+
+# local-only legacy/dev files removed from git
+requirements.txt
+smoke_engine.py
+test_scheduler.py
+multiplex/bridge/thinking.py
+
 # build artifacts
 dist/
 build/
