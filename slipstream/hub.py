@@ -160,24 +160,35 @@ class Hub:
                                 prefix_cache_dir=c["prefix_cache_dir"])
         self._ready.set()
         sched = self._sched
+        waiting: list[Req] = []
+        prefill_group: PrefillGroup | None = None
         while True:
             # admit newly submitted requests: prefill them (batched) and merge in
             with self._lock:
                 pending, self._incoming = self._incoming, []
             # Skip any request whose client already went away before we started.
             pending = [r for r in pending if not self.cancelled(r.rid)]
-            if pending:
-                group = PrefillGroup(reqs=pending)
-                # prefill_chunk aborts (returns None) if the request is cancelled
-                # mid-prefill, so a 60k-token prompt for a gone client stops early.
-                while (done := sched.prefill_chunk(group, self.cancelled)) is False:
-                    pass
-                if done:
-                    self._emit([(rid, [first]) for rid, first in sched.merge_ready(group)])
+            waiting.extend(pending)
+
+            if prefill_group is None and waiting:
+                prefill_group = PrefillGroup(reqs=waiting)
+                waiting = []
+
+            if prefill_group is not None:
+                # Advance only one prefill chunk, then return to this loop so
+                # live rows keep decoding and new requests can enter waiting.
+                done = sched.prefill_chunk(prefill_group, self.cancelled)
+                if done is None:
+                    prefill_group = None
+                elif done:
+                    self._emit([(rid, [first])
+                                for rid, first in sched.merge_ready(prefill_group)])
+                    prefill_group = None
 
             if not sched.has_rows():
-                sched.flush_prefix_cache()
-                time.sleep(0.003)   # idle; wait for work
+                if prefill_group is None and not waiting:
+                    sched.flush_prefix_cache()
+                    time.sleep(0.003)   # idle; wait for work
                 continue
 
             # Drop live rows whose client disconnected mid-generation.

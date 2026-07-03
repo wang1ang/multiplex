@@ -53,6 +53,12 @@ class PrefillGroup:
     singles: list = field(default_factory=list)   # per-req single-row BatchState
     firsts: list = field(default_factory=list)    # per-req first sampled token
     last_h: list = field(default_factory=list)    # per-req [1,1,H] trunk hidden
+    state: BatchState | None = None               # single-row chunked prefill
+    pos: int = 0
+    ssm_snaps: dict[int, list] = field(default_factory=dict)
+    cacheable: bool = False
+    cached_h: object = None
+    started: bool = False
 
 
 class Scheduler:
@@ -158,8 +164,9 @@ class Scheduler:
         """Prefill the group by LENGTH-SUBGROUP: requests of equal length are
         prefilled together (equal length = no padding = no SSM conv contamination
         from pad tokens); odd lengths prefill alone. Fills per-request single-row
-        states + first tokens. Returns True when done, or None if a request was
-        cancelled mid-prefill (client gone) — the caller then abandons the group.
+        states + first tokens. Returns False after one unfinished chunk, True
+        when done, or None if a request was cancelled mid-prefill (client gone)
+        — the caller then abandons the group.
 
         ``cancelled(rid)`` (optional) is polled between prefill chunks so a long
         prompt for a departed client stops instead of running to completion.
@@ -167,16 +174,16 @@ class Scheduler:
         Unequal-length prefill in one batch would left/right-pad the short rows
         and the pad tokens leak into the GatedDeltaNet conv — verified to corrupt
         the short row. Grouping by length avoids padding entirely."""
-        group.singles = [None] * len(group.reqs)
-        group.firsts = [None] * len(group.reqs)
-        group.last_h = [None] * len(group.reqs)
+        if not group.singles:
+            group.singles = [None] * len(group.reqs)
+            group.firsts = [None] * len(group.reqs)
+            group.last_h = [None] * len(group.reqs)
 
         # A single request can reuse a cached prefix (concurrency is rare, so
         # long prompts arrive alone); batched prefill has per-row prefixes and
         # keeps the plain length-grouped path.
-        if self.pc is not None and len(group.reqs) == 1:
-            self._prefill_one(group, 0, cancelled)
-            return None if group.singles[0] is None else True
+        if len(group.reqs) == 1:
+            return self._prefill_one(group, 0, cancelled)
 
         by_len: dict[int, list[int]] = {}
         for i, r in enumerate(group.reqs):
@@ -212,49 +219,61 @@ class Scheduler:
         req = group.reqs[i]
         ids = req.prompt
         eng = self.eng
-        match = self.pc.find(ids)
-        self._log_prefix_cache_decision(req, ids, match)
+        if not group.started:
+            match = self.pc.find(ids) if self.pc is not None else None
+            self._log_prefix_cache_decision(req, ids, match)
 
-        # Continue from a reused prefix (restore at the matched boundary), or
-        # cold-start from scratch.
-        stop = (lambda: cancelled and cancelled(req.rid))
-        cached_h = None
-        if match is not None:
-            payload = match.payload
-            if len(payload) == 3:
-                full, base_ssm, pos = payload
+            group.cached_h = None
+            group.cacheable = match is None
+            if match is not None:
+                payload = match.payload
+                if len(payload) == 3:
+                    full, base_ssm, pos = payload
+                else:
+                    full, base_ssm, pos, group.cached_h = payload
+                group.state = eng.restore_at(full, base_ssm, pos)
+                group.pos = pos
+                self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
+                          f"rid={req.rid} source={match.source!r}")
+                before, prompt_after = self._cache_log_context(ids, pos)
+                self._log(f"  hit_before={before!r}")
+                self._log(f"  hit_prompt_after={prompt_after!r}")
+                if group.cached_h is None and pos == len(ids):
+                    group.state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
+                    group.pos = 0
+                    group.cacheable = True
+                    self._log(f"PREFIX HIT exact without hidden; cold rerun rid={req.rid}")
             else:
-                full, base_ssm, pos, cached_h = payload
-            state = eng.restore_at(full, base_ssm, pos)
-            self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
-                      f"rid={req.rid} source={match.source!r}")
-            before, prompt_after = self._cache_log_context(ids, pos)
-            self._log(f"  hit_before={before!r}")
-            self._log(f"  hit_prompt_after={prompt_after!r}")
-            # Older prompt-block entries do not include the last hidden state.
-            # An exact hit with no tail cannot produce the first sampled token
-            # from KV/SSM alone, so rerun cold in that rare case.
-            if cached_h is None and pos == len(ids):
-                match = None
-                state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
-                pos = 0
-                self._log(f"PREFIX HIT exact without hidden; cold rerun rid={req.rid}")
-        else:
-            state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
-            pos = 0
-            self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
+                group.state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
+                group.pos = 0
+                self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
+            group.started = True
 
-        # Prompt cache is populated only for a fully cold prefill. It stores
-        # chunk-boundary blocks so future prompts can reuse a long prefix.
-        ssm_snaps: dict[int, list] = {}
-        on_ssm = (lambda p, s: ssm_snaps.__setitem__(p, s)) if match is None else None
-        h = cached_h if pos == len(ids) else eng._run_chunked(
-            state, ids[pos:], self.chunk, log=self._log, stop=stop, on_ssm=on_ssm
-        )
-        if h is not None and match is None:
-            full = eng.clone_state(state)
+        if cancelled and cancelled(req.rid):
+            self._log(f"PREFILL CANCELLED rid={req.rid}")
+            return None
+
+        h = group.cached_h if group.pos == len(ids) else None
+        if h is None:
+            start = group.pos
+            end = min(start + self.chunk, len(ids)) if self.chunk else len(ids)
+            h = eng.prefill_piece(group.state, ids[start:end], len(ids),
+                                  log=self._log)
+            group.pos = end
+            if (group.cacheable and self.pc is not None and self.chunk
+                    and end < len(ids) and end >= len(ids) - 3 * self.chunk
+                    and end - start == self.chunk):
+                group.ssm_snaps[end] = eng.clone_ssm(group.state.cache)
+            if cancelled and cancelled(req.rid):
+                self._log(f"PREFILL CANCELLED rid={req.rid}")
+                return None
+            if group.pos < len(ids):
+                return False
+
+        if group.cacheable and self.pc is not None:
+            full = eng.clone_state(group.state)
             stored = False
-            for p, ssm in ssm_snaps.items():
+            for p, ssm in group.ssm_snaps.items():
                 if p < len(ids):
                     block = p // self.chunk if self.chunk else 0
                     self.pc.store(ids, (full, ssm, p),
@@ -266,16 +285,14 @@ class Scheduler:
             if stored:
                 self._log(f"PREFIX STORE DEFER FLUSH rid={req.rid}")
 
-        if h is None:                               # cancelled mid-prefill
-            self._log(f"PREFILL CANCELLED rid={req.rid}")
-            return
         h = h[:, -1:, :]
         first = int(mx.argmax(eng.logits(h)[0, -1]))
 
         req.out.append(first)
-        group.singles[i] = eng.extract_row(state, 0)
+        group.singles[i] = eng.extract_row(group.state, 0)
         group.firsts[i] = first
         group.last_h[i] = h
+        return True
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
         """Merge prefilled requests into the live batch. Rebuilds the batch from
