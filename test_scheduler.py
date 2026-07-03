@@ -33,17 +33,17 @@ PROMPTS = {
 
 
 def group(req):
-    return PrefillGroup(reqs=[req])
+    return PrefillGroup(req=req)
 
 
 def solo(eng, prompt_ids, n, k=0):
     """Reference: run one request alone through the scheduler; return its tokens."""
     sch = Scheduler(eng, _DR, k=k)
-    g = PrefillGroup(reqs=[Req(0, prompt_ids, n)])
+    g = PrefillGroup(req=Req(0, prompt_ids, n))
     while not sch.prefill_chunk(g):
         pass
     sch.merge_ready(g)
-    out = list(g.reqs[0].out)
+    out = list(g.req.out)
     while sch.has_rows():
         for _rid, toks in sch.step():
             out.extend(toks)
@@ -101,7 +101,7 @@ def main():
 
     print("1) single request == solo")
     sch = Scheduler(eng, _DR, k=0)
-    got = drive(sch, [(0, PrefillGroup(reqs=[Req(0, enc(PROMPTS["france"]), N)]))])
+    got = drive(sch, [(0, group(Req(0, enc(PROMPTS["france"]), N)))])
     ok &= check("france", got[0], ref["france"])
 
     print("2) three requests submitted at once == each solo")
@@ -117,8 +117,8 @@ def main():
 
     print("3) mid-flight join (入): one runs, another joins at step 5")
     sch = Scheduler(eng, _DR, k=0)
-    g0 = PrefillGroup(reqs=[Req(0, enc(PROMPTS["story"]), N)])
-    g1 = PrefillGroup(reqs=[Req(1, enc(PROMPTS["france"]), N)])
+    g0 = group(Req(0, enc(PROMPTS["story"]), N))
+    g1 = group(Req(1, enc(PROMPTS["france"]), N))
     got = drive(sch, [(0, g0), (5, g1)])
     ok &= check("story (running)", got[0], ref["story"])
     ok &= check("france (joined@5)", got[1], ref["france"])

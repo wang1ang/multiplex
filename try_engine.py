@@ -91,9 +91,13 @@ def main() -> int:
         # Prefill the new request and merge it into the live batch (入). The
         # merge returns each joined request's FIRST token — show it now (it is
         # not part of the next step()'s output).
-        group = PrefillGroup(reqs=[Req(rid, to_ids(eng, text, args.raw), args.max_tokens)])
-        while not sch.prefill_chunk(group):
-            pass
+        group = PrefillGroup(req=Req(rid, to_ids(eng, text, args.raw), args.max_tokens))
+        while True:
+            done = sch.prefill_chunk(group)
+            if done is None:
+                return
+            if done:
+                break
         for r, first in sch.merge_ready(group):
             produced_text[r] += eng.decode([first])
         render()
