@@ -35,7 +35,7 @@ If no MTP head is available, the same stack runs pure autoregressive decoding.
 - Tool-call bridge for model text -> structured OpenAI-style tool calls.
 - Model discovery under `~/.mtplx/models`.
 - Optional on-disk prefix cache under `~/.cache/multiplex/prefixcache`.
-- Interactive REPL for testing dynamic batching locally.
+- Interactive chat CLI for testing dynamic batching locally.
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ Or use a model directory name discovered under `~/.mtplx/models`:
 python -m multiplex.server --model MODEL_NAME
 ```
 
-Try the dynamic-batch REPL:
+Try the chat CLI:
 
 ```bash
 python try_engine.py --model /path/to/model
