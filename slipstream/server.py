@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 import json
 import time
+import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -51,6 +52,52 @@ def _messages_from_chat(body):
     return list(body.get("messages", []))
 
 
+def _content_text(content):
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for part in content:
+            if isinstance(part, str):
+                parts.append(part)
+            elif isinstance(part, dict):
+                text = part.get("text")
+                if text is None:
+                    text = part.get("output")
+                if text is not None:
+                    parts.append(str(text))
+        return "".join(parts)
+    return str(content)
+
+
+def _arguments_text(arguments):
+    if isinstance(arguments, str):
+        return arguments
+    if arguments is None:
+        return "{}"
+    return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
+
+
+def _function_call_message(item):
+    call_id = str(item.get("call_id") or item.get("id") or "")
+    function = item.get("function") if isinstance(item.get("function"), dict) else {}
+    name = str(item.get("name") or function.get("name") or "")
+    if not name:
+        return None
+    arguments = item.get("arguments", function.get("arguments", "{}"))
+    return {
+        "role": "assistant",
+        "content": "",
+        "tool_calls": [{
+            "id": call_id,
+            "type": "function",
+            "function": {"name": name, "arguments": _arguments_text(arguments)},
+        }],
+    }
+
+
 def _messages_from_responses(body):
     """Responses: optional `instructions` (system) + `input` (str or items).
     Roles are passed through verbatim (developer frames included); role mapping
@@ -64,13 +111,33 @@ def _messages_from_responses(body):
         msgs.append({"role": "user", "content": inp})
     elif isinstance(inp, list):
         for item in inp:
-            if isinstance(item, dict) and item.get("type") in ("message", None):
-                c = item.get("content")
-                if isinstance(c, list):  # content parts -> join text
-                    c = "".join(p.get("text", "") for p in c if isinstance(p, dict))
-                if isinstance(c, str):
-                    msgs.append({"role": item.get("role", "user"), "content": c})
+            if not isinstance(item, dict):
+                continue
+            typ = item.get("type")
+            if typ in ("message", None):
+                msgs.append({
+                    "role": item.get("role", "user"),
+                    "content": _content_text(item.get("content")),
+                })
+            elif typ == "function_call":
+                msg = _function_call_message(item)
+                if msg is not None:
+                    msgs.append(msg)
+            elif typ == "function_call_output":
+                msgs.append({
+                    "role": "tool",
+                    "tool_call_id": str(item.get("call_id") or item.get("id") or ""),
+                    "content": _content_text(item.get("output", item.get("content"))),
+                })
     return msgs
+
+
+def _assistant_messages(text, tool_calls=None):
+    if tool_calls:
+        return [{"role": "assistant", "content": text or "", "tool_calls": tool_calls}]
+    if text:
+        return [{"role": "assistant", "content": text}]
+    return []
 
 
 # --- SSE encoders -------------------------------------------------------------
@@ -126,15 +193,16 @@ def _chat_stream(backend, messages, max_tokens, tools=None):
     yield "data: [DONE]\n\n"
 
 
-def _responses_stream(backend, messages, max_tokens, tools=None):
+def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=None):
     rid, mid = _hex("resp_"), _hex("msg_")
     base = {"id": rid, "object": "response", "model": backend.model_id}
+    message_item = {"id": mid, "type": "message", "role": "assistant",
+                    "content": [], "status": "in_progress"}
 
     yield _sse({"type": "response.created", "response": {**base, "status": "in_progress"}},
                "response.created")
-    yield _sse({"type": "response.output_item.added", "item":
-                {"id": mid, "type": "message", "role": "assistant", "content": [],
-                 "status": "in_progress"}}, "response.output_item.added")
+    yield _sse({"type": "response.output_item.added", "item": message_item},
+               "response.output_item.added")
 
     full, calls = "", []
     for visible, tool_calls in _stream_visible(backend, messages, max_tokens, tools):
@@ -146,19 +214,24 @@ def _responses_stream(backend, messages, max_tokens, tools=None):
             calls = tool_calls
     yield _sse({"type": "response.output_text.done", "item_id": mid, "text": full},
                "response.output_text.done")
+    message_item = {**message_item, "status": "completed",
+                    "content": [{"type": "output_text", "text": full, "annotations": []}]}
+    yield _sse({"type": "response.output_item.done", "item": message_item},
+               "response.output_item.done")
 
-    output = [{"id": mid, "type": "message", "role": "assistant", "status": "completed",
-               "content": [{"type": "output_text", "text": full, "annotations": []}]}]
+    output = [message_item]
     # A function_call output item per parsed tool call (added -> args delta -> done).
     for c in calls:
         fn = c.get("function") or {}
-        item = {"type": "function_call", "call_id": "fc_" + str(c.get("id") or ""),
+        item_id = _hex("fc_")
+        call_id = str(c.get("id") or _hex("call_"))
+        item = {"id": item_id, "type": "function_call", "call_id": call_id,
                 "name": fn.get("name") or "", "arguments": fn.get("arguments") or ""}
         yield _sse({"type": "response.output_item.added",
                     "item": {**item, "status": "in_progress", "arguments": ""}},
                    "response.output_item.added")
         yield _sse({"type": "response.function_call_arguments.delta",
-                    "item_id": item["call_id"], "delta": item["arguments"]},
+                    "item_id": item["id"], "delta": item["arguments"]},
                    "response.function_call_arguments.delta")
         yield _sse({"type": "response.output_item.done", "item": {**item, "status": "completed"}},
                    "response.output_item.done")
@@ -167,6 +240,8 @@ def _responses_stream(backend, messages, max_tokens, tools=None):
     yield _sse({"type": "response.completed", "response": {
         **base, "status": "completed", "created_at": int(time.time()), "output": output,
     }}, "response.completed")
+    if on_complete is not None:
+        on_complete(rid, _assistant_messages(full, calls))
 
 
 # --- non-stream bodies --------------------------------------------------------
@@ -193,8 +268,8 @@ def _responses_body(backend, text, tool_calls=None):
                        "content": [{"type": "output_text", "text": text, "annotations": []}]})
     for c in tool_calls or []:
         fn = c.get("function") or {}
-        output.append({"type": "function_call", "status": "completed",
-                       "call_id": "fc_" + str(c.get("id") or ""),
+        output.append({"id": _hex("fc_"), "type": "function_call", "status": "completed",
+                       "call_id": str(c.get("id") or _hex("call_")),
                        "name": fn.get("name") or "",
                        "arguments": fn.get("arguments") or ""})
     return {
@@ -205,6 +280,27 @@ def _responses_body(backend, text, tool_calls=None):
 
 # --- HTTP handler -------------------------------------------------------------
 def make_handler(backend: Hub):
+    response_history: dict[str, list[dict]] = {}
+    response_history_order: list[str] = []
+    response_history_lock = threading.Lock()
+
+    def response_messages(body):
+        prev_id = body.get("previous_response_id")
+        if prev_id:
+            with response_history_lock:
+                previous = list(response_history.get(str(prev_id), []))
+        else:
+            previous = []
+        return previous + _messages_from_responses(body)
+
+    def remember_response(rid, messages):
+        with response_history_lock:
+            response_history[str(rid)] = messages
+            response_history_order.append(str(rid))
+            while len(response_history_order) > 32:
+                old = response_history_order.pop(0)
+                response_history.pop(old, None)
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
             pass
@@ -250,13 +346,18 @@ def make_handler(backend: Hub):
                     clean, calls = _split_tool_calls(text, tools)
                     self._json(200, _chat_body(backend, clean, calls))
             elif path == "/v1/responses":
-                msgs = _messages_from_responses(body)
+                msgs = response_messages(body)
                 if stream:
-                    self._sse_stream(_responses_stream(backend, msgs, max_tokens, tools))
+                    self._sse_stream(_responses_stream(
+                        backend, msgs, max_tokens, tools,
+                        on_complete=lambda rid, out: remember_response(rid, msgs + out),
+                    ))
                 else:
                     text = "".join(backend.stream_messages(msgs, max_tokens, tools))
                     clean, calls = _split_tool_calls(text, tools)
-                    self._json(200, _responses_body(backend, clean, calls))
+                    resp = _responses_body(backend, clean, calls)
+                    remember_response(resp["id"], msgs + _assistant_messages(clean, calls))
+                    self._json(200, resp)
             else:
                 self._json(404, {"error": "not found"})
 
