@@ -9,10 +9,10 @@ scheduler). The MTP head loads generically; models with no head run pure AR.
 """
 
 from .engine import Engine, BatchState
-from .mtp import Drafter
+from .mtp import Drafter, find_mtp
 from .scheduler import Scheduler, Req, PrefillGroup
 from .hub import Hub
 
-__all__ = ["Engine", "BatchState", "Drafter", "Scheduler", "Req",
+__all__ = ["Engine", "BatchState", "Drafter", "find_mtp", "Scheduler", "Req",
            "PrefillGroup", "Hub"]
 __version__ = "0.0.0"

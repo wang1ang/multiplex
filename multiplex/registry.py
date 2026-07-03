@@ -1,9 +1,7 @@
-"""Model registry — discover models under a root directory.
+"""Model registry — discover model directories.
 
 Discovery ONLY: it finds model directories and resolves a user argument to one.
-It does not validate weights (load-time does), and it does not decide whether a
-model has an MTP head (that's the model's business — use engine.find_mtp on the
-resolved path). Download/cache management will extend this module later.
+It does not validate weights; load-time code does that.
 """
 
 from __future__ import annotations

@@ -24,8 +24,8 @@ import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from .bridge import ToolCallStreamFilter, extract_tool_calls_with_thinking
-from .engine import find_mtp
 from .hub import Hub
+from .mtp import find_mtp
 
 
 def _split_tool_calls(text, tools):

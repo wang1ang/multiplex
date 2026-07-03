@@ -23,8 +23,8 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
 
 from multiplex import registry
-from multiplex.engine import Engine, find_mtp
-from multiplex.mtp import Drafter
+from multiplex.engine import Engine
+from multiplex.mtp import Drafter, find_mtp
 from multiplex.scheduler import Scheduler, Req, PrefillGroup
 
 

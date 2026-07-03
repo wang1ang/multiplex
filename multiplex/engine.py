@@ -1,13 +1,13 @@
 """L1 — engine layer.
 
 The lowest layer. Its only job: run correct batched forward passes and manage
-the batched cache. It does NOT sample, does NOT decide AR-vs-MTP, does NOT know
-about requests. It gives whatever it's fed a correct forward.
+the batched cache. It does NOT sample or make scheduling decisions. It gives
+whatever token tensor it is fed a correct forward.
 
 Two capabilities, nothing more:
   * batch: process B sequences together in one forward.
   * next-k: feed k tokens per row at once and return all k positions' logits
-    (AR is just k=1; MTP verify is k>1 — the engine doesn't care which).
+    (k=1 and k>1 are the same primitive here).
 
 Correctness facts (verified by experiment):
   * Batched forward of this hybrid SSM+attention model is numerically EXACT vs
@@ -18,17 +18,15 @@ Correctness facts (verified by experiment):
   * Residual divergence between a batched row and the same sequence run alone is
     pure floating-point accumulation (batch reduction order differs from B=1).
     This is inherent to batched inference — NOT a bug — and both trajectories are
-    valid samples. It shows up only after many steps as an occasional token flip.
-  * The cache is ours to roll back for speculative verify: ``snapshot_ssm`` /
-    ``restore_ssm`` save & restore SSM recurrent state (it can't be trimmed),
-    and ``trim_attention`` trims attention KV. Together they undo a rejected
-    verify forward.
+    valid. It shows up only after many steps as an occasional token flip.
+  * The cache is ours to roll back: ``snapshot_ssm`` / ``restore_ssm`` save &
+    restore SSM recurrent state (it can't be trimmed), and ``trim_attention``
+    trims attention KV.
 """
 
 from __future__ import annotations
 
 import os
-import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -39,39 +37,12 @@ from mlx_lm.generate import _make_cache, _right_pad_prompts
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 
-def find_mtp(model_path: str) -> str | None:
-    """Return the model's MTP sidecar path, or None for pure AR/headless."""
-    model_dir = os.path.expanduser(model_path)
-    candidates = []
-
-    runtime = os.path.join(model_dir, "mtplx_runtime.json")
-    if os.path.exists(runtime):
-        try:
-            with open(runtime, encoding="utf-8") as f:
-                data = json.load(f)
-            for key in ("mtp_sidecar_file", "mtp_file"):
-                value = data.get(key)
-                if isinstance(value, str):
-                    candidates.append(os.path.join(model_dir, value))
-        except Exception:
-            pass
-
-    candidates.extend([
-        os.path.join(model_dir, "mtp.safetensors"),
-        os.path.join(model_dir, "mtp", "weights.safetensors"),
-    ])
-    for path in candidates:
-        if os.path.exists(path):
-            return path
-    return None
-
-
 @dataclass
 class BatchState:
     """Batched cache + per-row bookkeeping for B aligned sequences."""
 
     cache: list[Any]        # batched per-layer caches (BatchKVCache / ArraysCache)
-    lengths: list[int]      # committed token count per row (prompt + accepted)
+    lengths: list[int]      # committed token count per row
 
     @property
     def batch_size(self) -> int:
@@ -127,7 +98,7 @@ class Engine:
 
         Row i's next-token hidden is at position ``lengths[i]-1`` (prompts are
         right-padded to max_len). Returns pre-lm_head hidden; get logits with
-        ``logits(hidden)``. The caller samples — the engine doesn't.
+        ``logits(hidden)``. The caller decides how to consume logits.
 
         A single long prompt whose length exceeds ``chunk`` (>0) is fed in
         chunks so the attention scratch stays bounded (a 30k-token prompt's
@@ -206,9 +177,8 @@ class Engine:
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:
         """Feed ``tokens`` (``[B, k]``) per row, return hidden ``[B, k, H]``.
 
-        k=1 is AR; k>1 is speculative verify. Returns ALL k positions' hidden
-        (pre-lm_head; use ``logits()``); does not slice or sample. Advances the
-        cache by k; use snapshot/trim to discard rejected positions.
+        Returns ALL k positions' hidden (pre-lm_head; use ``logits()``); does
+        not slice or sample. Advances the cache by k.
         """
         k = int(tokens.shape[1])
         h = self.model.language_model.model(tokens, cache=state.cache)
@@ -218,10 +188,10 @@ class Engine:
     def snapshot_ssm(self, state: BatchState) -> list:
         """Clone the SSM (ArraysCache) recurrent state of every SSM layer.
 
-        SSM state can't be trimmed (it evolves sequentially), so speculative
-        verify saves it here and restores after. Attention layers are skipped
-        (they trim instead). The clone forces evaluation off the lazy graph
-        (``v + 0``) so later cache writes don't mutate the snapshot.
+        SSM state can't be trimmed because it evolves sequentially. Attention
+        layers are skipped (they trim instead). The clone forces evaluation off
+        the lazy graph (``v + 0``) so later cache writes don't mutate the
+        snapshot.
         """
         snap = []
         for c in state.cache:
@@ -247,23 +217,19 @@ class Engine:
                 c.trim(n)
 
     def filter(self, state: BatchState, keep: list[int]) -> None:
-        """Keep only rows ``keep`` (by row index) in the batched cache; drop the
-        rest. Used to remove finished (EOS) rows so the batch shrinks. Every cache
-        layer (BatchKVCache / ArraysCache) supports filter(indices)."""
+        """Keep only rows ``keep`` (by row index) in the batched cache."""
         for c in state.cache:
             c.filter(keep)
         state.lengths = [state.lengths[i] for i in keep]
 
     def extract_row(self, state: BatchState, i: int) -> BatchState:
         """Pull row ``i`` out of a batched state into its own single-row state,
-        WITHOUT modifying ``state`` (each cache layer's extract(i) copies the
-        row). Used to peel a freshly-prefilled request out of a prefill group."""
+        WITHOUT modifying ``state``."""
         cache = [c.extract(i) for c in state.cache]
         return BatchState(cache=cache, lengths=[state.lengths[i]])
 
     def merge_states(self, states: list[BatchState]) -> BatchState:
-        """Merge several single-row states into one batched state (for "入":
-        adding freshly-prefilled requests into the running batch).
+        """Merge several single-row states into one batched state.
 
         Attention: rows may differ in length, so left-pad every row's KV to the
         max length (per-row left_padding). SSM (ArraysCache): recurrent state is
