@@ -26,6 +26,7 @@ import mlx.core as mx
 from .engine import Engine, BatchState
 from .mtp import Drafter
 from .prefixcache import PrefixCache
+from .prefixcache.state import PrefixCacheState
 
 
 PROMPT_CACHE_MIN_TOKENS = 4096
@@ -40,19 +41,18 @@ class Req:
     # Direct callers/tests can leave this off and only use prompt block caching.
     session_cache: bool = False
     out: list[int] = field(default_factory=list)
-    session_ssm_snaps: dict[int, object] = field(default_factory=dict)
+    session_cache_pos: set[int] = field(default_factory=set)
 
 
 @dataclass
 class PrefillGroup:
     """One request being prefetched before it joins the live decode batch."""
-    reqs: list[Req]
+    req: Req
     single: BatchState | None = None
     first: int | None = None
     last_h: object = None
     state: BatchState | None = None               # single-row chunked prefill
     pos: int = 0
-    ssm_snaps: dict[int, list] = field(default_factory=dict)
     cacheable: bool = False
     cached_h: object = None
     started: bool = False
@@ -76,6 +76,7 @@ class Scheduler:
                                         "session": prefix_cache},
                               disk_dir=cache_dir, log=self._log) \
             if prefix_cache else None
+        self.pc_state = PrefixCacheState(engine) if self.pc is not None else None
 
         # live decode batch
         self.state: BatchState | None = None
@@ -125,27 +126,21 @@ class Scheduler:
 
         ``cancelled(rid)`` (optional) is polled between prefill chunks so a long
         prompt for a departed client stops instead of running to completion."""
-        if len(group.reqs) != 1:
-            raise ValueError("prefill is serial; PrefillGroup must contain one request")
-
-        req = group.reqs[0]
+        req = group.req
         ids = req.prompt
         eng = self.eng
         if not group.started:
-            hit = self._find_cache(ids)
-            self._log_prefix_cache_decision(req, ids, hit)
-            match = hit[1] if hit is not None else None
+            match = self._find_cache(ids)
+            self._log_prefix_cache_decision(req, ids, match)
 
             group.cached_h = None
             group.cacheable = len(ids) > PROMPT_CACHE_MIN_TOKENS
             if match is not None:
-                payload = match.payload
-                if len(payload) == 3:
-                    full, base_ssm, pos = payload
-                else:
-                    full, base_ssm, pos, group.cached_h = payload
-                group.state = eng.restore_at(full, base_ssm, pos)
-                group.pos = pos
+                restored = self.pc_state.restore_match(match)
+                group.state = restored.state
+                group.pos = restored.pos
+                group.cached_h = restored.cached_h
+                pos = group.pos
                 self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
                           f"rid={req.rid} source={match.source!r}")
                 if group.cached_h is None and pos == len(ids):
@@ -161,6 +156,8 @@ class Scheduler:
 
         if cancelled and cancelled(req.rid):
             self._log(f"PREFILL CANCELLED rid={req.rid}")
+            if self.pc is not None:
+                self.pc.prune_unreferenced()
             return None
 
         h = group.cached_h if group.pos == len(ids) else None
@@ -170,34 +167,14 @@ class Scheduler:
             h = eng.prefill_piece(group.state, ids[start:end], len(ids),
                                   log=self._log)
             group.pos = end
-            if (group.cacheable and self.pc is not None and self.chunk
-                    and end < len(ids) and end >= len(ids) - 3 * self.chunk
-                    and end - start == self.chunk
-                    and end >= PROMPT_CACHE_MIN_TOKENS):
-                group.ssm_snaps[end] = eng.clone_ssm(group.state.cache)
+            self._store_prompt_block(req, group, ids, start, end, h)
             if cancelled and cancelled(req.rid):
                 self._log(f"PREFILL CANCELLED rid={req.rid}")
+                if self.pc is not None:
+                    self.pc.prune_unreferenced()
                 return None
             if group.pos < len(ids):
                 return False
-
-        if group.cacheable and self.pc is not None:
-            full = eng.clone_state(group.state)
-            stored = False
-            for p, ssm in group.ssm_snaps.items():
-                if PROMPT_CACHE_MIN_TOKENS <= p < len(ids):
-                    block = p // self.chunk if self.chunk else 0
-                    self.pc.store(
-                        ids, (full, ssm, p),
-                        source=f"prompt rid={req.rid} block={block}",
-                        pool="prompt",
-                        save=False,
-                    )
-                    stored = True
-                    self._log(f"PREFIX STORE block={block} "
-                              f"len={p}/{len(ids)} rid={req.rid}")
-            if stored:
-                self._log(f"PREFIX STORE DEFER FLUSH rid={req.rid}")
 
         h = h[:, -1:, :]
         first = int(mx.argmax(eng.logits(h)[0, -1]))
@@ -210,9 +187,6 @@ class Scheduler:
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
         """Merge one prefilled request into the live batch."""
-        if len(group.reqs) != 1:
-            raise ValueError("prefill is serial; PrefillGroup must contain one request")
-
         singles, hs, prims, reqs = [], [], [], []
         for i, req in enumerate(self.rows):        # existing rows -> singles
             singles.append(self.eng.extract_row(self.state, i))
@@ -220,7 +194,7 @@ class Scheduler:
             prims.append(self.primary[i:i + 1])
             reqs.append(req)
         joined = []
-        r = group.reqs[0]
+        r = group.req
         singles.append(group.single)
         hs.append(group.last_h)
         prims.append(mx.array([group.first]))
@@ -234,6 +208,31 @@ class Scheduler:
             self.dcache = self.dr.make_cache()
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
+
+    def _store_prompt_block(self, req: Req, group: PrefillGroup, ids: list[int],
+                            start: int, end: int, h) -> None:
+        if self.pc is None or self.pc_state is None or not self.chunk:
+            return
+        if end - start != self.chunk:
+            return
+        if not (group.cacheable or req.session_cache):
+            return
+        attn = self.pc_state.clone_attention_block(group.state, start, end)
+        ssm = None
+        source = None
+        cached_h = None
+        if group.cacheable and end >= PROMPT_CACHE_MIN_TOKENS:
+            ssm = self.pc_state.clone_ssm(group.state.cache)
+            block = end // self.chunk
+            source = f"prompt rid={req.rid} block={block}"
+            cached_h = h[:, -1:, :] if end == len(ids) else None
+        stored = self.pc.store_block(
+            ids, start, end, attn, ssm=ssm, source=source,
+            pool="prompt", cached_h=cached_h,
+        )
+        if stored and ssm is not None:
+            self._log(f"PREFIX STORE block={end // self.chunk} "
+                      f"len={end}/{len(ids)} rid={req.rid}")
 
     # --- decode mechanism: one speculative round (推 + 出) ------------------
     def step(self) -> list[tuple[int, list[int]]]:
@@ -292,15 +291,15 @@ class Scheduler:
         self._capture_session_blocks(rows, state)
 
         if finished:
-            for i in finished:
-                self._store_finished_session(rows[i], state, i)
             self._log(f"EXIT {[rows[i].rid for i in finished]}")
             self._keep([i for i in range(B) if i not in finished])
+            if self.pc is not None:
+                self.pc.prune_unreferenced()
 
         return emitted
 
     def _capture_session_blocks(self, rows: list[Req], state: BatchState) -> None:
-        if self.pc is None or not self.chunk:
+        if self.pc is None or self.pc_state is None or not self.chunk:
             return
         for i, req in enumerate(rows):
             if not req.session_cache:
@@ -309,65 +308,24 @@ class Scheduler:
             full_len = len(req.prompt) + len(req.out)
             if pos <= len(req.prompt) or pos > full_len or pos % self.chunk:
                 continue
-            if pos in req.session_ssm_snaps:
+            if pos in req.session_cache_pos:
                 continue
             single = self.eng.extract_row(state, i)
-            req.session_ssm_snaps[pos] = self.eng.clone_ssm(single.cache)
-
-    def _store_finished_session(self, req: Req, state: BatchState, row: int) -> None:
-        """Store generated-session cache at block boundaries only."""
-        if self.pc is None or not req.session_cache:
-            return
-
-        prefix = req.prompt + req.out
-        if not prefix:
-            return
-
-        covered = state.lengths[row] - len(req.prompt)
-        if covered < 0 or covered > len(req.out):
-            self._log(f"SESSION STORE SKIP rid={req.rid} covered={covered} "
-                      f"out={len(req.out)}")
-            return
-
-        single = self.eng.extract_row(state, row)
-        pos = single.lengths[0]
-        final_len = len(prefix)
-        while self.chunk and pos < final_len:
-            boundary = ((pos // self.chunk) + 1) * self.chunk
-            if boundary > final_len:
-                break
-            h_piece = self.eng.forward(
-                single, mx.array([prefix[pos:boundary]], dtype=mx.int32)
-            )
-            mx.eval(h_piece, *(c.state for c in single.cache))
-            pos = boundary
-            req.session_ssm_snaps[pos] = self.eng.clone_ssm(single.cache)
-
-        if pos < final_len:
-            h_final = self.eng.forward(
-                single, mx.array([prefix[pos:final_len]], dtype=mx.int32)
-            )
-            mx.eval(h_final, *(c.state for c in single.cache))
-
-        blocks = [(p, ssm) for p, ssm in sorted(req.session_ssm_snaps.items())
-                  if len(req.prompt) < p <= final_len]
-        if not blocks:
-            return
-
-        full = self.eng.clone_state(single)
-        for p, ssm in blocks:
-            block = p // self.chunk if self.chunk else 0
-            self.pc.store(
-                prefix, (full, ssm, p),
+            start = pos - self.chunk
+            prefix = req.prompt + req.out
+            if len(prefix) < pos or start < 0:
+                continue
+            prefix = prefix[:pos]
+            attn = self.pc_state.clone_attention_block(single, start, pos)
+            ssm = self.pc_state.clone_ssm(single.cache)
+            block = pos // self.chunk
+            if self.pc.store_block(
+                prefix, start, pos, attn, ssm=ssm,
                 source=f"session rid={req.rid} block={block}",
                 pool="session",
-                save=False,
-            )
-        self._log(f"SESSION STORE blocks={len(blocks)} len={len(prefix)} rid={req.rid}")
-
-    def flush_prefix_cache(self) -> None:
-        if self.pc is not None:
-            self.pc.flush()
+            ):
+                req.session_cache_pos.add(pos)
+                self._log(f"SESSION STORE block={block} len={pos} rid={req.rid}")
 
     def _keep(self, keep: list[int]) -> None:
         """Retain only the given row indices in the live batch, dropping the
@@ -390,3 +348,13 @@ class Scheduler:
         rids = set(rids)
         self._log(f"DROP {list(rids)}")
         self._keep([i for i, r in enumerate(self.rows) if r.rid not in rids])
+        if self.pc is not None:
+            self.pc.prune_unreferenced()
+
+    def cancel(self, rids) -> None:
+        """Notify L3 that request ids were cancelled upstream."""
+        live = self.live_rids() & set(rids)
+        if live:
+            self.drop(live)
+        elif self.pc is not None:
+            self.pc.prune_unreferenced()

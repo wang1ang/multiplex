@@ -29,6 +29,79 @@ from .scheduler import Scheduler, Req, PrefillGroup
 _DONE = object()   # sentinel pushed to a request's queue when it finishes
 
 
+class RequestManager:
+    """L4-owned request lifecycle state.
+
+    HTTP threads submit/cancel requests here; the engine thread drains pending
+    work, emits text, and finishes requests. Lower layers never see this object.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._incoming: list[Req] = []
+        self._queues: dict[int, queue.Queue] = {}
+        self._toks: dict[int, list[int]] = {}
+        self._shown: dict[int, int] = {}
+        self._cancelled: set[int] = set()
+        self._rid = 0
+
+    def submit(self, prompt_ids, max_tokens) -> tuple[Req, queue.Queue]:
+        q: queue.Queue = queue.Queue()
+        with self._lock:
+            req = Req(self._rid, list(prompt_ids), max_tokens, session_cache=True)
+            self._rid += 1
+            self._incoming.append(req)
+            self._queues[req.rid] = q
+            self._toks[req.rid] = []
+            self._shown[req.rid] = 0
+        return req, q
+
+    def cancel(self, rid: int) -> None:
+        with self._lock:
+            if rid in self._queues:
+                self._cancelled.add(rid)
+
+    def is_cancelled(self, rid: int) -> bool:
+        with self._lock:
+            return rid in self._cancelled
+
+    def drain_incoming(self) -> list[Req]:
+        with self._lock:
+            pending, self._incoming = self._incoming, []
+        return pending
+
+    def drain_cancelled(self) -> set[int]:
+        with self._lock:
+            rids = set(self._cancelled)
+            self._cancelled.clear()
+        return rids
+
+    def finish(self, rid: int, *, notify: bool) -> None:
+        with self._lock:
+            q = self._queues.pop(rid, None)
+            self._toks.pop(rid, None)
+            self._shown.pop(rid, None)
+            self._cancelled.discard(rid)
+        if notify and q is not None:
+            q.put(_DONE)
+
+    def emit(self, emitted, decode) -> None:
+        for rid, toks in emitted:
+            with self._lock:
+                if rid not in self._toks:
+                    continue
+                self._toks[rid].extend(toks)
+                all_toks = list(self._toks[rid])
+                shown = self._shown[rid]
+                q = self._queues.get(rid)
+            text = decode(all_toks)
+            if q is None or len(text) <= shown:
+                continue
+            q.put(text[shown:])
+            with self._lock:
+                self._shown[rid] = len(text)
+
+
 class Hub:
     def __init__(self, model_path, mtp_path, *, k=1, chunk=512, debug=False,
                  prefix_cache_dir="auto"):
@@ -36,13 +109,7 @@ class Hub:
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,
                          prefix_cache_dir=prefix_cache_dir)
-        self._lock = threading.Lock()
-        self._incoming = []                       # [Req] submitted, not yet added
-        self._queues: dict[int, queue.Queue] = {}  # rid -> text-delta queue
-        self._toks: dict[int, list] = {}           # rid -> all tokens (hub's copy)
-        self._shown: dict[int, int] = {}           # rid -> chars already emitted
-        self._cancelled: set[int] = set()          # rids whose client went away
-        self._rid = 0
+        self._requests = RequestManager()
         self._request_log_dir = Path("logs") / "requests"
         # The model must be loaded AND used on the same thread (MLX's GPU stream
         # is thread-bound), so the engine thread loads it. Wait until ready.
@@ -83,24 +150,19 @@ class Hub:
         consumer stops early (client disconnects -> the SSE handler stops
         iterating -> this generator is closed), mark the request cancelled so the
         engine thread drops it instead of finishing generation for no one."""
-        q: queue.Queue = queue.Queue()
-        with self._lock:
-            r = Req(self._rid, list(prompt_ids), max_tokens, session_cache=True)
-            self._rid += 1
-            self._incoming.append(r)
-            self._queues[r.rid] = q
-            self._toks[r.rid] = []
-            self._shown[r.rid] = 0
+        r, q = self._requests.submit(prompt_ids, max_tokens)
         self._write_request_log(r, prompt_ids)
+        completed = False
         try:
             while True:
                 item = q.get()
                 if item is _DONE:
+                    completed = True
                     return
                 yield item
         finally:
-            # Normal completion already cleaned up; this matters on early close.
-            self._cancelled.add(r.rid)
+            if not completed:
+                self._requests.cancel(r.rid)
 
     def _write_request_log(self, req, prompt_ids):
         if not self._cfg["debug"]:
@@ -124,9 +186,6 @@ class Hub:
         except Exception:
             pass
 
-    def cancelled(self, rid) -> bool:
-        return rid in self._cancelled
-
     # --- engine thread (only thread that touches MLX) -----------------------
     def _run(self):
         c = self._cfg
@@ -144,56 +203,46 @@ class Hub:
         while True:
             # admit newly submitted requests; prefill them serially, one chunk
             # per loop, while live rows keep decoding.
-            with self._lock:
-                pending, self._incoming = self._incoming, []
-            # Skip any request whose client already went away before we started.
-            pending = [r for r in pending if not self.cancelled(r.rid)]
+            pending = self._requests.drain_incoming()
+            cancelled = self._requests.drain_cancelled()
+            if cancelled:
+                pending = [r for r in pending if r.rid not in cancelled]
+                waiting = [r for r in waiting if r.rid not in cancelled]
+                if prefill_group is not None and prefill_group.req.rid in cancelled:
+                    prefill_group = None
+                sched.cancel(cancelled)
+                for rid in cancelled:
+                    self._requests.finish(rid, notify=False)
             waiting.extend(pending)
 
             if prefill_group is None and waiting:
-                prefill_group = PrefillGroup(reqs=[waiting.pop(0)])
+                prefill_group = PrefillGroup(req=waiting.pop(0))
 
             if prefill_group is not None:
                 # Advance only one prefill chunk, then return to this loop so
                 # live rows keep decoding and new requests can enter waiting.
-                done = sched.prefill_chunk(prefill_group, self.cancelled)
+                done = sched.prefill_chunk(
+                    prefill_group, self._requests.is_cancelled
+                )
                 if done is None:
+                    self._requests.finish(prefill_group.req.rid, notify=False)
                     prefill_group = None
                 elif done:
-                    self._emit([(rid, [first])
-                                for rid, first in sched.merge_ready(prefill_group)])
+                    self._requests.emit(
+                        [(rid, [first])
+                         for rid, first in sched.merge_ready(prefill_group)],
+                        self.eng.decode,
+                    )
                     prefill_group = None
 
             if not sched.has_rows():
                 if prefill_group is None and not waiting:
-                    sched.flush_prefix_cache()
                     time.sleep(0.003)   # idle; wait for work
                 continue
 
-            # Drop live rows whose client disconnected mid-generation.
-            gone = [rid for rid in sched.live_rids() if self.cancelled(rid)]
-            if gone:
-                sched.drop(gone)
-
             live_before = sched.live_rids()
-            self._emit(sched.step())
+            self._requests.emit(sched.step(), self.eng.decode)
 
             # finished = was live before this step but no longer live -> done
             for rid in live_before - sched.live_rids():
-                q = self._queues.pop(rid, None)
-                self._toks.pop(rid, None)
-                self._shown.pop(rid, None)
-                if q is not None:
-                    q.put(_DONE)
-
-    def _emit(self, emitted):
-        """Accumulate new tokens per rid and push the decoded text delta."""
-        for rid, toks in emitted:
-            if rid not in self._toks:
-                continue
-            self._toks[rid].extend(toks)
-            text = self.eng.decode(self._toks[rid])
-            q = self._queues.get(rid)
-            if q is not None and len(text) > self._shown[rid]:
-                q.put(text[self._shown[rid]:])
-                self._shown[rid] = len(text)
+                self._requests.finish(rid, notify=True)
