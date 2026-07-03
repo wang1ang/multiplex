@@ -1,50 +1,101 @@
 # multiplex
 
-本地 LLM 推理框架,核心是 [mlx-lm](https://github.com/ml-explore/mlx-lm)。
+本地 LLM 推理框架,核心依赖 [mlx-lm](https://github.com/ml-explore/mlx-lm)。
 
-目标:**在保住 MTP 投机解码加速的同时,做真批量同时解码 + 序列随进随出** —— 这三者的组合现有引擎(mlx-lm / MTPLX / oMLX / llama.cpp)都没打通:它们一旦 batch_size>1 就关掉 MTP。
+目标是把三件事接到同一条执行路径上:
 
-> 项目名: `multiplex`。当前 Python import 包名已是 `multiplex`。
+- 真批量解码:多条序列一次 forward。
+- MTP 投机解码:有 MTP sidecar 时保留 speculative speedup。
+- 动态批:请求可以在运行中加入/退出,不要求整批同生同死。
+
+当前 Python 包名和项目名都是 `multiplex`。
 
 ## 设计原则
 
-- **直筒,不留分支。** 需求是一条直路就只实现这一条:不写用不到的路径、不写 fallback、不写"以防万一"的兜底。用到什么就断言什么,拿不到直接报错。
-- **要深,不要宽。** 把真正要的那条路做到底、做对、做透,而非为多种情况各留一条浅路。
+- **直筒,不留分支。** 只实现当前要走的路径;不用的 fallback 和兜底不写。
+- **要深,不要宽。** 优先把单一路径的正确性、cache 状态和协议边界打透。
+- **分层不越界。** L1/L2 不做路由;L5 只做协议翻译;调度和 cache 归 L3/L4。
 
-## 分层
+## 当前分层
 
-由核心到外围。每层单独一个文档(`docs/<layer>.md`,随开发补齐)。
+| 层 | 模块 | 职责 | 状态 |
+|---|---|---|---|
+| L1 引擎 | `multiplex.engine` | 批量 `prefill` / `forward`,logits,cache filter/extract/merge,SSM snapshot/restore,attention trim。 | 可用 |
+| L2 投机核 | `multiplex.mtp` | 加载 MTP sidecar,批量 draft/verify,按 batch 最小接受数提交;无头模型走纯 AR。 | 可用 |
+| L3 调度机制 | `multiplex.scheduler` | 分块 prefill,merge into live batch,decode step,EOS/max-token 退出,取消,前缀 cache 接入。 | 可用,仍在打磨 |
+| L4 Hub | `multiplex.hub` | 单 engine 线程持有 MLX,多 HTTP/调用线程提交请求和接收流式 delta。 | 可用 |
+| L5 HTTP | `multiplex.server` | OpenAI-compatible `/v1/chat/completions`, `/v1/responses`, `/v1/models`,SSE,tool-call 桥接。 | 可用,兼容性继续补 |
+| Bridge | `multiplex.bridge` | 消息归一、thinking/tool-call 文本过滤与结构化解析。 | 可用 |
+| Prefix cache | `multiplex.prefixcache` | token 前缀最长匹配、prompt/session 两个 LRU pool、可选磁盘持久化。 | 可用,仍需实测 |
+| Registry | `multiplex.registry` | 扫描 `~/.mtplx/models` 并解析 `--model`。 | 可用 |
 
-| 层 | 职责 | 状态 |
-|---|---|---|
-| L1 引擎 | 批量前向:prefill / next-k forward / rollback。不采样、不调度。 | ✅ 可用 |
-| L2 投机核 | 批量 MTP:draft → verify → 取最小 commit → 回滚 | 未做 |
-| L3 执行 | 批量状态机,一次 step 推进整批一轮 | 未做 |
-| L4 调度 | prefill/decode 协调,序列随进随出 | 未做 |
-| L5 接口 | Python API / CLI / (later) HTTP | 体验用 CLI |
+## 运行
 
-## 引擎层(L1)现状
-
-一个纯粹的批量前向原语,只做三件事,不多:
-
-- **batch** — B 条序列一次 forward。
-- **next-k** — 一次喂 k 个 token/行,返回全部 k 个位置的 logits(AR 是 k=1,投机 verify 是 k>1,引擎不关心)。
-- **rollback** — trim 掉被拒的投机 token(attention 层;SSM 层回滚待 L2 解决)。
-
-已验证:批量解码与单序列逐 token 一致(等长);不等长用右 padding + mask,并修复了 mlx-lm 让 SSM padding 未被屏蔽的 bug。批量输出与单序列的浮点级微小差异是批量推理固有性质,非 bug。
-
-```python
-from multiplex import Engine
-import mlx.core as mx
-
-eng = Engine("/path/to/model")
-state, logits = eng.prefill([ids_a, ids_b])   # 批量 prefill
-tok = eng.forward(state, mx.array([[x], [y]]))  # 批量 next-1
-```
-
-## 试用
+安装依赖:
 
 ```bash
-python try_engine.py           # 交互:每行一个 prompt,空行运行,:q 退出
-python smoke_engine.py         # 引擎回归测试(batch + next-k)
+pip install -r requirements.txt
+# 或按 pyproject:
+pip install -e ".[cli]"
 ```
+
+交互式动态批 REPL:
+
+```bash
+python try_engine.py --model /path/to/model
+python try_engine.py --model MODEL_NAME -d 0     # 强制纯 AR
+```
+
+HTTP 服务:
+
+```bash
+python -m multiplex.server --model /path/to/model --host 127.0.0.1 --port 8000
+```
+
+可用端点:
+
+- `GET /v1/models`
+- `POST /v1/chat/completions`
+- `POST /v1/responses`
+
+`--model` 可以是本地路径,也可以是 `~/.mtplx/models` 下的目录名。不传时,如果只发现一个模型会自动选中;发现多个模型时,交互式终端会让你选择,非交互环境会要求显式传 `--model`。
+
+MTP sidecar 自动查找:
+
+- `<model>/mtplx_runtime.json` 中的 `mtp_sidecar_file` 或 `mtp_file`
+- `<model>/mtp.safetensors`
+- `<model>/mtp/weights.safetensors`
+
+找不到 MTP head 时不会报错,调度器会把 draft depth 强制为 `0`,即纯 AR。
+
+## Prefix Cache
+
+L3 会在 chunk 边界捕获 cache 快照,新请求按 token 前缀找最长可复用边界,命中后只 prefill 剩余 tail。
+
+默认 HTTP/Hub 使用:
+
+```text
+~/.cache/multiplex/prefixcache/<model-name>-<model-path-sha>
+```
+
+可以通过 `--prefix-cache-dir` 指定目录;传空值、`none` 或 `off` 可关闭磁盘目录。内存侧当前按 `prompt` 和 `session` 两个 pool 各自做 LRU。
+
+## 测试和验证
+
+```bash
+python smoke_engine.py /path/to/model
+python test_scheduler.py /path/to/model
+```
+
+`smoke_engine.py` 验证 L1 的 batch 与 next-k forward。
+
+`test_scheduler.py` 是调度正确性测试脚本,但当前有一个已知文档化缺口:脚本末尾仍引用旧的 `Hub.stream_text` API,而当前 Hub 暴露的是 `stream_messages(...)`。在修测试前,优先用 `try_engine.py` 和 HTTP 端到端验证 L3-L5。
+
+本仓库依赖 MLX/Metal;在没有可用 Metal device 的沙箱或 headless 环境中,导入 `mlx` 可能直接失败。
+
+## 当前边界
+
+- 不是 paged KV cache;当前走 padding/mask 和 batch 行增删。
+- 没有多用户公平性、抢占或复杂 QoS。
+- prefix cache 已有内存/磁盘机制,但命中率、磁盘清理策略和长会话行为仍需要真实负载压测。
+- 批量 MTP 因“取最小接受数”会被最差行拖累;小 batch 和相似请求更适合,大 batch 可能应走纯 AR。
