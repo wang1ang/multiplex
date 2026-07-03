@@ -1,41 +1,23 @@
 # multiplex
 
-Local LLM serving on Apple Silicon, built on [mlx-lm](https://github.com/ml-explore/mlx-lm).
+Local LLM serving for Apple Silicon.
 
-`multiplex` is a compact inference stack for personal agent workloads: fast local
-generation, OpenAI-compatible HTTP endpoints, streaming, tool-call adaptation,
-dynamic batching, and prefix reuse for long conversations.
+`multiplex` is built for personal agent workloads: fast local generation,
+OpenAI-compatible endpoints, streaming responses, tool calling, dynamic batching,
+and long-conversation reuse.
 
-The core bet is simple: local models should feel responsive even when an agent
-fans out into several overlapping requests.
+The goal is simple: make a local model feel responsive even when an agent sends
+several overlapping requests or repeatedly resends a long conversation.
 
-## Why
+## Highlights
 
-Most local serving stacks make a tradeoff:
-
-- speculative decoding works well for one request;
-- batching works for multiple requests;
-- long agent conversations repeatedly resend the same prefix.
-
-`multiplex` puts those paths in one engine:
-
-- **MTP speculative decoding** when a model ships an MTP sidecar.
-- **True batched decode** with several live sequences in one forward pass.
-- **Dynamic join/leave** so requests can enter and exit the live batch mid-flight.
-- **Prefix cache** so retries and multi-turn agent calls can reuse already-prefilled state.
-- **OpenAI-compatible HTTP** for `/v1/responses`, `/v1/chat/completions`, and `/v1/models`.
-
-If no MTP head is available, the same stack runs pure autoregressive decoding.
-
-## Features
-
-- Built directly on `mlx-lm` and MLX cache primitives.
-- One engine thread owns MLX execution; HTTP threads submit requests and stream deltas.
-- Streaming SSE for Chat Completions and Responses.
-- Tool-call bridge for model text -> structured OpenAI-style tool calls.
-- Model discovery under `~/.mtplx/models`.
-- Optional on-disk prefix cache under `~/.cache/multiplex/prefixcache`.
-- Interactive chat CLI for testing dynamic batching locally.
+- **OpenAI-compatible API** for `/v1/responses`, `/v1/chat/completions`, and `/v1/models`.
+- **Streaming output** for chat and agent clients.
+- **Tool-call support** for clients that expect structured OpenAI-style tool calls.
+- **Dynamic batching** so overlapping requests can run together.
+- **Speculative decoding** when the model supports it, with pure AR fallback when it does not.
+- **Prefix reuse** for long-running conversations and retries.
+- **Chat CLI** for local testing.
 
 ## Quick Start
 
@@ -46,13 +28,13 @@ pip install -r requirements.txt
 pip install -e ".[cli]"
 ```
 
-Start the HTTP server:
+Start the server:
 
 ```bash
 python -m multiplex.server --model /path/to/model --host 127.0.0.1 --port 8000
 ```
 
-Or use a model directory name discovered under `~/.mtplx/models`:
+Or use a model name discovered under `~/.mtplx/models`:
 
 ```bash
 python -m multiplex.server --model MODEL_NAME
@@ -64,18 +46,15 @@ Try the chat CLI:
 python try_engine.py --model /path/to/model
 ```
 
-While one prompt is generating, submit another prompt to see it join the live
-batch.
-
 ## API
 
-`multiplex` exposes the endpoints most local OpenAI-compatible clients expect:
+Available endpoints:
 
 - `GET /v1/models`
 - `POST /v1/chat/completions`
 - `POST /v1/responses`
 
-Both streaming and non-streaming responses are supported.
+Streaming and non-streaming responses are supported.
 
 Example:
 
@@ -89,64 +68,14 @@ curl http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-## MTP Heads
-
-MTP sidecars are discovered automatically from:
-
-- `<model>/mtplx_runtime.json`
-- `<model>/mtp.safetensors`
-- `<model>/mtp/weights.safetensors`
-
-When a sidecar is present, `multiplex` loads the MTP head and uses speculative
-decode. When no sidecar is present, the scheduler switches to pure AR without
-changing the serving API.
-
-## Prefix Cache
-
-Agent clients often resend long, nearly identical prompts. `multiplex` captures
-cache state at chunk boundaries, finds the longest token-identical prefix on the
-next request, restores that state, and only prefills the new tail.
-
-By default, HTTP serving uses an automatic cache directory:
-
-```text
-~/.cache/multiplex/prefixcache/<model-name>-<model-path-sha>
-```
-
-Override it with:
-
-```bash
-python -m multiplex.server --model /path/to/model --prefix-cache-dir /path/to/cache
-```
-
-## Architecture
-
-The stack stays deliberately narrow:
-
-```text
-server.py        OpenAI-compatible HTTP and SSE translation
-hub.py           concurrent callers -> one MLX engine thread
-scheduler.py     dynamic prefill/decode batch management
-mtp.py           MTP draft/verify speculative decoding
-engine.py        batched mlx-lm forward and cache operations
-prefixcache/     prefix matching, cache snapshots, optional disk persistence
-bridge/          message normalization and tool-call parsing
-```
-
-The lower layers do not know about HTTP, and the HTTP layer does not manage
-model cache. That split keeps the serving surface small while leaving the engine
-free to optimize batching and reuse.
-
 ## Requirements
 
-- macOS with an available Metal device.
+- macOS with Apple Silicon and an available Metal device.
 - Python 3.10+.
 - `mlx` and `mlx-lm`.
 - A local MLX model directory.
 
 ## Status
 
-`multiplex` is an active local-serving experiment focused on Apple Silicon and
-agent-style workloads. It is useful today for local testing and integration, and
-the current work is centered on compatibility polish, prefix-cache measurement,
-and smarter draft-depth policy.
+`multiplex` is an active local-serving project focused on Apple Silicon and
+agent-style workflows.
