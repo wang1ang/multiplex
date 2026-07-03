@@ -32,6 +32,10 @@ PROMPTS = {
 }
 
 
+def group(req):
+    return PrefillGroup(reqs=[req])
+
+
 def solo(eng, prompt_ids, n, k=0):
     """Reference: run one request alone through the scheduler; return its tokens."""
     sch = Scheduler(eng, _DR, k=k)
@@ -100,12 +104,13 @@ def main():
     got = drive(sch, [(0, PrefillGroup(reqs=[Req(0, enc(PROMPTS["france"]), N)]))])
     ok &= check("france", got[0], ref["france"])
 
-    print("2) three requests joined at once == each solo")
+    print("2) three requests submitted at once == each solo")
     sch = Scheduler(eng, _DR, k=0)
-    g = PrefillGroup(reqs=[Req(0, enc(PROMPTS["france"]), N),
-                           Req(1, enc(PROMPTS["story"]), N),
-                           Req(2, enc(PROMPTS["math"]), N)])
-    got = drive(sch, [(0, g)])
+    got = drive(sch, [
+        (0, group(Req(0, enc(PROMPTS["france"]), N))),
+        (0, group(Req(1, enc(PROMPTS["story"]), N))),
+        (0, group(Req(2, enc(PROMPTS["math"]), N))),
+    ])
     ok &= check("france", got[0], ref["france"])
     ok &= check("story", got[1], ref["story"])
     ok &= check("math", got[2], ref["math"])
@@ -120,9 +125,10 @@ def main():
 
     print("4) early exit (出): short finishes, long continues")
     sch = Scheduler(eng, _DR, k=0)
-    g = PrefillGroup(reqs=[Req(0, enc(PROMPTS["hi"]), N),
-                           Req(1, enc(PROMPTS["story"]), N)])
-    got = drive(sch, [(0, g)])
+    got = drive(sch, [
+        (0, group(Req(0, enc(PROMPTS["hi"]), N))),
+        (0, group(Req(1, enc(PROMPTS["story"]), N))),
+    ])
     ok &= check("hi (short)", got[0], ref["hi"])
     ok &= check("story (long)", got[1], ref["story"])
 

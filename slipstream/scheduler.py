@@ -1,13 +1,11 @@
-"""L3 — dynamic-batch mechanism (live decode batch + chunked prefill + merge).
+"""L3 — dynamic-batch mechanism (live decode batch + serial chunked prefill).
 
 MECHANISM ONLY. L3 offers the operations; L4 (the hub) decides policy — which
-requests to prefill together, when, and routes output. L3 never keeps a waiting
-queue.
+request to prefill, when, and routes output. L3 never keeps a waiting queue.
 
 Operations:
-  * ``prefill_chunk(group)``  — advance a batched, chunked prefill of new requests
-    one chunk; returns the finished ones (ready to merge) as they complete.
-  * ``merge_ready(ready)``    — merge prefilled requests into the live decode batch.
+  * ``prefill_chunk(group)``  — advance one request's prefill by one chunk.
+  * ``merge_ready(group)``    — merge a prefilled request into the live decode batch.
   * ``step()``                — one speculative round over the live batch (推),
     dropping EOS/max rows (出). Speculation IS generation (k=0 = pure AR).
 
@@ -50,12 +48,11 @@ class Req:
 
 @dataclass
 class PrefillGroup:
-    """A set of new requests to prefill and join (L4 forms it). prefill_chunk
-    fills these per-request results (one single-row state + first token each)."""
+    """One request being prefetched before it joins the live decode batch."""
     reqs: list[Req]
-    singles: list = field(default_factory=list)   # per-req single-row BatchState
-    firsts: list = field(default_factory=list)    # per-req first sampled token
-    last_h: list = field(default_factory=list)    # per-req [1,1,H] trunk hidden
+    single: BatchState | None = None
+    first: int | None = None
+    last_h: object = None
     state: BatchState | None = None               # single-row chunked prefill
     pos: int = 0
     ssm_snaps: dict[int, list] = field(default_factory=dict)
@@ -102,29 +99,6 @@ class Scheduler:
         name = os.path.basename(model_path.rstrip(os.sep)) or "model"
         return Path.home() / ".cache" / "multiplex" / "prefixcache" / f"{name}-{digest}"
 
-    @staticmethod
-    def _short_log_text(text: str, max_chars: int = 180) -> str:
-        text = text.replace("\n", "\\n").replace("\r", "\\r")
-        if len(text) <= max_chars:
-            return text
-        return text[:max_chars] + f"...(+{len(text) - max_chars} chars)"
-
-    def _decode_for_cache_log(self, token_ids, max_chars: int = 180) -> str:
-        if not token_ids:
-            return ""
-        tok = self.eng.tokenizer
-        try:
-            text = tok.decode(list(token_ids), skip_special_tokens=False)
-        except TypeError:
-            text = tok.decode(list(token_ids))
-        return self._short_log_text(text, max_chars=max_chars)
-
-    def _cache_log_context(self, token_ids, pos: int):
-        before = token_ids[max(0, pos - 48):pos]
-        after = token_ids[pos:min(len(token_ids), pos + 96)]
-        return (self._decode_for_cache_log(before),
-                self._decode_for_cache_log(after))
-
     def _log_prefix_cache_decision(self, req: Req, ids, match) -> None:
         if not self.debug or self.pc is None:
             return
@@ -141,62 +115,17 @@ class Scheduler:
 
     # --- prefill mechanism -------------------------------------------------
     def prefill_chunk(self, group: PrefillGroup, cancelled=None):
-        """Prefill the group by LENGTH-SUBGROUP: requests of equal length are
-        prefilled together (equal length = no padding = no SSM conv contamination
-        from pad tokens); odd lengths prefill alone. Fills per-request single-row
-        states + first tokens. Returns False after one unfinished chunk, True
-        when done, or None if a request was cancelled mid-prefill (client gone)
-        — the caller then abandons the group.
+        """Advance one request's prefill.
+
+        Returns False after one unfinished chunk, True when the request is ready
+        to merge, or None if the client was cancelled mid-prefill.
 
         ``cancelled(rid)`` (optional) is polled between prefill chunks so a long
-        prompt for a departed client stops instead of running to completion.
+        prompt for a departed client stops instead of running to completion."""
+        if len(group.reqs) != 1:
+            raise ValueError("prefill is serial; PrefillGroup must contain one request")
 
-        Unequal-length prefill in one batch would left/right-pad the short rows
-        and the pad tokens leak into the GatedDeltaNet conv — verified to corrupt
-        the short row. Grouping by length avoids padding entirely."""
-        if not group.singles:
-            group.singles = [None] * len(group.reqs)
-            group.firsts = [None] * len(group.reqs)
-            group.last_h = [None] * len(group.reqs)
-
-        # A single request can reuse a cached prefix (concurrency is rare, so
-        # long prompts arrive alone); batched prefill has per-row prefixes and
-        # keeps the plain length-grouped path.
-        if len(group.reqs) == 1:
-            return self._prefill_one(group, 0, cancelled)
-
-        by_len: dict[int, list[int]] = {}
-        for i, r in enumerate(group.reqs):
-            by_len.setdefault(len(r.prompt), []).append(i)
-        for L, idxs in by_len.items():
-            rids = [group.reqs[i].rid for i in idxs]
-            stop = (lambda: cancelled and any(cancelled(r) for r in rids))
-            prompts = [group.reqs[i].prompt for i in idxs]
-            state, hidden = self.eng.prefill(prompts, chunk=self.chunk,
-                                             log=self._log, stop=stop)
-            if hidden is None:            # cancelled mid-prefill
-                self._log(f"PREFILL CANCELLED rids={rids}")
-                return None
-            # Chunked prefill (single long prompt) returns only the last chunk's
-            # hidden, so the next-token position is that block's last, not L-1.
-            pos = min(L - 1, hidden.shape[1] - 1)
-            for j, i in enumerate(idxs):
-                last_h = hidden[j:j + 1, pos:pos + 1, :]
-                first = int(mx.argmax(self.eng.logits(last_h)[0, -1]))
-                group.reqs[i].out.append(first)
-                group.singles[i] = self.eng.extract_row(state, j)
-                group.firsts[i] = first
-                group.last_h[i] = last_h
-            self._log(f"PREFILL len={L} rids={[group.reqs[i].rid for i in idxs]}")
-        return True
-
-    def _prefill_one(self, group, i, cancelled):
-        """Prefill one request, reusing a cached prefix when possible. On a hit,
-        restore the snapshot and forward only the tail; otherwise cold-prefill.
-        Cold prefill stores prompt block boundaries; session requests additionally
-        store their final generated state when they exit. Fills group.singles[i] /
-        firsts[i] / last_h[i]; leaves singles[i] None if cancelled mid-prefill."""
-        req = group.reqs[i]
+        req = group.reqs[0]
         ids = req.prompt
         eng = self.eng
         if not group.started:
@@ -271,9 +200,9 @@ class Scheduler:
         first = int(mx.argmax(eng.logits(h)[0, -1]))
 
         req.out.append(first)
-        group.singles[i] = eng.extract_row(group.state, 0)
-        group.firsts[i] = first
-        group.last_h[i] = h
+        group.single = eng.extract_row(group.state, 0)
+        group.first = first
+        group.last_h = h
         return True
 
     def _capture_session_base(self, req: Req, state: BatchState) -> None:
@@ -286,8 +215,10 @@ class Scheduler:
         req.session_base_ssm = self.eng.clone_ssm(state.cache)
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
-        """Merge prefilled requests into the live batch. Rebuilds the batch from
-        single rows (existing + new) so merge_states always sees clean singles."""
+        """Merge one prefilled request into the live batch."""
+        if len(group.reqs) != 1:
+            raise ValueError("prefill is serial; PrefillGroup must contain one request")
+
         singles, hs, prims, reqs = [], [], [], []
         for i, req in enumerate(self.rows):        # existing rows -> singles
             singles.append(self.eng.extract_row(self.state, i))
@@ -295,12 +226,12 @@ class Scheduler:
             prims.append(self.primary[i:i + 1])
             reqs.append(req)
         joined = []
-        for i, r in enumerate(group.reqs):         # new rows (already singles)
-            singles.append(group.singles[i])
-            hs.append(group.last_h[i])
-            prims.append(mx.array([group.firsts[i]]))
-            reqs.append(r)
-            joined.append((r.rid, group.firsts[i]))
+        r = group.reqs[0]
+        singles.append(group.single)
+        hs.append(group.last_h)
+        prims.append(mx.array([group.first]))
+        reqs.append(r)
+        joined.append((r.rid, group.first))
         self.state = self.eng.merge_states(singles)
         self.h = mx.concatenate(hs, axis=0)
         self.primary = mx.concatenate(prims, axis=0)

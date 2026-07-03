@@ -15,7 +15,6 @@ queues. An HTTP thread submits a request and drains its text queue for SSE.
 
 from __future__ import annotations
 
-import json
 from pathlib import Path
 import queue
 import threading
@@ -126,7 +125,7 @@ class Hub:
             self._queues[r.rid] = q
             self._toks[r.rid] = []
             self._shown[r.rid] = 0
-        self._write_request_log(r, prompt_ids, session_prompt_len, max_tokens)
+        self._write_request_log(r, prompt_ids)
         try:
             while True:
                 item = q.get()
@@ -137,7 +136,7 @@ class Hub:
             # Normal completion already cleaned up; this matters on early close.
             self._cancelled.add(r.rid)
 
-    def _write_request_log(self, req, prompt_ids, session_prompt_len, max_tokens):
+    def _write_request_log(self, req, prompt_ids):
         if not self._cfg["debug"]:
             return
         try:
@@ -151,17 +150,8 @@ class Hub:
             self._request_log_dir.mkdir(parents=True, exist_ok=True)
             path = self._request_log_dir / f"req-{req.rid}.log"
             body = [
-                f"rid={req.rid}",
-                f"prompt_len={len(prompt_ids)}",
-                f"session_prompt_len={session_prompt_len}",
-                f"max_tokens={max_tokens}",
-                "",
                 "--- prompt ---",
                 prompt_text,
-                "",
-                "--- prompt_ids ---",
-                json.dumps(list(prompt_ids), ensure_ascii=False,
-                           separators=(",", ":")),
                 "",
             ]
             path.write_text("\n".join(body), encoding="utf-8")
@@ -186,7 +176,8 @@ class Hub:
         waiting: list[Req] = []
         prefill_group: PrefillGroup | None = None
         while True:
-            # admit newly submitted requests: prefill them (batched) and merge in
+            # admit newly submitted requests; prefill them serially, one chunk
+            # per loop, while live rows keep decoding.
             with self._lock:
                 pending, self._incoming = self._incoming, []
             # Skip any request whose client already went away before we started.
@@ -194,8 +185,7 @@ class Hub:
             waiting.extend(pending)
 
             if prefill_group is None and waiting:
-                prefill_group = PrefillGroup(reqs=waiting)
-                waiting = []
+                prefill_group = PrefillGroup(reqs=[waiting.pop(0)])
 
             if prefill_group is not None:
                 # Advance only one prefill chunk, then return to this loop so
