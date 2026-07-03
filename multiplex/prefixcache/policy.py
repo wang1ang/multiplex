@@ -56,8 +56,9 @@ class _TrieNode:
 class PrefixCache:
     """Block-tree prefix cache with independent LRU pools.
 
-    ``capacity`` bounds reusable boundary nodes per pool. Attention-only ancestor
-    blocks are retained only while a reusable descendant needs them.
+    ``capacity`` bounds resident reusable payloads per pool. Prefix-tree nodes
+    and disk-backed metadata are retained so misses can be inspected and cold
+    entries can lazy-load their tensors from SSD.
     """
 
     def __init__(
@@ -150,6 +151,16 @@ class PrefixCache:
             return sum(1 for _ in self.iter_entries())
         return sum(1 for node in self.iter_entries() if node.pool == pool)
 
+    def _resident_entries(self):
+        for node in self.iter_entries():
+            if node.ssm is not None:
+                yield node
+
+    def _resident_count(self, pool: str | None = None) -> int:
+        if pool is None:
+            return sum(1 for _ in self._resident_entries())
+        return sum(1 for node in self._resident_entries() if node.pool == pool)
+
     def _rebuild_index(self) -> None:
         self._root = _TrieNode()
         for node in self.iter_entries():
@@ -162,87 +173,75 @@ class PrefixCache:
         cur.entries.append(node)
 
     def _evict(self) -> None:
-        changed = False
         pools = set(self.capacity)
-        pools.update(node.pool for node in self.iter_entries())
+        pools.update(node.pool for node in self._resident_entries())
         for pool in pools:
-            while self._entry_count(pool) > self._capacity_for(pool):
+            while self._resident_count(pool) > self._capacity_for(pool):
                 victim = min(
-                    (node for node in self.iter_entries() if node.pool == pool),
+                    (node for node in self._resident_entries() if node.pool == pool),
                     key=lambda node: node.touch,
                     default=None,
                 )
                 if victim is None:
                     break
-                self._drop_reusable(victim)
-                self._prune_block(victim)
-                changed = True
-        if changed:
-            self._rebuild_index()
+                self._drop_payload(victim)
+        self._drop_cold_attention()
 
     def _prune_block(self, node: Node) -> None:
-        """Drop leaf attention blocks that no reusable descendant needs."""
-        while (
+        """Release payload from a non-reusable leaf while keeping its node."""
+        if (
             node is not self._block_root
             and not node.children
             and not self._is_reusable_node(node)
         ):
-            parent = node.parent
-            if parent is None:
-                return
-            parent.children.pop(tuple(node.prefix[node.start:node.pos]), None)
-            self._blocks.pop(node.prefix, None)
-            node = parent
+            node.attn = None
 
     def prune_unreferenced(self) -> None:
-        """Drop attention-only leaves that are not anchoring a reusable node."""
-        changed = False
+        """Release cold payloads without removing prefix-tree nodes."""
         for node in list(self._blocks.values()):
             if node is self._block_root:
                 continue
             if not self._is_reusable_node(node) and not node.children:
                 self._prune_block(node)
-                changed = True
-        if changed:
-            self._rebuild_index()
+        self._drop_cold_attention()
 
     def find(self, token_ids) -> Match | None:
         """Return the deepest reusable prefix of ``token_ids``."""
         token_ids = tuple(token_ids)
-        best: Node | None = None
+        candidates: list[Node] = []
         cur = self._root
         for tok in token_ids:
             cur = cur.children.get(tok)
             if cur is None:
                 break
             if cur.entries:
-                candidate = max(cur.entries, key=lambda node: node.touch)
-                if (
-                    best is None
-                    or candidate.pos > best.pos
-                    or (candidate.pos == best.pos and candidate.touch > best.touch)
-                ):
-                    best = candidate
-        if best is None:
-            return None
+                candidates.extend(cur.entries)
 
-        self._clock += 1
-        best.touch = self._clock
-        if not self._load_reusable_payload(best):
-            self._drop_reusable(best)
-            self._rebuild_index()
-            return self.find(token_ids)
-        blocks = self._path_blocks(best)
-        if blocks is None:
-            self._drop_reusable(best)
-            self._rebuild_index()
-            return self.find(token_ids)
+        candidates.sort(key=lambda node: (node.pos, node.touch), reverse=True)
+        for best in candidates:
+            self._clock += 1
+            best.touch = self._clock
+            if not self._load_reusable_payload(best):
+                self._debug(
+                    f"MISS payload_unavailable pos={best.pos} "
+                    f"disk={best.disk_key[:12] if best.disk_key else None}"
+                )
+                continue
+            blocks = self._path_blocks(best)
+            if blocks is None:
+                self._debug(
+                    f"MISS attention_unavailable pos={best.pos} "
+                    f"disk={best.disk_key[:12] if best.disk_key else None}"
+                )
+                continue
 
-        payload = ("blocks", blocks, best.ssm, best.pos)
-        if best.cached_h is not None:
-            payload += (best.cached_h,)
-        return Match(prefix_len=best.pos, payload=payload, source=best.source,
-                     pool=best.pool)
+            payload = ("blocks", blocks, best.ssm, best.pos)
+            if best.cached_h is not None:
+                payload += (best.cached_h,)
+            self._evict()
+            return Match(prefix_len=best.pos, payload=payload, source=best.source,
+                         pool=best.pool)
+        return None
 
     def _path_blocks(self, node: Node) -> list[Any] | None:
         blocks = []
@@ -260,11 +259,23 @@ class PrefixCache:
             return None
         return self._disk.get_record(node.disk_key)
 
-    def _drop_reusable(self, node: Node) -> None:
+    def _drop_payload(self, node: Node) -> None:
         node.ssm = None
         node.cached_h = None
-        node.reusable = False
-        node.source = None
+
+    def _drop_cold_attention(self) -> None:
+        keep: set[int] = set()
+        for node in self._resident_entries():
+            cur = node
+            while cur is not self._block_root:
+                keep.add(id(cur))
+                if cur.parent is None:
+                    break
+                cur = cur.parent
+
+        for node in self._blocks.values():
+            if node is not self._block_root and id(node) not in keep:
+                node.attn = None
 
     def _load_attention(self, node: Node) -> bool:
         if node.attn is not None:
