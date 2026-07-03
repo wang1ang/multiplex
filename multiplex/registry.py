@@ -64,9 +64,10 @@ def select(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry:
     """Resolve to exactly ONE model, shared by every entry point so they behave
     identically. A single match (given arg, or the sole model) returns straight
     away. For several candidates the behaviour follows the environment, not the
-    caller: an interactive terminal prompts a numbered choice; without a tty
-    (e.g. a server started in the background) it lists them and raises, telling
-    the user to pass --model. Zero models always raises.
+    caller: an interactive terminal prompts a numbered choice, with Enter
+    selecting the first model; without a tty (e.g. a server started in the
+    background) it lists them and raises, telling the user to pass --model. Zero
+    models always raises.
     """
     r = resolve(arg, root)
     if not isinstance(r, list):
@@ -81,7 +82,9 @@ def select(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry:
         raise RuntimeError(
             f"multiple models under {where} — choose one with --model NAME:\n{lines}")
     print(lines)
-    raw = input(f"pick a model [0-{len(r) - 1}]: ").strip()
+    raw = input(f"pick a model [0-{len(r) - 1}] (default 0): ").strip()
+    if raw == "":
+        raw = "0"
     if not raw.isdigit() or not (0 <= int(raw) < len(r)):
         raise ValueError(f"invalid selection: {raw!r}")
     return r[int(raw)]

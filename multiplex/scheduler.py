@@ -45,6 +45,8 @@ class Req:
     session_cache_pos: set[int] = field(default_factory=set)
     output_log_started: bool = False
     output_log_chars: int = 0
+    advance_tokens: int = 0
+    advance_seconds: float = 0.0
 
 
 @dataclass
@@ -261,7 +263,8 @@ class Scheduler:
         lengths_before = list(state.lengths)
         verify_in = mx.array([[int(primary[i])] + draft_ids[i] for i in range(B)])
         vhidden = eng.forward(state, verify_in)
-        trunk_pred = mx.argmax(eng.logits(vhidden), axis=-1)
+        trunk_logits = eng.logits(vhidden)
+        trunk_pred = mx.argmax(trunk_logits, axis=-1)
 
         accs = []
         for i in range(B):
@@ -297,9 +300,17 @@ class Scheduler:
             h = eng.forward(state, commit_in)[:, -1:, :]
         mx.eval(h, primary)
         dt = max(time.perf_counter() - t0, 1e-9)
-        tok_s = sum(len(toks) for _rid, toks in emitted) / dt
+        emitted_by_rid = {rid: toks for rid, toks in emitted}
+        for req in rows:
+            req.advance_tokens += len(emitted_by_rid.get(req.rid, ()))
+            req.advance_seconds += dt
+        total_tokens = sum(req.advance_tokens for req in rows)
+        total_seconds = sum(req.advance_seconds for req in rows)
+        tok_s = total_tokens / max(total_seconds, 1e-9)
+        prob = self._bonus_probs(trunk_logits, trunk_pred, m) if self.debug else None
+        prob_text = f" prob={prob}" if prob is not None else ""
         self._log(f"ADVANCE {[r.rid for r in rows]} accept={accs} min={m} "
-                  f"{tok_s:.0f} tok/s")
+                  f"{prob_text} {tok_s:.0f} tok/s")
         self.state, self.h, self.primary = state, h, primary
         self._capture_session_blocks(rows, state)
 
@@ -310,6 +321,13 @@ class Scheduler:
                 self.pc.prune_unreferenced()
 
         return emitted
+
+    def _bonus_probs(self, logits, pred, pos: int) -> list[float]:
+        probs = mx.softmax(logits[:, pos, :], axis=-1)
+        return [
+            round(float(probs[i, int(pred[i, pos])]), 4)
+            for i in range(int(pred.shape[0]))
+        ]
 
     def _log_output(self, req: Req, toks: list[int]) -> None:
         if self.output_log_dir is None:
