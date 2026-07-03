@@ -66,6 +66,29 @@ def _quant_config(model_path: str) -> dict:
             "mode": str(q.get("mode", "affine"))}
 
 
+def _infer_prequant_group_size(weights: dict, bits: int) -> int | None:
+    """Infer the sidecar's real quantization group size from packed tensors."""
+    if bits <= 0 or 32 % bits:
+        return None
+    unpack = 32 // bits
+    group_sizes = set()
+    for key, scales in weights.items():
+        if not key.endswith(".scales"):
+            continue
+        weight = weights.get(key[: -len(".scales")] + ".weight")
+        if weight is None or not getattr(weight, "shape", None):
+            continue
+        groups = int(scales.shape[-1])
+        if groups <= 0:
+            continue
+        input_dims = int(weight.shape[-1]) * unpack
+        if input_dims % groups == 0:
+            group_sizes.add(input_dims // groups)
+    if len(group_sizes) == 1:
+        return group_sizes.pop()
+    return None
+
+
 class MTPHead(nn.Module):
     """One MTP layer. Reuses the trunk's embed_tokens and lm_head (not owned)."""
 
@@ -101,7 +124,7 @@ class Drafter:
         cfg = engine.model.args.text_config
         targs = q5.TextModelArgs.from_dict(cfg)
         self.head = MTPHead(targs)
-        qc = _quant_config(engine.model_path)   # head follows the model's scheme
+        qc = _quant_config(engine.model_path)
 
         raw = mx.load(mtp_path)
         weights = {k[len("mtp."):]: v for k, v in raw.items() if k.startswith("mtp.")}
@@ -117,6 +140,10 @@ class Drafter:
         # drive it by a predicate over the weight keys, not a blanket quantize.
         prequant = any(k.endswith(".scales") for k in weights)
         if prequant:
+            inferred_group_size = _infer_prequant_group_size(weights, qc["bits"])
+            if inferred_group_size is not None:
+                qc["group_size"] = inferred_group_size
+
             scaled = {k[: -len(".scales")] for k in weights if k.endswith(".scales")}
 
             def is_quantized(path, _module):
