@@ -152,7 +152,7 @@ class Scheduler:
             match = hit[1] if hit is not None else None
 
             group.cached_h = None
-            group.cacheable = match is None and len(ids) > PROMPT_CACHE_MIN_TOKENS
+            group.cacheable = len(ids) > PROMPT_CACHE_MIN_TOKENS
             if match is not None:
                 payload = match.payload
                 if len(payload) == 3:
