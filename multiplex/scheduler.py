@@ -15,8 +15,6 @@ thread and calls these in a loop.
 
 from __future__ import annotations
 
-import hashlib
-import os
 from pathlib import Path
 import sys
 import time
@@ -26,11 +24,7 @@ import mlx.core as mx
 
 from .engine import Engine, BatchState
 from .mtp import Drafter
-from .prefixcache import PrefixCache
-from .prefixcache.state import PrefixCacheState
-
-
-PROMPT_CACHE_MIN_TOKENS = 4096
+from .prefixcache.runtime import PrefixCacheRuntime
 
 
 @dataclass
@@ -77,14 +71,10 @@ class Scheduler:
         self.log = log
         self._t = 0
         self.output_log_dir = Path(output_log_dir) if output_log_dir else None
-        # One prefix tree with two independent LRU pools. Prompt entries and
-        # session entries share prefix structure but never evict each other.
-        cache_dir = self._prefix_cache_dir(prefix_cache_dir)
-        self.pc = PrefixCache(capacity={"prompt": prefix_cache,
-                                        "session": prefix_cache},
-                              disk_dir=cache_dir, log=self._log) \
-            if prefix_cache else None
-        self.pc_state = PrefixCacheState(engine) if self.pc is not None else None
+        self.prefix_cache = PrefixCacheRuntime(
+            engine, capacity=prefix_cache, disk_dir=prefix_cache_dir,
+            chunk=chunk, log=self._log,
+        )
 
         # live decode batch
         self.state: BatchState | None = None
@@ -100,28 +90,6 @@ class Scheduler:
                 self.log(line)
             else:
                 print(line, file=sys.stderr, flush=True)
-
-    def _prefix_cache_dir(self, value):
-        if value in (None, False, "", "none", "off"):
-            return None
-        if value != "auto":
-            return value
-        model_path = os.path.abspath(os.path.expanduser(self.eng.model_path))
-        digest = hashlib.sha256(model_path.encode()).hexdigest()[:12]
-        name = os.path.basename(model_path.rstrip(os.sep)) or "model"
-        return Path.home() / ".cache" / "multiplex" / "prefixcache" / f"{name}-{digest}"
-
-    def _find_cache(self, ids):
-        return self.pc.find(ids) if self.pc is not None else None
-
-    def _log_prefix_cache_decision(self, req: Req, ids, match) -> None:
-        if not self.debug or self.pc is None:
-            return
-        chosen = match.prefix_len if match is not None else 0
-        source = match.source if match is not None else None
-        self._log(f"PREFIX CACHE FIND rid={req.rid} prompt_len={len(ids)} "
-                  f"chosen={chosen} pool={getattr(match, 'pool', None)!r} "
-                  f"source={source!r}")
 
     def has_rows(self):
         return bool(self.rows)
@@ -142,34 +110,12 @@ class Scheduler:
         ids = req.prompt
         eng = self.eng
         if not group.started:
-            match = self._find_cache(ids)
-            self._log_prefix_cache_decision(req, ids, match)
-
-            group.cached_h = None
-            group.cacheable = len(ids) > PROMPT_CACHE_MIN_TOKENS
-            if match is not None:
-                restored = self.pc_state.restore_match(match)
-                group.state = restored.state
-                group.pos = restored.pos
-                group.cached_h = restored.cached_h
-                pos = group.pos
-                self._log(f"PREFIX HIT reuse={pos}/{len(ids)} tail={len(ids) - pos} "
-                          f"rid={req.rid} source={match.source!r}")
-                if group.cached_h is None and pos == len(ids):
-                    group.state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
-                    group.pos = 0
-                    group.cacheable = False
-                    self._log(f"PREFIX HIT exact without hidden; cold rerun rid={req.rid}")
-            else:
-                group.state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
-                group.pos = 0
-                self._log(f"PREFILL len={len(ids)} rid={req.rid} (cold)")
+            self.prefix_cache.begin_prefill(req, group)
             group.started = True
 
         if cancelled and cancelled(req.rid):
             self._log(f"PREFILL CANCELLED rid={req.rid}")
-            if self.pc is not None:
-                self.pc.prune_unreferenced()
+            self.prefix_cache.prune_unreferenced()
             return None
 
         h = group.cached_h if group.pos == len(ids) else None
@@ -179,11 +125,10 @@ class Scheduler:
             h = eng.prefill_piece(group.state, ids[start:end], len(ids),
                                   log=self._log)
             group.pos = end
-            self._store_prompt_block(req, group, ids, start, end, h)
+            self.prefix_cache.store_prompt_block(req, group, ids, start, end, h)
             if cancelled and cancelled(req.rid):
                 self._log(f"PREFILL CANCELLED rid={req.rid}")
-                if self.pc is not None:
-                    self.pc.prune_unreferenced()
+                self.prefix_cache.prune_unreferenced()
                 return None
             if group.pos < len(ids):
                 return False
@@ -221,33 +166,6 @@ class Scheduler:
             self.dcache = self.dr.make_cache()
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
-
-    def _store_prompt_block(self, req: Req, group: PrefillGroup, ids: list[int],
-                            start: int, end: int, h) -> None:
-        if self.pc is None or self.pc_state is None or not self.chunk:
-            return
-        if end - start != self.chunk:
-            return
-        if not (group.cacheable or req.session_cache):
-            return
-        attn = self.pc_state.clone_attention_block(group.state, start, end)
-        ssm = None
-        source = None
-        cached_h = None
-        if group.cacheable and end >= PROMPT_CACHE_MIN_TOKENS:
-            ssm = self.pc_state.clone_ssm(group.state.cache)
-            block = end // self.chunk
-            source = f"prompt rid={req.rid} block={block}"
-            cached_h = h[:, -1:, :] if end == len(ids) else None
-            if cached_h is not None:
-                mx.eval(cached_h)
-        stored = self.pc.store_block(
-            ids, start, end, attn, ssm=ssm, source=source,
-            pool="prompt", cached_h=cached_h,
-        )
-        if stored and ssm is not None:
-            self._log(f"PREFIX STORE block={end // self.chunk} "
-                      f"len={end}/{len(ids)} rid={req.rid}")
 
     # --- decode mechanism: one speculative round (推 + 出) ------------------
     def step(self) -> list[tuple[int, list[int]]]:
@@ -318,13 +236,12 @@ class Scheduler:
         self._log(f"ADVANCE {[r.rid for r in rows]} accept={accs} min={m} "
                   f"{prob_text} {tok_s:.0f} tok/s")
         self.state, self.h, self.primary = state, h, primary
-        self._capture_session_blocks(rows, state)
+        self.prefix_cache.capture_session_blocks(rows, state)
 
         if finished:
             self._log(f"EXIT {[rows[i].rid for i in finished]}")
             self._keep([i for i in range(B) if i not in finished])
-            if self.pc is not None:
-                self.pc.prune_unreferenced()
+            self.prefix_cache.prune_unreferenced()
 
         return emitted
 
@@ -359,35 +276,6 @@ class Scheduler:
         except Exception:
             pass
 
-    def _capture_session_blocks(self, rows: list[Req], state: BatchState) -> None:
-        if self.pc is None or self.pc_state is None or not self.chunk:
-            return
-        for i, req in enumerate(rows):
-            if not req.session_cache:
-                continue
-            pos = state.lengths[i]
-            full_len = len(req.prompt) + len(req.out)
-            if pos <= len(req.prompt) or pos > full_len or pos % self.chunk:
-                continue
-            if pos in req.session_cache_pos:
-                continue
-            single = self.eng.extract_row(state, i)
-            start = pos - self.chunk
-            prefix = req.prompt + req.out
-            if len(prefix) < pos or start < 0:
-                continue
-            prefix = prefix[:pos]
-            attn = self.pc_state.clone_attention_block(single, start, pos)
-            ssm = self.pc_state.clone_ssm(single.cache)
-            block = pos // self.chunk
-            if self.pc.store_block(
-                prefix, start, pos, attn, ssm=ssm,
-                source=f"session rid={req.rid} block={block}",
-                pool="session",
-            ):
-                req.session_cache_pos.add(pos)
-                self._log(f"SESSION STORE block={block} len={pos} rid={req.rid}")
-
     def _keep(self, keep: list[int]) -> None:
         """Retain only the given row indices in the live batch, dropping the
         rest from every parallel structure (state cache, draft cache, primary,
@@ -409,13 +297,12 @@ class Scheduler:
         rids = set(rids)
         self._log(f"DROP {list(rids)}")
         self._keep([i for i, r in enumerate(self.rows) if r.rid not in rids])
-        if self.pc is not None:
-            self.pc.prune_unreferenced()
+        self.prefix_cache.prune_unreferenced()
 
     def cancel(self, rids) -> None:
         """Notify L3 that request ids were cancelled upstream."""
         live = self.live_rids() & set(rids)
         if live:
             self.drop(live)
-        elif self.pc is not None:
-            self.pc.prune_unreferenced()
+        else:
+            self.prefix_cache.prune_unreferenced()

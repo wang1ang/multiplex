@@ -6,13 +6,14 @@ is the dominant single-call cost. This package keeps, per past request, snapshot
 of the model state taken at chunk boundaries during prefill; a new request reuses
 the longest matching snapshot and only prefills the tail.
 
-Split in two pieces under L3:
+Split into runtime plus two lower pieces under L3:
+  * ``runtime`` — scheduler-facing hooks for find/restore/store/prune timing.
   * ``policy`` — pure logic (no MLX): trie longest-prefix matching over stored
     entries and per-pool LRU eviction. This is what could become a standalone
     library.
   * ``state`` — L3 adapter for MLX cache objects: clone attention blocks,
     snapshot SSM, and restore a matched prefix into a single-row BatchState.
-  * L3 scheduler wires policy + state adapter into request flow.
+  * L3 scheduler wires runtime into request flow.
 
 The state object it stores is opaque here. ``policy`` only reasons about token
 ids and which boundary can be reused; ``state`` knows how MLX caches are cloned
