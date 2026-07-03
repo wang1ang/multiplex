@@ -6,17 +6,19 @@ is the dominant single-call cost. This package keeps, per past request, snapshot
 of the model state taken at chunk boundaries during prefill; a new request reuses
 the longest matching snapshot and only prefills the tail.
 
-Split in two:
+Split in two pieces under L3:
   * ``policy`` — pure logic (no MLX): trie longest-prefix matching over stored
     entries and per-pool LRU eviction. This is what could become a standalone
     library.
-  * the state clone/restore lives in the engine (L1); L3 wires them together.
+  * ``state`` — L3 adapter for MLX cache objects: clone attention blocks,
+    snapshot SSM, and restore a matched prefix into a single-row BatchState.
+  * L3 scheduler wires policy + state adapter into request flow.
 
-The state object it stores is opaque here — the caller (L3) provides already
-cloned per-layer snapshots and knows how to restore them. policy only reasons
-about token ids and which snapshot position to reuse.
+The state object it stores is opaque here. ``policy`` only reasons about token
+ids and which boundary can be reused; ``state`` knows how MLX caches are cloned
+and restored.
 """
 
-from .policy import PrefixCache, Match, Snapshot, common_prefix_len
+from .policy import PrefixCache, Match
 
-__all__ = ["PrefixCache", "Match", "Snapshot", "common_prefix_len"]
+__all__ = ["PrefixCache", "Match"]

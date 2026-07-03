@@ -100,8 +100,8 @@ class Engine:
         return lm.lm_head(hidden)
 
     # --- batched forward primitives (always [B, ...]; B=1 is just a batch of 1) ---
-    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None, stop=None,
-                on_ssm=None, snapshot_tail: int = 3) -> tuple[BatchState, mx.array]:
+    def prefill(self, prompts: list[list[int]], chunk: int = 0, log=None,
+                stop=None) -> tuple[BatchState, mx.array]:
         """Prefill B prompts. Returns (state, hidden ``[B, max_len, H]``).
 
         Row i's next-token hidden is at position ``lengths[i]-1`` (prompts are
@@ -121,8 +121,7 @@ class Engine:
         if chunk and len(prompts) == 1 and max_len > chunk:
             cache = _make_cache(self.model, [0], None)
             state = BatchState(cache=cache, lengths=[0])
-            h = self._run_chunked(state, prompts[0], chunk, log=log, stop=stop,
-                                   on_ssm=on_ssm, snapshot_tail=snapshot_tail)
+            h = self._run_chunked(state, prompts[0], chunk, log=log, stop=stop)
             return state, h
 
         padding = [max_len - n for n in lengths]
@@ -160,15 +159,11 @@ class Engine:
         return h
 
     def _run_chunked(self, state: BatchState, ids: list[int], chunk: int, *,
-                     log=None, stop=None, on_ssm=None, snapshot_tail: int = 3):
+                     log=None, stop=None):
         """Feed ``ids`` into a single-row ``state`` in chunks (cache accumulates,
-        attention stays incremental so the scratch is bounded). Snapshots SSM
-        state at the last few FULL chunk boundaries via on_ssm(abs_pos, snap) —
-        the final partial chunk (holding the per-turn generation prompt) is never
-        snapshotted, so the next turn's real content matches cleanly. Used for
-        both cold prefill (base 0) and continuing a reused prefix (base = pos).
-        Advances state.lengths; returns the last chunk's hidden. Returns None if
-        stop() fires between chunks."""
+        attention stays incremental so the scratch is bounded). Advances
+        state.lengths; returns the last chunk's hidden. Returns None if stop()
+        fires between chunks."""
         model = self.model.language_model.model
         base = state.lengths[0]
         total = base + len(ids)
@@ -183,9 +178,6 @@ class Engine:
             if log:
                 dt = time.time() - t0
                 log(f"prefill {end}/{total} tok {(min(s + chunk, len(ids)) - s) / dt:.0f} tok/s")
-            if (on_ssm is not None and (s + chunk) <= len(ids)   # full chunk only
-                    and end >= total - snapshot_tail * chunk):
-                on_ssm(end, self.clone_ssm(state.cache))
             if stop and stop():
                 return None
         return h
@@ -247,51 +239,6 @@ class Engine:
         row). Used to peel a freshly-prefilled request out of a prefill group."""
         cache = [c.extract(i) for c in state.cache]
         return BatchState(cache=cache, lengths=[state.lengths[i]])
-
-    def clone_state(self, state: BatchState):
-        """Deep-copy the full attention/KV state for one row.
-
-        SSM layers are intentionally stored as None here.  They are captured per
-        reusable boundary by clone_ssm(), while attention KV is shared by all
-        boundaries under the same full prefix and truncated during restore.
-        """
-        snap = [
-            None if isinstance(c, ArraysCache)
-            else [None if v is None else v + 0 for v in c.state]
-            for c in state.cache
-        ]
-        return (snap, int(state.lengths[0]))
-
-    def clone_ssm(self, cache: list):
-        """Deep-copy ONLY the SSM (ArraysCache) layers — the small (~50MB),
-        fixed-size recurrent state that cannot be truncated, so it must be
-        captured per chunk boundary. Attention layers -> None (truncated from the
-        full KV at restore). Cheap enough to snapshot several boundaries."""
-        return [[None if v is None else v + 0 for v in c.cache]
-                if isinstance(c, ArraysCache) else None for c in cache]
-
-    def restore_at(self, full_snapshot, ssm_snapshot, pos: int) -> BatchState:
-        """Rebuild a state good for the first ``pos`` tokens: attention KV taken
-        from the full snapshot and TRUNCATED to pos; SSM taken from the
-        per-boundary ssm_snapshot (which is exactly the state at pos). Continue
-        with forward()."""
-        full, full_len = full_snapshot
-        cache = _make_cache(self.model, [0], None)
-        for c, layer_full, layer_ssm in zip(cache, full, ssm_snapshot):
-            if isinstance(c, ArraysCache):
-                c.cache = [None if v is None else v + 0 for v in layer_ssm]
-            else:
-                layer = [None if v is None else v + 0 for v in layer_full]
-                if isinstance(c, BatchKVCache) and len(layer) == 2:
-                    c.keys, c.values = layer
-                    c.offset = mx.array([c.keys.shape[2]])
-                    c.left_padding = mx.array([0])
-                    c._idx = c.keys.shape[2]
-                else:
-                    c.state = layer
-                if pos < full_len:
-                    c.trim(full_len - pos)   # KV has a position axis -> truncate
-        return BatchState(cache=cache, lengths=[pos])
 
     def merge_states(self, states: list[BatchState]) -> BatchState:
         """Merge several single-row states into one batched state (for "入":
