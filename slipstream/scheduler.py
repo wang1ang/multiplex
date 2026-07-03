@@ -264,7 +264,7 @@ class Scheduler:
                     self._log(f"PREFIX STORE block={block} "
                               f"len={p}/{len(ids)} rid={req.rid}")
             if stored:
-                self.pc.flush()
+                self._log(f"PREFIX STORE DEFER FLUSH rid={req.rid}")
 
         if h is None:                               # cancelled mid-prefill
             self._log(f"PREFILL CANCELLED rid={req.rid}")
@@ -383,7 +383,7 @@ class Scheduler:
             self.pc.store(prefix, (self.eng.clone_state(single),
                                   self.eng.clone_ssm(single.cache),
                                   len(prefix), h_final + 0),
-                          source=f"session rid={req.rid}")
+                          source=f"session rid={req.rid}", save=False)
             self._log(f"SESSION STORE len={len(prefix)} prompt_len={prompt_len} "
                       f"rid={req.rid}")
             return
@@ -405,8 +405,12 @@ class Scheduler:
         self.pc.store(prefix, (self.eng.clone_state(single),
                               self.eng.clone_ssm(single.cache),
                               len(prefix), h_final + 0),
-                      source=f"session rid={req.rid}")
+                      source=f"session rid={req.rid}", save=False)
         self._log(f"SESSION STORE len={len(prefix)} rid={req.rid}")
+
+    def flush_prefix_cache(self) -> None:
+        if self.pc is not None:
+            self.pc.flush()
 
     def _keep(self, keep: list[int]) -> None:
         """Retain only the given row indices in the live batch, dropping the

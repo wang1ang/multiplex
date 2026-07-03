@@ -176,6 +176,7 @@ class Hub:
                     self._emit([(rid, [first]) for rid, first in sched.merge_ready(group)])
 
             if not sched.has_rows():
+                sched.flush_prefix_cache()
                 time.sleep(0.003)   # idle; wait for work
                 continue
 

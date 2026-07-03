@@ -77,6 +77,7 @@ class PrefixCache:
         self._snaps: list[Snapshot] = []
         self._clock = 0
         self._log = log
+        self._dirty = False
         self.disk_dir = Path(disk_dir).expanduser() if disk_dir else None
         self._store = PrefixCacheDiskStore(self.disk_dir, log=log) \
             if self.disk_dir else None
@@ -127,6 +128,7 @@ class PrefixCache:
                         f"encoded={stats['encoded']} wrote={stats['wrote']} "
                         f"deduped={stats['deduped']} "
                         f"path={self._store.manifest_path}")
+            self._dirty = False
         except Exception as e:
             path = self._store.manifest_path if self._store is not None else None
             self._debug(f"SAVE FAILED path={path} error={e!r}")
@@ -207,6 +209,8 @@ class PrefixCache:
 
     def flush(self, *, wait: bool = False) -> None:
         """Persist the current cache to disk, if persistence is enabled."""
+        if not self._dirty:
+            return
         self._save_disk(wait=wait)
 
     def store(self, full_prefix, payload, *, source: str | None = None,
@@ -227,6 +231,7 @@ class PrefixCache:
         self._clock += 1
         group.nodes.append(Node(pos=pos, ssm=ssm, source=source,
                                 cached_h=cached_h, touch=self._clock))
+        self._dirty = True
         self._evict()
         if save:
             self._save_disk()
