@@ -28,6 +28,7 @@ Correctness facts (verified by experiment):
 from __future__ import annotations
 
 import os
+import json
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -39,10 +40,30 @@ from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
 
 def find_mtp(model_path: str) -> str | None:
-    """The MTP head sits beside the model as mtp.safetensors; return its path,
-    or None if absent (the model then runs pure AR / headless)."""
-    p = os.path.join(os.path.expanduser(model_path), "mtp.safetensors")
-    return p if os.path.exists(p) else None
+    """Return the model's MTP sidecar path, or None for pure AR/headless."""
+    model_dir = os.path.expanduser(model_path)
+    candidates = []
+
+    runtime = os.path.join(model_dir, "mtplx_runtime.json")
+    if os.path.exists(runtime):
+        try:
+            with open(runtime, encoding="utf-8") as f:
+                data = json.load(f)
+            for key in ("mtp_sidecar_file", "mtp_file"):
+                value = data.get(key)
+                if isinstance(value, str):
+                    candidates.append(os.path.join(model_dir, value))
+        except Exception:
+            pass
+
+    candidates.extend([
+        os.path.join(model_dir, "mtp.safetensors"),
+        os.path.join(model_dir, "mtp", "weights.safetensors"),
+    ])
+    for path in candidates:
+        if os.path.exists(path):
+            return path
+    return None
 
 
 @dataclass

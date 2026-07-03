@@ -52,11 +52,15 @@ def _stack_experts(weights: dict, n_experts: int) -> dict:
 
 
 def _quant_config(model_path: str) -> dict:
-    """Default quantization scheme from the model's config.json. The block sits
-    at the TOP level (not text_config), and mlx-lm drops it after load, so read
-    the file. Mixed per-layer specs share the block; top-level = the default."""
+    """Quantization scheme for the MTP head.
+
+    Some artifacts quantize the draft head differently from the trunk body
+    (e.g. Qwen3.6-27B uses an INT4 group-32 MTP sidecar with a group-64 trunk),
+    so prefer the explicit MTP block and only fall back to the body default.
+    """
     with open(os.path.join(model_path, "config.json")) as f:
-        q = (json.load(f).get("quantization") or {})
+        cfg = json.load(f)
+    q = cfg.get("mtplx_mtp_quantization") or cfg.get("quantization") or {}
     return {"group_size": int(q.get("group_size", 64)),
             "bits": int(q.get("bits", 4)),
             "mode": str(q.get("mode", "affine"))}
