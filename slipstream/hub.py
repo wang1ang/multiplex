@@ -31,7 +31,7 @@ _DONE = object()   # sentinel pushed to a request's queue when it finishes
 
 class Hub:
     def __init__(self, model_path, mtp_path, *, k=1, chunk=512, debug=False,
-                 prefix_cache_dir="auto"):
+                 prefix_cache_dir="none"):
         self.model_id = model_path.rstrip("/").split("/")[-1]
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,
