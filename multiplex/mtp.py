@@ -93,6 +93,26 @@ def _quant_config(model_path: str) -> dict:
             "mode": str(q.get("mode", "affine"))}
 
 
+def _mtp_norms_are_delta_encoded(model_path: str) -> bool:
+    with open(os.path.join(model_path, "config.json")) as f:
+        cfg = json.load(f)
+    mtp_quant = cfg.get("mtplx_mtp_quantization")
+    values = [
+        cfg.get("mtplx_mtp_norm_encoding"),
+        cfg.get("mtp_norm_encoding"),
+    ]
+    if isinstance(mtp_quant, dict):
+        values.extend([
+            mtp_quant.get("norm_encoding"),
+            mtp_quant.get("norm_weight_encoding"),
+        ])
+    return any(
+        str(value).strip().lower() in {"delta", "delta_plus_one", "mlx_delta"}
+        for value in values
+        if value is not None
+    )
+
+
 def _infer_prequant_group_size(weights: dict, bits: int) -> int | None:
     """Infer the sidecar's real quantization group size from packed tensors."""
     if bits <= 0 or 32 % bits:
@@ -182,13 +202,10 @@ class Drafter:
         # strict=False: heads vary by architecture (dense vs MoE, quantized or
         # not); load what matches and let the module keep its untouched norms.
         self.head.load_weights(list(weights.items()), strict=False)
-        # This model's RMSNorm uses the (1 + weight) convention: the checkpoint
-        # stores weight-1, and the forward computes (1 + w) * x. mlx-lm's nn.RMSNorm
-        # is plain w * x, so add 1 to every norm weight in the head. (The trunk is
-        # loaded by mlx-lm which already handles this; the head is loaded here.)
-        for _, m in self.head.named_modules():
-            if isinstance(m, nn.RMSNorm):
-                m.weight = m.weight + 1.0
+        if _mtp_norms_are_delta_encoded(engine.model_path):
+            for _, m in self.head.named_modules():
+                if isinstance(m, nn.RMSNorm):
+                    m.weight = m.weight + 1.0
         # A non-prequantized head is quantized to the model's own scheme (bits
         # follow the model, not a user knob); prequantized heads are done above.
         if not prequant:
