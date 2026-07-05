@@ -45,6 +45,8 @@ class Req:
     output_log_chars: int = 0
     advance_tokens: int = 0
     advance_seconds: float = 0.0
+    accept_counts: list[int] = field(default_factory=list)
+    accept_trials: int = 0
 
 
 @dataclass
@@ -230,6 +232,12 @@ class Scheduler:
                 else:
                     break
             accs.append(a)
+            if k:
+                if len(rows[i].accept_counts) < k:
+                    rows[i].accept_counts.extend([0] * (k - len(rows[i].accept_counts)))
+                rows[i].accept_trials += 1
+                for n in range(a):
+                    rows[i].accept_counts[n] += 1
         m = min(accs)
 
         emitted, finished = [], []
@@ -276,7 +284,12 @@ class Scheduler:
         self.prefix_cache.capture_session_blocks(rows, state, dcache=self.dcache, h=h)
 
         if finished:
-            self._log(f"EXIT {[rows[i].rid for i in finished]}")
+            exits = [
+                f"{rows[i].rid} acc_rate="
+                f"{[round(c / rows[i].accept_trials, 3) for c in rows[i].accept_counts]}"
+                for i in finished
+            ]
+            self._log(f"EXIT {exits}")
             self._keep([i for i in range(B) if i not in finished])
             self.prefix_cache.prune_unreferenced()
 

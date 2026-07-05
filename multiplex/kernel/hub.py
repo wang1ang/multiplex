@@ -18,6 +18,7 @@ from __future__ import annotations
 from pathlib import Path
 import json
 import queue
+import sys
 import threading
 import time
 
@@ -160,6 +161,9 @@ class Hub:
         #           f"add_generation_prompt={add_generation_prompt!r}",
         #           file=sys.stderr, flush=True)
         effective_enable_thinking = self._effective_enable_thinking(enable_thinking)
+        if getattr(self, "_cfg", {}).get("debug"):
+            print(f"[hub] REQUEST enable_thinking={effective_enable_thinking}",
+                  file=sys.stderr, flush=True)
         prompt_ids = self._prompt_ids(
             messages,
             tools,
