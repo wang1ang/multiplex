@@ -16,6 +16,7 @@ thread and calls these in a loop.
 from __future__ import annotations
 
 from pathlib import Path
+import random
 import sys
 import time
 from dataclasses import dataclass, field
@@ -308,12 +309,41 @@ class Scheduler:
         ]
 
     def _accept_draft(self, req: Req, logits, best: int, draft: int) -> bool:
-        """Hook for future relaxed MTP acceptance.
+        """Accept draft with probability ``p_draft / p_max``.
 
-        The per-request knobs already live on Req; current behavior stays
-        strict and identical to argmax verify.
+        ``top_k`` and ``top_p`` are hard filters. ``temperature`` only scales
+        the verifier distribution; non-positive values keep strict argmax.
         """
-        return draft == best
+        temp = req.temperature
+        if temp is None or temp <= 0:
+            return draft == best
+
+        probs = mx.softmax(logits / temp, axis=-1)
+        p_draft = float(probs[draft])
+        p_max = max(float(probs[best]), 1e-12)
+
+        if not self._passes_top_k(probs, draft, req.top_k):
+            return False
+        if not self._passes_top_p(probs, draft, req.top_p):
+            return False
+        return random.random() < min(1.0, p_draft / p_max)
+
+    @staticmethod
+    def _passes_top_k(probs, draft: int, top_k: int | None) -> bool:
+        if top_k is None or top_k <= 0:
+            return True
+        top = mx.topk(probs, min(top_k, int(probs.shape[-1])))
+        return float(probs[draft]) >= float(top[-1])
+
+    @staticmethod
+    def _passes_top_p(probs, draft: int, top_p: float | None) -> bool:
+        if top_p is None or top_p <= 0 or top_p >= 1:
+            return True
+        order = mx.argsort(-probs)
+        sorted_probs = probs[order]
+        cumsum = mx.cumsum(sorted_probs)
+        rank = int(mx.argmax(order == draft))
+        return rank == 0 or float(cumsum[rank - 1]) < top_p
 
     def _log_output(self, req: Req, toks: list[int]) -> None:
         if self.output_log_dir is None or self.output_decode is None:

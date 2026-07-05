@@ -1,6 +1,9 @@
 import json
 
+import mlx.core as mx
+
 from multiplex.hub import Hub
+from multiplex.scheduler import Req, Scheduler
 from multiplex.server import (
     _chat_stream,
     _enable_thinking_from_body,
@@ -134,3 +137,28 @@ def test_l4_sets_decode_params_from_thinking_state():
             [{"role": "user", "content": "hi"}], 8, **kwargs
         ))
         assert calls == [expected]
+
+
+def test_l3_accepts_draft_by_probability(monkeypatch):
+    req = Req(0, [], 1, temperature=1.0)
+    logits = mx.array([2.0, 1.0, 0.0])
+    scheduler = Scheduler.__new__(Scheduler)
+
+    monkeypatch.setattr("multiplex.kernel.scheduler.random.random", lambda: 0.3)
+    assert scheduler._accept_draft(req, logits, best=0, draft=1) is True
+
+    monkeypatch.setattr("multiplex.kernel.scheduler.random.random", lambda: 0.5)
+    assert scheduler._accept_draft(req, logits, best=0, draft=1) is False
+
+
+def test_l3_accept_draft_top_k_and_top_p_are_hard_filters(monkeypatch):
+    logits = mx.array([3.0, 2.0, 1.0])
+    scheduler = Scheduler.__new__(Scheduler)
+    monkeypatch.setattr("multiplex.kernel.scheduler.random.random", lambda: 0.0)
+
+    assert scheduler._accept_draft(
+        Req(0, [], 1, temperature=1.0, top_k=1), logits, best=0, draft=1
+    ) is False
+    assert scheduler._accept_draft(
+        Req(0, [], 1, temperature=1.0, top_p=0.5), logits, best=0, draft=1
+    ) is False
