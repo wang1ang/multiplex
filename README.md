@@ -74,6 +74,7 @@ python -m multiplex.server \
 Useful flags:
 
 - `--no-debug`: silence scheduler/request logs.
+- `-d, --depth N`: MTP draft depth; `0` disables speculation.
 - `--prefix-cache-dir auto`: default; persists prefix-cache blocks under
   `~/.cache/multiplex/prefixcache/<model>-<hash>`.
 - `--prefix-cache-dir none`: disable SSD-backed prefix cache.
