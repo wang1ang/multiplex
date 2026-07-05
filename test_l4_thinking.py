@@ -1,7 +1,7 @@
 import json
 
 from multiplex.hub import Hub
-from multiplex.server import _chat_stream
+from multiplex.server import _chat_stream, _enable_thinking_from_body
 
 
 def _ids(text: str) -> list[int]:
@@ -85,3 +85,23 @@ def test_l5_chat_stream_maps_l4_reasoning_to_reasoning_content_delta():
     deltas = [payload["choices"][0]["delta"] for payload in payloads]
     assert {"reasoning_content": "private plan"} in deltas
     assert {"content": "Visible answer"} in deltas
+
+
+def test_l5_maps_reasoning_effort_to_enable_thinking():
+    assert _enable_thinking_from_body({"reasoning": {"effort": "low"}}) is False
+    assert _enable_thinking_from_body({"reasoning": {"effort": "minimal"}}) is False
+    assert _enable_thinking_from_body({"reasoning": {"effort": "medium"}}) is True
+    assert _enable_thinking_from_body({"reasoning": {"effort": "high"}}) is True
+    assert _enable_thinking_from_body({"reasoning": {"effort": "xhigh"}}) is True
+    assert _enable_thinking_from_body({"reasoning_effort": "high"}) is True
+
+
+def test_l5_enable_thinking_overrides_reasoning_effort():
+    assert _enable_thinking_from_body({
+        "enable_thinking": False,
+        "reasoning": {"effort": "high"},
+    }) is False
+    assert _enable_thinking_from_body({
+        "enable_thinking": True,
+        "reasoning": {"effort": "low"},
+    }) is True

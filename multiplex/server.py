@@ -52,6 +52,26 @@ def _messages_from_chat(body):
     return list(body.get("messages", []))
 
 
+def _enable_thinking_from_body(body):
+    explicit = body.get("enable_thinking")
+    if isinstance(explicit, bool):
+        return explicit
+
+    reasoning = body.get("reasoning")
+    effort = reasoning.get("effort") if isinstance(reasoning, dict) else None
+    if not isinstance(effort, str):
+        effort = body.get("reasoning_effort")
+    if not isinstance(effort, str):
+        return None
+
+    effort = effort.lower()
+    if effort in {"minimal", "low"}:
+        return False
+    if effort in {"medium", "high", "xhigh"}:
+        return True
+    return None
+
+
 def _content_text(content):
     if content is None:
         return ""
@@ -365,9 +385,7 @@ def make_handler(backend: Hub):
                              or body.get("max_tokens") or 2048)
 
             tools = body.get("tools")
-            enable_thinking = body.get("enable_thinking")
-            if not isinstance(enable_thinking, bool):
-                enable_thinking = None
+            enable_thinking = _enable_thinking_from_body(body)
             if path == "/v1/chat/completions":
                 msgs = _messages_from_chat(body)
                 if stream:
