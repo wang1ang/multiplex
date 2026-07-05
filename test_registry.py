@@ -1,5 +1,6 @@
 import importlib.util
 import sys
+from types import SimpleNamespace
 from pathlib import Path
 
 
@@ -93,3 +94,26 @@ def test_huggingface_url_reuses_existing_local_dir(monkeypatch, tmp_path):
 
     assert entry.name == "org--repo"
     assert entry.path == str(model_dir)
+
+
+def test_missing_huggingface_url_calls_snapshot_download_without_network(
+    monkeypatch, tmp_path
+):
+    calls = []
+
+    def fake_snapshot_download(*, repo_id, local_dir):
+        calls.append((repo_id, local_dir))
+        Path(local_dir).mkdir(parents=True)
+        (Path(local_dir) / "config.json").write_text("{}")
+
+    monkeypatch.setitem(
+        sys.modules,
+        "huggingface_hub",
+        SimpleNamespace(snapshot_download=fake_snapshot_download),
+    )
+
+    entry = registry.select("https://huggingface.co/org/repo/tree/main", root=str(tmp_path))
+
+    assert entry.name == "org--repo"
+    assert entry.path == str(tmp_path / "org--repo")
+    assert calls == [("org/repo", str(tmp_path / "org--repo"))]
