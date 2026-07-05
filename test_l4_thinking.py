@@ -1,5 +1,4 @@
 import json
-from types import SimpleNamespace
 
 from multiplex.hub import Hub
 from multiplex.server import _chat_stream
@@ -28,7 +27,7 @@ class TinyTokenizer:
 
 def _hub_with_raw_chunks(chunks):
     hub = Hub.__new__(Hub)
-    hub.eng = SimpleNamespace(tokenizer=TinyTokenizer())
+    hub.tokenizer = TinyTokenizer()
     hub._default_enable_thinking = None
     hub._stream_prompt_ids = lambda _prompt_ids, _max_tokens: iter(chunks)
     return hub

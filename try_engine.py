@@ -28,12 +28,16 @@ from multiplex.mtp import Drafter, find_mtp
 from multiplex.scheduler import Scheduler, Req, PrefillGroup
 
 
-def to_ids(eng, text, raw):
+def to_ids(tokenizer, text, raw):
     if raw:
-        return eng.encode(text)
-    return eng.tokenizer.apply_chat_template(
+        return tokenizer.encode(text)
+    return tokenizer.apply_chat_template(
         [{"role": "user", "content": text}], add_generation_prompt=True
     )
+
+
+def decode(tokenizer, token_ids, *, skip_special_tokens=True):
+    return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
 def main() -> int:
@@ -51,6 +55,7 @@ def main() -> int:
     mtp = find_mtp(entry.path)
     print(f"[loading {entry.name}{' + MTP head' if mtp else ' (headless, pure AR)'}...]")
     eng = Engine(entry.path)
+    tokenizer = eng.tokenizer
     drafter = Drafter(eng, mtp) if mtp else None
 
     debug_lines = []
@@ -60,7 +65,9 @@ def main() -> int:
         del debug_lines[:-80]
 
     sch = Scheduler(
-        eng, drafter, k=args.depth, chunk=512, debug=args.debug,
+        eng, drafter, eos_token_ids=tokenizer.eos_token_ids,
+        k=args.depth, chunk=512, debug=args.debug,
+        output_decode=lambda ids: decode(tokenizer, ids, skip_special_tokens=False),
         log=append_debug if args.debug else None,
     )
 
@@ -114,7 +121,7 @@ def main() -> int:
         # Prefill the new request and merge it into the live batch. The
         # merge returns each joined request's FIRST token — show it now (it is
         # not part of the next step()'s output).
-        group = PrefillGroup(req=Req(rid, to_ids(eng, text, args.raw), args.max_tokens))
+        group = PrefillGroup(req=Req(rid, to_ids(tokenizer, text, args.raw), args.max_tokens))
         while True:
             done = sch.prefill_chunk(group)
             if done is None:
@@ -122,7 +129,7 @@ def main() -> int:
             if done:
                 break
         for r, first in sch.merge_ready(group):
-            produced_text[r] += eng.decode([first])
+            produced_text[r] += decode(tokenizer, [first])
         render()
 
     kb = KeyBindings()
@@ -150,7 +157,7 @@ def main() -> int:
         while True:
             if sch.has_rows():
                 for rid, toks in sch.step():
-                    produced_text[rid] = produced_text.get(rid, "") + eng.decode(toks)
+                    produced_text[rid] = produced_text.get(rid, "") + decode(tokenizer, toks)
                 render()
                 app.invalidate()
             await asyncio.sleep(0.001)

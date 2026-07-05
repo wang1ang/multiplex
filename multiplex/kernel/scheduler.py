@@ -60,19 +60,21 @@ class PrefillGroup:
 
 
 class Scheduler:
-    def __init__(self, engine: Engine, drafter: Drafter | None, *, k=1, chunk=512,
-                 prefix_cache=8, prefix_cache_dir=None, output_log_dir=None,
-                 debug=False, log=None):
+    def __init__(self, engine: Engine, drafter: Drafter | None, *,
+                 eos_token_ids, k=1, chunk=512, prefix_cache=8,
+                 prefix_cache_dir=None, output_log_dir=None,
+                 output_decode=None, debug=False, log=None):
         self.eng = engine
         self.dr = drafter
         # No MTP head -> no speculation possible; k is forced to 0 (pure AR).
         self.k = k if drafter is not None else 0
         self.chunk = chunk
-        self.eos = engine.eos_token_ids
+        self.eos = set(eos_token_ids)
         self.debug = debug
         self.log = log
         self._t = 0
         self.output_log_dir = Path(output_log_dir) if output_log_dir else None
+        self.output_decode = output_decode
         self.prefix_cache = PrefixCacheRuntime(
             engine, drafter=drafter, capacity=prefix_cache, disk_dir=prefix_cache_dir,
             chunk=chunk, log=self._log,
@@ -286,7 +288,7 @@ class Scheduler:
         ]
 
     def _log_output(self, req: Req, toks: list[int]) -> None:
-        if self.output_log_dir is None:
+        if self.output_log_dir is None or self.output_decode is None:
             return
         try:
             self.output_log_dir.mkdir(parents=True, exist_ok=True)
@@ -295,7 +297,7 @@ class Scheduler:
                 text_path.write_text("", encoding="utf-8")
                 req.output_log_started = True
 
-            raw = self.eng.tokenizer.decode(req.out, skip_special_tokens=False)
+            raw = self.output_decode(req.out)
             delta = raw[req.output_log_chars:]
             if delta:
                 with text_path.open("a", encoding="utf-8") as f:

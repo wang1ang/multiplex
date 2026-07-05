@@ -37,7 +37,7 @@ class RequestManager:
     work, emits text, and finishes requests. Lower layers never see this object.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, decode) -> None:
         self._lock = threading.Lock()
         self._incoming: list[Req] = []
         self._queues: dict[int, queue.Queue] = {}
@@ -45,6 +45,7 @@ class RequestManager:
         self._shown: dict[int, int] = {}
         self._cancelled: set[int] = set()
         self._rid = 0
+        self._decode = decode
 
     def submit(self, prompt_ids, max_tokens) -> tuple[Req, queue.Queue]:
         q: queue.Queue = queue.Queue()
@@ -86,7 +87,8 @@ class RequestManager:
         if notify and q is not None:
             q.put(_DONE)
 
-    def emit(self, emitted, decode) -> None:
+    def emit(self, emitted) -> None:
+        decode = self._decode
         for rid, toks in emitted:
             with self._lock:
                 if rid not in self._toks:
@@ -114,7 +116,6 @@ class Hub:
                          prefix_cache_dir=prefix_cache_dir)
         self._default_enable_thinking = self._load_default_enable_thinking(model_path)
         self._request_log_dir = Path("logs") / "requests"
-        self._requests = RequestManager()
         # The model must be loaded AND used on the same thread (MLX's GPU stream
         # is thread-bound), so the engine thread loads it. Wait until ready.
         self._ready = threading.Event()
@@ -179,7 +180,7 @@ class Hub:
                     enable_thinking=None):
         """Render messages to token ids for L3."""
         msgs = normalize_messages_for_template(messages)
-        tok = self.eng.tokenizer
+        tok = self.tokenizer
         kw = {"tools": tools} if tools else {}
         if enable_thinking is not None:
             kw["enable_thinking"] = bool(enable_thinking)
@@ -209,11 +210,11 @@ class Hub:
 
     def _prompt_opens_thinking(self, prompt_ids) -> bool:
         try:
-            prompt_text = self.eng.tokenizer.decode(
+            prompt_text = self.tokenizer.decode(
                 list(prompt_ids), skip_special_tokens=False
             )
         except TypeError:
-            prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
+            prompt_text = self.tokenizer.decode(list(prompt_ids))
         except Exception:
             return False
         open_index = prompt_text.rfind("<think>")
@@ -246,11 +247,11 @@ class Hub:
             return
         try:
             try:
-                prompt_text = self.eng.tokenizer.decode(
+                prompt_text = self.tokenizer.decode(
                     list(prompt_ids), skip_special_tokens=False
                 )
             except TypeError:
-                prompt_text = self.eng.tokenizer.decode(list(prompt_ids))
+                prompt_text = self.tokenizer.decode(list(prompt_ids))
 
             self._request_log_dir.mkdir(parents=True, exist_ok=True)
             path = self._request_log_dir / f"req-{req.rid}.log"
@@ -267,13 +268,19 @@ class Hub:
     def _run(self):
         c = self._cfg
         self.eng = Engine(c["model_path"])
+        self.tokenizer = self.eng.tokenizer
+        self._requests = RequestManager(self._decode)
         # No MTP head path -> run pure AR (scheduler forces k=0).
         self.drafter = (Drafter(self.eng, c["mtp_path"])
                         if c["mtp_path"] is not None else None)
         self._sched = Scheduler(self.eng, self.drafter,
+                                eos_token_ids=self.tokenizer.eos_token_ids,
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"],
                                 prefix_cache_dir=c["prefix_cache_dir"],
-                                output_log_dir=self._request_log_dir if c["debug"] else None)
+                                output_log_dir=self._request_log_dir if c["debug"] else None,
+                                output_decode=lambda ids: self._decode(
+                                    ids, skip_special_tokens=False
+                                ))
         self._ready.set()
         sched = self._sched
         waiting: list[Req] = []
@@ -308,8 +315,7 @@ class Hub:
                 elif done:
                     self._requests.emit(
                         [(rid, [first])
-                         for rid, first in sched.merge_ready(prefill_group)],
-                        self.eng.decode,
+                         for rid, first in sched.merge_ready(prefill_group)]
                     )
                     prefill_group = None
 
@@ -319,8 +325,13 @@ class Hub:
                 continue
 
             live_before = sched.live_rids()
-            self._requests.emit(sched.step(), self.eng.decode)
+            self._requests.emit(sched.step())
 
             # finished = was live before this step but no longer live -> done
             for rid in live_before - sched.live_rids():
                 self._requests.finish(rid, notify=True)
+
+    def _decode(self, token_ids, *, skip_special_tokens=True):
+        return self.tokenizer.decode(
+            token_ids, skip_special_tokens=skip_special_tokens
+        )

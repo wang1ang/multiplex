@@ -66,14 +66,6 @@ class Engine:
         self.model_path = model_path
         self.load_seconds = time.time() - t0
 
-    def decode(self, token_ids: list[int]) -> str:
-        # skip_special_tokens drops <|im_end|>/<|endoftext|> etc from the text.
-        return self.tokenizer.decode(token_ids, skip_special_tokens=True)
-
-    @property
-    def eos_token_ids(self) -> set[int]:
-        return set(self.tokenizer.eos_token_ids)
-
     def logits(self, hidden: mx.array) -> mx.array:
         """Trunk head over hidden -> logits ``[..., vocab]``. Mirrors mlx-lm's
         own tie handling: tied models project through the embedding, untied use
