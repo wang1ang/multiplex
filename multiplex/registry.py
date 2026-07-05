@@ -9,6 +9,7 @@ from __future__ import annotations
 import os
 import sys
 from dataclasses import dataclass
+from urllib.parse import urlparse
 
 DEFAULT_ROOT = "~/.mtplx/models"
 
@@ -34,6 +35,40 @@ def list_models(root: str = DEFAULT_ROOT) -> list[ModelEntry]:
     return entries
 
 
+def _hf_names(model: str) -> tuple[str, str]:
+    """Return ``(repo_id, local_dir_name)`` for an HF id or HF model URL."""
+    if model.startswith(("http://", "https://")):
+        parsed = urlparse(model)
+        if parsed.netloc not in {"huggingface.co", "www.huggingface.co", "hf.co"}:
+            raise ValueError(f"unsupported model URL: {model}")
+        parts = [p for p in parsed.path.split("/") if p]
+        if len(parts) < 2:
+            raise ValueError(f"unsupported Hugging Face model URL: {model}")
+        repo_id = "/".join(parts[:2])
+    else:
+        repo_id = model.strip("/")
+    return repo_id, repo_id.replace("/", "--")
+
+
+def download_model(model: str, root: str = DEFAULT_ROOT) -> ModelEntry:
+    """Download an HF repo into the local model root and return its entry."""
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as e:
+        raise RuntimeError(
+            "huggingface_hub is required to download models; install multiplex again"
+        ) from e
+
+    repo_id, local_name = _hf_names(model)
+    root = os.path.expanduser(root)
+    path = os.path.join(root, local_name)
+    print(f"[downloading HF model {repo_id} -> {path}]", file=sys.stderr)
+    snapshot_download(repo_id=repo_id, local_dir=path)
+    if not os.path.isfile(os.path.join(path, "config.json")):
+        raise RuntimeError(f"downloaded model has no config.json: {path}")
+    return ModelEntry(name=os.path.basename(path), path=path)
+
+
 def resolve(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry | list[ModelEntry]:
     """Resolve a user's model argument to a single model, or hand the caller a
     list to choose from.
@@ -49,10 +84,11 @@ def resolve(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry | list[Mode
         if arg.startswith(("/", "~", "./", "../")):
             path = os.path.expanduser(arg.rstrip("/"))
             return ModelEntry(name=os.path.basename(path), path=path)
+        _, local_name = _hf_names(arg)
         for e in list_models(root):
-            if e.name == arg:
+            if e.name == arg or e.name == local_name:
                 return e
-        raise FileNotFoundError(f"no model named {arg!r} under {os.path.expanduser(root)}")
+        return download_model(arg, root)
 
     models = list_models(root)
     return models[0] if len(models) == 1 else models

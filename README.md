@@ -42,12 +42,16 @@ Dependencies are declared in `pyproject.toml`; there is no separate
 
 ## Models
 
-Pass either a local model path or a model name discovered under
-`~/.mtplx/models`:
+Pass a local model path, a model name discovered under `~/.mtplx/models`, a
+Hugging Face repo id, or a Hugging Face model URL. If the command-line model
+argument is not found locally, `multiplex` downloads it under `~/.mtplx/models`,
+using `--` in place of `/`:
 
 ```bash
 python -m multiplex.server --model /path/to/model
 python -m multiplex.server --model MODEL_NAME
+python -m multiplex.server --model org/repo
+python -m multiplex.server --model https://huggingface.co/org/repo
 ```
 
 If `--model` is omitted in an interactive terminal, `multiplex` shows a numbered
