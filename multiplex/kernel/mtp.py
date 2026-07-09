@@ -215,6 +215,190 @@ def build_qwen_head(engine, mtp_path: str):
     return head
 
 
+def _pair_layout(model_path: str) -> dict | None:
+    """Return an assistant-pair bundle's ``layout`` dict, or None if the model
+    at ``model_path`` is not a pair bundle. A pair bundle has ``mtplx_pair.json``
+    at its root pointing at ``target/`` and ``assistant/`` subdirectories."""
+    pair = os.path.join(os.path.expanduser(model_path), "mtplx_pair.json")
+    if not os.path.isfile(pair):
+        return None
+    try:
+        with open(pair, encoding="utf-8") as f:
+            layout = (json.load(f).get("layout") or {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    return layout if isinstance(layout, dict) else {}
+
+
+class GemmaHead:
+    """Gemma 4 external-drafter MTP head (MTPLX assistant-backed).
+
+    The Gemma drafter is a 4-layer transformer whose attention layers own no
+    K/V — they must borrow the target's (shared-KV). Unlike Qwen's native head,
+    it keeps NO KV cache of its own: every draft step re-reads the target's live
+    K/V straight from ``engine``'s trunk cache. So the ``cache`` argument that
+    ``Drafter`` threads through (a plain ``KVCache``) is used only as a position
+    counter here — the head writes a 1-wide dummy per token to keep ``Drafter``'s
+    trim/append bookkeeping consistent, but never attends to it.
+
+    The assistant forward (``mtplx.backends.gemma4_assistant``) is reused as-is;
+    this class only adapts it to ``Drafter``'s ``head(embed, hidden, cache)``
+    step interface and wires the shared-KV extraction.
+    """
+
+    def __init__(self, engine, assistant, *, sliding_src: int, full_src: int):
+        self.engine = engine
+        self.assistant = assistant
+        # Source layers whose cached K/V the drafter's sliding / full-attention
+        # layers borrow: the LAST trunk layer of each attention type. This
+        # mirrors MTPLX's forward_with_state, where the shared_kv_states dict
+        # ends up holding the last-written K/V per layer_type.
+        self._sliding_src = int(sliding_src)
+        self._full_src = int(full_src)
+        text_model = engine.model.language_model.model
+        self.embed = text_model.embed_tokens
+        self._embed_scale = float(getattr(text_model, "embed_scale", 1.0))
+        self._last_logits = None
+        # Position within the current draft block. Draft step i predicts the
+        # token at sequence position off+i, so its query position is off-1+i:
+        # it must ADVANCE across a multi-token draft block, not stay pinned at
+        # off-1 (which is only correct for the first drafted token). Drafter
+        # resets this at the start of each block via begin_draft().
+        self._draft_step = 0
+
+    def begin_draft(self) -> None:
+        """Reset the per-block draft position counter (called once per block)."""
+        self._draft_step = 0
+
+    @staticmethod
+    def _valid_kv(c):
+        """Return a source layer's committed K/V ``[1, n_kv, L, D]``, skipping
+        any left-padding (BatchKVCache/BatchRotatingKVCache carry a padded
+        offset; a plain KVCache has a scalar offset and none)."""
+        off = c.offset
+        if hasattr(off, "shape") and off.shape:        # batched (1 row)
+            pad = int(c.left_padding[0])
+            end = int(c._idx)
+            return c.keys[:, :, pad:end, :], c.values[:, :, pad:end, :]
+        n = int(off)
+        return c.keys[..., :n, :], c.values[..., :n, :]
+
+    def _shared_kv(self, cache):
+        ks, vs = self._valid_kv(cache[self._sliding_src])
+        kf, vf = self._valid_kv(cache[self._full_src])
+        return {"sliding_attention": (ks, vs), "full_attention": (kf, vf)}
+
+    def _trunk_cache(self):
+        """The live trunk KV cache the drafter borrows from. The engine stashes
+        the cache of its most recent forward on ``last_trunk_cache``; at draft
+        time that is the current committed decode cache."""
+        cache = getattr(self.engine, "last_trunk_cache", None)
+        if cache is None:
+            raise RuntimeError("Gemma drafter: no trunk cache to borrow shared-KV from")
+        return cache
+
+    def _trunk_offset(self, cache) -> int:
+        off = cache[self._full_src].offset
+        return int(off.item()) if hasattr(off, "shape") and off.shape else int(off)
+
+    def __call__(self, embed: mx.array, hidden: mx.array, cache) -> mx.array:
+        """One (or L) draft step(s). ``embed`` is ``self.embed(tok)`` for the
+        token(s) being predicted from, ``hidden`` the trunk hidden of the same
+        position(s). Returns the drafter's post-hidden, shaped like ``hidden``.
+
+        Attention borrows the trunk's live shared-KV at its current offset; the
+        query position is pinned to ``offset-1`` (the position of the primary
+        token that produced ``hidden``), matching the MLX-VLM/MTPLX drafter.
+        """
+        trunk = self._trunk_cache()
+        off = self._trunk_offset(trunk)
+        # Query position advances within the draft block: step i (0-based) drafts
+        # the token at sequence position off+i, whose query position is off-1+i.
+        # Pinning at off-1 is only correct for step 0 (k=1); k>=2 needs the shift
+        # or the 2nd+ drafted token gets the wrong RoPE position and diverges.
+        pos = max(off - 1 + self._draft_step, 0)
+        self.assistant.set_shared_kv(
+            self._shared_kv(trunk), off,
+            position=pos, kv_valid_len=off,
+        )
+        self._draft_step += 1
+        # embed arrives already scaled? No — Drafter calls self.embed(tok) which
+        # is the raw nn.Embedding; apply the trunk's embed_scale here (mirrors
+        # the assistant's own draft_step, which scales the token embedding).
+        inputs_embeds = mx.concatenate([embed * self._embed_scale, hidden], axis=-1)
+        post, logits = self.assistant(inputs_embeds)
+        # Drafts come from the assistant's OWN vocab head, not the trunk's — the
+        # trunk output projection expects trunk-space hidden, whereas ``post`` is
+        # the assistant's backbone-space chaining state. Stash the step's logits
+        # for Drafter to read via ``self.logits`` immediately after this call.
+        self._last_logits = logits
+        # Keep Drafter's KVCache position counter in step with the trunk without
+        # ever attending to it: write one dummy slot per input token.
+        L = int(inputs_embeds.shape[1])
+        dummy = mx.zeros((inputs_embeds.shape[0], 1, L, 1), dtype=post.dtype)
+        cache.update_and_fetch(dummy, dummy)
+        return post
+
+    def logits(self, post: mx.array) -> mx.array:
+        """The assistant's logits for the step ``__call__`` just computed. The
+        ``post`` argument (chaining hidden) is ignored — Drafter calls this right
+        after ``__call__`` in the same step, so the stashed logits are current."""
+        return self._last_logits
+
+
+def _import_gemma_assistant():
+    """Return MTPLX's ``load_gemma4_assistant_model``.
+
+    The Gemma assistant model class + its shared-KV forward live in MTPLX, which
+    is a sibling checkout rather than an installed dependency. Import it directly
+    if it is already on the path; otherwise add the checkout root (from
+    ``MTPLX_ROOT`` or a sibling ``../MTPLX``) and retry."""
+    import importlib
+    import sys
+
+    def _load():
+        mod = importlib.import_module("mtplx.backends.gemma4_assistant")
+        return mod.load_gemma4_assistant_model
+
+    try:
+        return _load()
+    except ModuleNotFoundError:
+        pass
+    candidates = []
+    env_root = os.environ.get("MTPLX_ROOT")
+    if env_root:
+        candidates.append(os.path.expanduser(env_root))
+    here = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    candidates.append(os.path.join(os.path.dirname(here), "MTPLX"))
+    for root in candidates:
+        if os.path.isdir(os.path.join(root, "mtplx")) and root not in sys.path:
+            sys.path.insert(0, root)
+    return _load()
+
+
+def build_gemma_head(engine, assistant_dir: str):
+    """Build a Gemma 4 external-drafter head from a pair bundle's assistant dir.
+
+    Loads the MTPLX assistant (which honours its own 4-bit quant config), binds
+    it to the trunk (for shared-KV geometry + input embedding), and returns a
+    head exposing ``__call__(embed, hidden, cache) -> post_hidden`` and ``embed``
+    — the same contract as the Qwen head. The assistant's 4-layer transformer
+    forward is reused verbatim; nothing here re-implements it.
+    """
+    load_gemma4_assistant_model = _import_gemma_assistant()
+
+    assistant = load_gemma4_assistant_model(assistant_dir)
+    # bind() wires the trunk's embed_tokens/embed_scale and reads layer_types;
+    # it accepts the mlx-lm wrapper (uses .language_model.model / .text_model).
+    assistant.bind(engine.model)
+
+    text_model = engine.model.language_model.model
+    layer_types = [l.layer_type for l in text_model.layers]
+    full_src = max(i for i, t in enumerate(layer_types) if t == "full_attention")
+    sliding_src = max(i for i, t in enumerate(layer_types) if t == "sliding_attention")
+    return GemmaHead(engine, assistant, sliding_src=sliding_src, full_src=full_src)
+
+
 class Drafter:
     """Drafts tokens against a trunk model using an injected MTP ``head``.
 
@@ -222,12 +406,21 @@ class Drafter:
     needs to expose ``__call__(embed, hidden, cache) -> post_hidden`` plus an
     ``embed`` attribute. Everything else here — draft-cache management, the draft
     loop, committed-history append, verify hand-off — is model-agnostic.
+
+    Draft tokens are read from ``self.draft_logits(post)``. A native head (Qwen)
+    shares the trunk's output projection, so this defaults to ``engine.logits``.
+    An external drafter with its own vocab head (Gemma assistant) instead exposes
+    a ``logits`` method returning ITS logits for the step it just computed; the
+    head's ``post_hidden`` is then only the chaining state, not a trunk hidden.
     """
 
     def __init__(self, engine, head):
         self.engine = engine
         self.head = head
         self.embed = head.embed
+        # External drafters project drafts through their own head; native heads
+        # reuse the trunk's (engine.logits). Predicate: head advertises .logits.
+        self.draft_logits = getattr(head, "logits", None) or engine.logits
 
     def make_cache(self) -> list:
         return [KVCache()]
@@ -335,6 +528,12 @@ class Drafter:
             tok = tok[None, :]
         if int(tok.shape[1]) == 0:
             return
+        # A stateless shared-KV head (Gemma) keeps no draft KV of its own — it
+        # re-reads the trunk's live K/V each step — so there is no MTP history to
+        # append, and running the head here would only perturb its block-position
+        # counter. The native head (Qwen) has no begin_draft and needs the append.
+        if hasattr(self.head, "begin_draft"):
+            return
         post = self.head(self.embed(tok), hidden, cache[0])
         mx.eval(post, *cache[0].state)
 
@@ -348,12 +547,16 @@ class Drafter:
         """
         if k == 0:                                  # no draft -> pure AR
             return mx.zeros((tokens.shape[0], 0), dtype=tokens.dtype)
+        # Shared-KV heads track a query position that advances across this block;
+        # reset it at the block start. Native heads (Qwen) don't define this.
+        if hasattr(self.head, "begin_draft"):
+            self.head.begin_draft()
         h = hidden
         tok = tokens[:, None]                       # [B, 1]
         drafts = []
         for _ in range(k):
             post = self.head(self.embed(tok), h, cache[0])   # [B, 1, H]
-            tok = mx.argmax(self.engine.logits(post)[:, -1, :], axis=-1)[:, None]  # [B, 1]
+            tok = mx.argmax(self.draft_logits(post)[:, -1, :], axis=-1)[:, None]  # [B, 1]
             drafts.append(tok)
             h = post
         return mx.concatenate(drafts, axis=1)
@@ -367,9 +570,20 @@ def find_drafter(engine):
     Add a new MTP family by adding a head builder + a branch here — the draft
     loop, cache management, and scheduler contract stay shared.
       * ``mtp.safetensors`` sidecar  -> Qwen native MTP head (build_qwen_head)
-      * (future) assistant-pair bundle -> Gemma external drafter
+      * assistant-pair bundle        -> Gemma external drafter (build_gemma_head)
     """
     mtp_path = find_mtp(engine.model_path)
     if mtp_path is not None:
         return Drafter(engine, build_qwen_head(engine, mtp_path))
+
+    # A pair bundle points at target/ (already the load path) + assistant/. The
+    # engine loaded the target; the drafter is the sibling assistant dir. The
+    # bundle root is the parent of the resolved target load path.
+    bundle_root = os.path.dirname(os.path.normpath(engine.model_path))
+    layout = _pair_layout(bundle_root)
+    if layout is not None:
+        assistant_dir = os.path.join(
+            bundle_root, str(layout.get("assistant") or "assistant"))
+        if os.path.isfile(os.path.join(assistant_dir, "config.json")):
+            return Drafter(engine, build_gemma_head(engine, assistant_dir))
     return None

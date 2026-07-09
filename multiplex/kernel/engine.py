@@ -91,6 +91,10 @@ class Engine:
             self.model.language_model = self.model
         self.model_path = load_path
         self.load_seconds = time.time() - t0
+        # The most recent forward's trunk cache. An external drafter (Gemma
+        # shared-KV) borrows the trunk's live K/V from here at draft time; the
+        # native-head path never reads it.
+        self.last_trunk_cache = None
 
     def logits(self, hidden: mx.array) -> mx.array:
         """Trunk head over hidden -> logits ``[..., vocab]``. Mirrors mlx-lm's
@@ -111,6 +115,7 @@ class Engine:
         h = self.model.language_model.model(piece, cache=state.cache)
         mx.eval(h, *(c.state for c in state.cache))
         state.lengths[0] += len(ids)
+        self.last_trunk_cache = state.cache
         return h
 
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:
@@ -122,6 +127,7 @@ class Engine:
         k = int(tokens.shape[1])
         h = self.model.language_model.model(tokens, cache=state.cache)
         state.lengths = [n + k for n in state.lengths]
+        self.last_trunk_cache = state.cache
         return h
 
     def snapshot_ssm(self, state: BatchState) -> list:
@@ -179,6 +185,7 @@ class Engine:
         for li in range(nlayers):
             merged.append(self._merge_layer([s.cache[li] for s in states]))
         lengths = [s.lengths[0] for s in states]
+        self.last_trunk_cache = merged
         return BatchState(cache=merged, lengths=lengths)
 
     @staticmethod

@@ -261,12 +261,24 @@ class Scheduler:
                 dr.append_history(self.dcache, vhidden[:, :m, :], accepted)
         if m == k:
             h = vhidden[:, -1:, :]
-        else:
+        elif snap is not None and any(s is not None for s in snap):
+            # Hybrid SSM+attention trunk: SSM recurrent state can't be partially
+            # trimmed, so roll it back to before the round and replay the
+            # committed prefix (primary + m accepted). Attention keeps only the
+            # committed KV via the trim; the replay rebuilds SSM and gives h.
             eng.restore_ssm(state, snap)
             eng.trim_attention(state, k - m)
             state.lengths = list(lengths_before)
             commit_in = mx.array([[int(verify_in[i, 0])] + draft_ids[i][:m] for i in range(B)])
             h = eng.forward(state, commit_in)[:, -1:, :]
+        else:
+            # Pure-attention trunk (no SSM to replay): the verify pass already
+            # wrote the committed KV, so just drop the rejected tail (k - m
+            # positions) and take the committed hidden straight from vhidden.
+            # Re-forwarding here would double-append the committed tokens.
+            eng.trim_attention(state, k - m)
+            state.lengths = [n + m + 1 for n in lengths_before]
+            h = vhidden[:, m:m + 1, :]
         mx.eval(h, primary)
         dt = max(time.perf_counter() - t0, 1e-9)
         emitted_by_rid = {rid: toks for rid, toks in emitted}
