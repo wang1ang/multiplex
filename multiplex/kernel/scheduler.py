@@ -36,6 +36,12 @@ class Req:
     temperature: float | None = None
     top_p: float | None = None
     top_k: int | None = None
+    # Optional precomputed prefill input embeddings [1, L, H] (L == len(prompt)).
+    # Set by L4 for multimodal (image) requests: the prompt token ids still
+    # describe the sequence (image-placeholder positions included) for MTP
+    # history + EOS logic, but the trunk is fed these spliced text+image embeds
+    # instead of embed_tokens(ids). None for ordinary text requests.
+    embeds: object = None
     # L4 marks chat/session requests so L3 can store generated block snapshots.
     # Direct callers/tests can leave this off and only use prompt block caching.
     session_cache: bool = False
@@ -119,6 +125,15 @@ class Scheduler:
         req = group.req
         ids = req.prompt
         eng = self.eng
+
+        # Multimodal (image) request: L4 precomputed the spliced text+image
+        # embeds. Prefill them in one shot through the engine's embeds ingress.
+        # Prefix caching is bypassed (image embeds aren't token-cacheable), but
+        # MTP history is still populated from ids+hidden so decode keeps its
+        # speculative speedup — vision is a prefill-only branch (see docs/VISION).
+        if req.embeds is not None:
+            return self._prefill_embeds(group, cancelled)
+
         if not group.started:
             self.prefix_cache.begin_prefill(req, group)
             group.started = True
@@ -152,6 +167,46 @@ class Scheduler:
         h = h[:, -1:, :]
         first = int(mx.argmax(eng.logits(h)[0, -1]))
 
+        req.out.append(first)
+        self._log_output(req, [first])
+        group.single = group.state
+        group.first = first
+        group.last_h = h
+        return True
+
+    def _prefill_embeds(self, group: PrefillGroup, cancelled=None):
+        """Single-shot prefill from precomputed input embeddings (image request).
+
+        Returns True (ready to merge) or None (cancelled). No chunking: the
+        spliced embeds must be fed in one contiguous pass so the image positions
+        keep their computed features. MTP history is seeded from the prompt ids
+        + hidden exactly as the token path does, so decode can still speculate.
+        """
+        req = group.req
+        eng = self.eng
+        if not group.started:
+            group.state = BatchState(cache=eng._make_empty_cache(), lengths=[0])
+            if self.dr is not None:
+                group.dcache = self.dr.make_cache()
+            group.started = True
+        if cancelled and cancelled(req.rid):
+            self._log(f"PREFILL CANCELLED rid={req.rid}")
+            return None
+
+        ids = req.prompt
+        t0 = time.time()
+        h = eng.prefill_embeds(group.state, req.embeds)
+        dt = max(time.time() - t0, 1e-9)
+        self._log(f"prefill(embeds) {len(ids)} tok {len(ids) / dt:.0f} tok/s")
+        # Seed MTP history over the whole prompt (start=0, end=len(ids)).
+        self._append_prefill_mtp_history(group, ids, 0, len(ids), h)
+
+        if cancelled and cancelled(req.rid):
+            self._log(f"PREFILL CANCELLED rid={req.rid}")
+            return None
+
+        h = h[:, -1:, :]
+        first = int(mx.argmax(eng.logits(h)[0, -1]))
         req.out.append(first)
         self._log_output(req, [first])
         group.single = group.state

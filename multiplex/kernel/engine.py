@@ -118,6 +118,19 @@ class Engine:
         self.last_trunk_cache = state.cache
         return h
 
+    def prefill_embeds(self, state: BatchState, embeds: mx.array) -> mx.array:
+        """Feed one prefill piece given precomputed input embeddings instead of
+        token ids. ``embeds`` is ``[1, L, H]`` (modality-agnostic: L4 builds it
+        from spliced text+image embeds). The trunk already accepts
+        ``input_embeddings`` and applies its own embed_scale, so this is a thin
+        passthrough parallel to ``prefill``. Advances the row by L."""
+        h = self.model.language_model.model(None, cache=state.cache,
+                                             input_embeddings=embeds)
+        mx.eval(h, *(c.state for c in state.cache))
+        state.lengths[0] += int(embeds.shape[1])
+        self.last_trunk_cache = state.cache
+        return h
+
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:
         """Feed ``tokens`` (``[B, k]``) per row, return hidden ``[B, k, H]``.
 
