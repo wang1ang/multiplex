@@ -34,14 +34,16 @@ def _apply_template(tokenizer, text, has_image):
     return tokenizer.apply_chat_template(msgs, add_generation_prompt=True)
 
 
-def run(model_path, image, prompt, max_tokens, k, text_only):
+def run(model_path, image, prompt, max_tokens, k, text_only,
+        dynamic_depth=True):
     eng = Engine(model_path)
     tok = eng.tokenizer
     drafter = find_drafter(eng)
     print(f"[loaded; MTP={'yes' if drafter else 'no'}]", file=sys.stderr)
 
     sch = Scheduler(eng, drafter, eos_token_ids=tok.eos_token_ids,
-                    k=k, chunk=512, debug=False)
+                    k=k, chunk=512, debug=False,
+                    dynamic_depth=dynamic_depth)
 
     ids = list(_apply_template(tok, prompt, has_image=not text_only))
 
@@ -81,7 +83,7 @@ def run(model_path, image, prompt, max_tokens, k, text_only):
     return text
 
 
-if __name__ == "__main__":
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default="/Users/yang.wang/.mtplx/models/"
                     "Gemma-4-12B-MTPLX-6bit-mtp4bit")
@@ -89,8 +91,25 @@ if __name__ == "__main__":
     ap.add_argument("--prompt", default="Describe this image. What color and "
                     "shape do you see?")
     ap.add_argument("-n", "--max-tokens", type=int, default=128)
-    ap.add_argument("-k", "--depth", type=int, default=4)
+    ap.add_argument(
+        "-k",
+        "--depth",
+        type=int,
+        default=3,
+        help="maximum dynamic MTP depth (default: 3); fixed with "
+             "--no-dynamic-depth; 0 = pure AR",
+    )
+    ap.add_argument(
+        "--dynamic-depth",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="adapt D1..Dmax from live full-depth acceptance (default: enabled)",
+    )
     ap.add_argument("--text-only", action="store_true")
-    args = ap.parse_args()
+    return ap.parse_args(argv)
+
+
+if __name__ == "__main__":
+    args = parse_args()
     run(args.model, args.image, args.prompt, args.max_tokens, args.depth,
-        args.text_only)
+        args.text_only, args.dynamic_depth)

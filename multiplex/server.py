@@ -424,8 +424,8 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
-          debug=False, prefix_cache_dir="auto", depth=1,
-          dynamic_depth=False):
+          debug=False, prefix_cache_dir="auto", depth=3,
+          dynamic_depth=True):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
     if mtp_path is None:
@@ -442,25 +442,22 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
     httpd.serve_forever()
 
 
-def main():
+def parse_args(argv=None):
     import argparse
-    import sys
-
-    from . import registry
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None,
                     help="model path or name; default: scan ~/.mtplx/models")
     # Default: derive <model>/mtp.safetensors (present -> speculate, absent -> AR).
     ap.add_argument("--mtp", default=None)
-    ap.add_argument("-d", "--depth", type=int, default=1,
-                    help="MTP draft depth; maximum depth with --dynamic-depth; "
-                         "0 disables speculation")
+    ap.add_argument("-d", "--depth", type=int, default=3,
+                    help="maximum dynamic MTP depth (default: 3); fixed with "
+                         "--no-dynamic-depth; 0 disables speculation")
     ap.add_argument(
         "--dynamic-depth",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="adapt MTP depth from live full-depth acceptance; off by default",
+        default=True,
+        help="adapt MTP depth from live full-depth acceptance (default: enabled)",
     )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
@@ -470,7 +467,15 @@ def main():
     ap.add_argument("--prefix-cache-dir", default="auto",
                     help="prefix cache load dir; default 'auto' reads "
                          "~/.cache/multiplex/prefixcache/<model>.")
-    args = ap.parse_args()
+    return ap.parse_args(argv)
+
+
+def main():
+    import sys
+
+    from . import registry
+
+    args = parse_args()
 
     # registry.select behaves per-environment: a server run without a tty gets
     # the "list + pick with --model" error instead of an interactive prompt.

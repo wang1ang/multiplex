@@ -182,10 +182,10 @@ class PrefillGroup:
 
 class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *,
-                 eos_token_ids, k=1, chunk=512, prefix_cache=8,
+                 eos_token_ids, k=3, chunk=512, prefix_cache=8,
                  prefix_cache_dir=None, output_log_dir=None,
                  output_decode=None, debug=False, log=None,
-                 dynamic_depth=False, dynamic_depth_window=16,
+                 dynamic_depth=True, dynamic_depth_window=16,
                  dynamic_depth_min_samples=8,
                  dynamic_depth_up_threshold=0.80,
                  dynamic_depth_down_threshold=0.50,
@@ -506,7 +506,7 @@ class Scheduler:
             decision = self.depth_controller.observe(m)
             self.k = decision.current
             depth_text += (
-                f"/D{self.max_k} full={decision.full_acceptance:.3f}"
+                f" full={decision.full_acceptance:.3f}"
                 f" n={decision.samples}"
             )
         self._log(

@@ -2,7 +2,21 @@ import json
 
 import pytest
 
-from try_engine import load_prompt_file
+from try_engine import load_prompt_file, parse_args
+
+
+def test_defaults_to_dynamic_depth_three():
+    args = parse_args([])
+
+    assert args.depth == 3
+    assert args.dynamic_depth is True
+
+
+def test_dynamic_depth_can_be_disabled():
+    args = parse_args(["--no-dynamic-depth"])
+
+    assert args.depth == 3
+    assert args.dynamic_depth is False
 
 
 def test_load_prompt_file_reads_plain_text(tmp_path):

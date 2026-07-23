@@ -1,6 +1,10 @@
+import inspect
 import unittest
 
+from multiplex.hub import Hub
 from multiplex.scheduler import DynamicDepthController, Req, Scheduler
+from multiplex.server import parse_args as parse_server_args, serve
+from try_vision import parse_args as parse_vision_args
 
 
 def feed(controller, accepted):
@@ -11,6 +15,26 @@ def feed(controller, accepted):
 
 
 class DynamicDepthTests(unittest.TestCase):
+    def test_all_runtime_entry_points_default_to_dynamic_depth_three(self):
+        scheduler_defaults = inspect.signature(Scheduler).parameters
+        hub_defaults = inspect.signature(Hub).parameters
+        serve_defaults = inspect.signature(serve).parameters
+
+        self.assertEqual(scheduler_defaults["k"].default, 3)
+        self.assertIs(scheduler_defaults["dynamic_depth"].default, True)
+        self.assertEqual(hub_defaults["k"].default, 3)
+        self.assertIs(hub_defaults["dynamic_depth"].default, True)
+        self.assertEqual(serve_defaults["depth"].default, 3)
+        self.assertIs(serve_defaults["dynamic_depth"].default, True)
+
+        server_args = parse_server_args([])
+        self.assertEqual(server_args.depth, 3)
+        self.assertIs(server_args.dynamic_depth, True)
+
+        vision_args = parse_vision_args([])
+        self.assertEqual(vision_args.depth, 3)
+        self.assertIs(vision_args.dynamic_depth, True)
+
     def test_steps_down_one_level_at_a_time(self):
         controller = DynamicDepthController(
             3,

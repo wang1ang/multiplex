@@ -114,8 +114,8 @@ class RequestManager:
 
 
 class Hub:
-    def __init__(self, model_path, mtp_path, *, k=1, chunk=512, debug=False,
-                 prefix_cache_dir="auto", dynamic_depth=False):
+    def __init__(self, model_path, mtp_path, *, k=3, chunk=512, debug=False,
+                 prefix_cache_dir="auto", dynamic_depth=True):
         self.model_id = model_path.rstrip("/").split("/")[-1]
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,

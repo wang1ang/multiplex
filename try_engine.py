@@ -10,8 +10,9 @@ automatically. JSON/JSONL prompt files use the first object's ``prompt`` field.
 :q or Ctrl-C quits.
 
 Drives multiplex.scheduler.Scheduler: new requests are chunk-prefilled and
-merged into the running batch. -d = fixed draft depth, or the maximum when
-``--dynamic-depth`` is enabled (0 = pure AR).
+merged into the running batch. Dynamic D1..D3 is the default. ``-d`` changes
+the maximum, ``--no-dynamic-depth`` makes it fixed, and ``-d 0`` selects pure
+AR.
 """
 
 import argparse
@@ -75,18 +76,25 @@ def load_prompt_file(path: str) -> str:
     return prompt
 
 
-def main() -> int:
+def parse_args(argv=None):
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None,
                     help="model path or name; default: scan ~/.mtplx/models")
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=8192)
-    ap.add_argument("-d", "--depth", type=int, default=1)
+    ap.add_argument(
+        "-d",
+        "--depth",
+        type=int,
+        default=3,
+        help="maximum dynamic MTP depth (default: 3); fixed with "
+             "--no-dynamic-depth; 0 = pure AR",
+    )
     ap.add_argument(
         "--dynamic-depth",
         action=argparse.BooleanOptionalAction,
-        default=False,
-        help="adapt D1..Dmax from live full-depth acceptance",
+        default=True,
+        help="adapt D1..Dmax from live full-depth acceptance (default: enabled)",
     )
     ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
                     help="show scheduler debug log in the log pane")
@@ -96,7 +104,11 @@ def main() -> int:
         "--prompt-file",
         help="submit a text file, or the first prompt in a JSON/JSONL file",
     )
-    args = ap.parse_args()
+    return ap.parse_args(argv)
+
+
+def main() -> int:
+    args = parse_args()
     initial_prompt = (
         load_prompt_file(args.prompt_file) if args.prompt_file else args.prompt
     )

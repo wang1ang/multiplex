@@ -76,11 +76,12 @@ python -m multiplex.server \
 Useful flags:
 
 - `--no-debug`: silence scheduler/request logs.
-- `-d, --depth N`: fixed MTP draft depth; with `--dynamic-depth`, the maximum
-  allowed depth. `0` disables speculation.
-- `--dynamic-depth`: adapt between D1 and `-d N` from live full-depth
-  acceptance. The controller starts at the configured maximum, steps down when
-  recent full-depth acceptance is poor, and only retries a higher depth after a
+- `-d, --depth N`: maximum dynamic MTP depth; defaults to `3`. With
+  `--no-dynamic-depth`, this becomes the fixed depth. `0` disables speculation.
+- `--dynamic-depth`: enabled by default; adapt between D1 and `-d N` from live
+  full-depth acceptance. Use `--no-dynamic-depth` for a fixed depth. The
+  controller starts at the configured maximum, steps down when recent
+  full-depth acceptance is poor, and only retries a higher depth after a
   cooldown. Defaults use a 16-round window with at least 8 observations:
   step down below 50% full-depth acceptance, step up at 80%, and wait 24 rounds
   after a downshift before retrying a higher depth.
@@ -112,15 +113,22 @@ and for watching scheduler logs such as prefill, JOIN, ADVANCE, MTP acceptance,
 and prefix-cache behavior.
 
 ```bash
-python try_engine.py --model MODEL_NAME
+python try_engine.py --model MODEL_NAME  # dynamic D1..D3 by default
 python try_engine.py --model MODEL_NAME -d 3 --prompt-file prompts.jsonl
-python try_engine.py --model MODEL_NAME -d 3 --dynamic-depth
+python try_engine.py --model MODEL_NAME -d 2  # dynamic D1..D2
+python try_engine.py --model MODEL_NAME --no-dynamic-depth  # fixed D3
 python try_engine.py --model MODEL_NAME --no-debug
 ```
 
 The UI has a generated-output pane, a scheduler-log pane, and a fixed input box.
+The Chat CLI defaults to dynamic depth with a maximum of D3. `-d N` changes the
+maximum, while `--no-dynamic-depth` selects a fixed depth.
 `--prompt TEXT` submits an initial prompt directly. `--prompt-file PATH` accepts
 plain text or the first `prompt` field in a JSON/JSONL file.
+
+These defaults are shared by the HTTP server, `Hub`, `Scheduler`, and the
+vision CLI. If no MTP sidecar is available, all entry points still fall back to
+pure autoregressive decoding.
 
 ## Requirements
 
