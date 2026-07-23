@@ -424,7 +424,8 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
-          debug=False, prefix_cache_dir="auto", depth=1):
+          debug=False, prefix_cache_dir="auto", depth=1,
+          dynamic_depth=False):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
     if mtp_path is None:
@@ -433,6 +434,7 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
         mtp_path = None
     print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
     backend = Hub(model_path, mtp_path, k=depth, debug=debug,
+                  dynamic_depth=dynamic_depth,
                   prefix_cache_dir=prefix_cache_dir)
     httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
@@ -452,7 +454,14 @@ def main():
     # Default: derive <model>/mtp.safetensors (present -> speculate, absent -> AR).
     ap.add_argument("--mtp", default=None)
     ap.add_argument("-d", "--depth", type=int, default=1,
-                    help="MTP draft depth; 0 disables speculation")
+                    help="MTP draft depth; maximum depth with --dynamic-depth; "
+                         "0 disables speculation")
+    ap.add_argument(
+        "--dynamic-depth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="adapt MTP depth from live full-depth acceptance; off by default",
+    )
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=8000)
     ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
@@ -470,7 +479,8 @@ def main():
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         sys.exit(str(e))
     serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug,
-          prefix_cache_dir=args.prefix_cache_dir, depth=max(args.depth, 0))
+          prefix_cache_dir=args.prefix_cache_dir, depth=max(args.depth, 0),
+          dynamic_depth=args.dynamic_depth)
 
 
 if __name__ == "__main__":

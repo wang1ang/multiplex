@@ -1,18 +1,23 @@
 """Chat CLI for testing dynamic batching and mid-generation joins.
 
     python try_engine.py [--model PATH] [--raw] [-n N] [-d DEPTH] [--debug]
+                         [--prompt TEXT | --prompt-file PATH]
 
 A fixed input box sits at the bottom (like most CLIs); generated text scrolls
 above it. Type a prompt + Enter to start; type another while it runs to add it
-to the live batch. :q or Ctrl-C quits.
+to the live batch. ``--prompt`` and ``--prompt-file`` submit an initial request
+automatically. JSON/JSONL prompt files use the first object's ``prompt`` field.
+:q or Ctrl-C quits.
 
 Drives multiplex.scheduler.Scheduler: new requests are chunk-prefilled and
-merged into the running batch. -d = draft depth k (0 = pure AR).
+merged into the running batch. -d = fixed draft depth, or the maximum when
+``--dynamic-depth`` is enabled (0 = pure AR).
 """
 
-import os
 import argparse
 import asyncio
+import json
+from pathlib import Path
 
 import mlx.core as mx
 from prompt_toolkit import Application
@@ -40,6 +45,36 @@ def decode(tokenizer, token_ids, *, skip_special_tokens=True):
     return tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
 
 
+def load_prompt_file(path: str) -> str:
+    """Load plain text, or the first ``prompt`` field from JSON/JSONL."""
+    source = Path(path).expanduser()
+    text = source.read_text(encoding="utf-8")
+    if source.suffix.lower() not in {".json", ".jsonl"}:
+        prompt = text.strip()
+        if not prompt:
+            raise ValueError(f"prompt file is empty: {source}")
+        return prompt
+
+    if source.suffix.lower() == ".jsonl":
+        lines = [line for line in text.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError(f"prompt file is empty: {source}")
+        payload = json.loads(lines[0])
+    else:
+        payload = json.loads(text)
+        if isinstance(payload, list):
+            if not payload:
+                raise ValueError(f"prompt JSON array is empty: {source}")
+            payload = payload[0]
+
+    if not isinstance(payload, dict) or not isinstance(payload.get("prompt"), str):
+        raise ValueError(f"prompt JSON must contain a string 'prompt' field: {source}")
+    prompt = payload["prompt"]
+    if not prompt.strip():
+        raise ValueError(f"prompt field is empty: {source}")
+    return prompt
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", default=None,
@@ -47,9 +82,24 @@ def main() -> int:
     ap.add_argument("--raw", action="store_true")
     ap.add_argument("-n", "--max-tokens", type=int, default=8192)
     ap.add_argument("-d", "--depth", type=int, default=1)
+    ap.add_argument(
+        "--dynamic-depth",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="adapt D1..Dmax from live full-depth acceptance",
+    )
     ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
                     help="show scheduler debug log in the log pane")
+    initial = ap.add_mutually_exclusive_group()
+    initial.add_argument("--prompt", help="submit this prompt when the UI starts")
+    initial.add_argument(
+        "--prompt-file",
+        help="submit a text file, or the first prompt in a JSON/JSONL file",
+    )
     args = ap.parse_args()
+    initial_prompt = (
+        load_prompt_file(args.prompt_file) if args.prompt_file else args.prompt
+    )
 
     entry = registry.select(args.model)
     eng = Engine(entry.path)
@@ -66,6 +116,7 @@ def main() -> int:
     sch = Scheduler(
         eng, drafter, eos_token_ids=tokenizer.eos_token_ids,
         k=args.depth, chunk=512, debug=args.debug,
+        dynamic_depth=args.dynamic_depth,
         output_decode=lambda ids: decode(tokenizer, ids, skip_special_tokens=False),
         log=append_debug if args.debug else None,
     )
@@ -146,7 +197,10 @@ def main() -> int:
     def _(event):
         event.app.exit()
 
-    render()
+    if initial_prompt:
+        add(initial_prompt)
+    else:
+        render()
 
     app = Application(layout=layout, key_bindings=kb, full_screen=True,
                       mouse_support=True, refresh_interval=0.1)

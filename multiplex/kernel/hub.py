@@ -115,11 +115,12 @@ class RequestManager:
 
 class Hub:
     def __init__(self, model_path, mtp_path, *, k=1, chunk=512, debug=False,
-                 prefix_cache_dir="auto"):
+                 prefix_cache_dir="auto", dynamic_depth=False):
         self.model_id = model_path.rstrip("/").split("/")[-1]
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,
-                         prefix_cache_dir=prefix_cache_dir)
+                         prefix_cache_dir=prefix_cache_dir,
+                         dynamic_depth=dynamic_depth)
         self._default_enable_thinking = self._load_default_enable_thinking(model_path)
         self._request_log_dir = Path("logs") / "requests"
         # The model must be loaded AND used on the same thread (MLX's GPU stream
@@ -297,6 +298,7 @@ class Hub:
         self._sched = Scheduler(self.eng, self.drafter,
                                 eos_token_ids=self.tokenizer.eos_token_ids,
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"],
+                                dynamic_depth=c["dynamic_depth"],
                                 prefix_cache_dir=c["prefix_cache_dir"],
                                 output_log_dir=self._request_log_dir if c["debug"] else None,
                                 output_decode=lambda ids: self._decode(

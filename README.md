@@ -76,7 +76,14 @@ python -m multiplex.server \
 Useful flags:
 
 - `--no-debug`: silence scheduler/request logs.
-- `-d, --depth N`: MTP draft depth; `0` disables speculation.
+- `-d, --depth N`: fixed MTP draft depth; with `--dynamic-depth`, the maximum
+  allowed depth. `0` disables speculation.
+- `--dynamic-depth`: adapt between D1 and `-d N` from live full-depth
+  acceptance. The controller starts at the configured maximum, steps down when
+  recent full-depth acceptance is poor, and only retries a higher depth after a
+  cooldown. Defaults use a 16-round window with at least 8 observations:
+  step down below 50% full-depth acceptance, step up at 80%, and wait 24 rounds
+  after a downshift before retrying a higher depth.
 - `--prefix-cache-dir auto`: default; persists prefix-cache blocks under
   `~/.cache/multiplex/prefixcache/<model>-<hash>`.
 - `--prefix-cache-dir none`: disable SSD-backed prefix cache.
@@ -106,10 +113,14 @@ and prefix-cache behavior.
 
 ```bash
 python try_engine.py --model MODEL_NAME
+python try_engine.py --model MODEL_NAME -d 3 --prompt-file prompts.jsonl
+python try_engine.py --model MODEL_NAME -d 3 --dynamic-depth
 python try_engine.py --model MODEL_NAME --no-debug
 ```
 
 The UI has a generated-output pane, a scheduler-log pane, and a fixed input box.
+`--prompt TEXT` submits an initial prompt directly. `--prompt-file PATH` accepts
+plain text or the first `prompt` field in a JSON/JSONL file.
 
 ## Requirements
 

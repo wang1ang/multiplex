@@ -15,6 +15,7 @@ thread and calls these in a loop.
 
 from __future__ import annotations
 
+from collections import deque
 from pathlib import Path
 import random
 import sys
@@ -53,6 +54,114 @@ class Req:
     advance_seconds: float = 0.0
     accept_counts: list[int] = field(default_factory=list)
     accept_trials: int = 0
+    accept_trials_by_depth: list[int] = field(default_factory=list)
+
+
+@dataclass(frozen=True)
+class DepthDecision:
+    """One adaptive-depth observation and the depth selected for next round."""
+
+    previous: int
+    current: int
+    full_acceptance: float
+    samples: int
+    reason: str | None = None
+
+
+class DynamicDepthController:
+    """Select D1..Dmax from recent full-depth acceptance.
+
+    The scheduler commits the minimum accepted prefix across a live batch, so
+    observations use that effective batch acceptance rather than averaging
+    independent rows. A low full-depth rate steps down. A high rate may step up
+    after a cooldown; the asymmetric thresholds and cooldown prevent a prompt
+    near a boundary from oscillating between adjacent depths.
+    """
+
+    def __init__(
+        self,
+        max_depth: int,
+        *,
+        min_depth: int = 1,
+        window: int = 16,
+        min_samples: int = 8,
+        up_threshold: float = 0.80,
+        down_threshold: float = 0.50,
+        retry_cooldown: int = 24,
+    ) -> None:
+        max_depth = max(1, int(max_depth))
+        min_depth = max(1, min(int(min_depth), max_depth))
+        window = max(1, int(window))
+        min_samples = max(1, min(int(min_samples), window))
+        if not 0.0 <= down_threshold < up_threshold <= 1.0:
+            raise ValueError(
+                "dynamic depth requires 0 <= down_threshold < "
+                "up_threshold <= 1"
+            )
+        self.max_depth = max_depth
+        self.min_depth = min_depth
+        self.window = window
+        self.min_samples = min_samples
+        self.up_threshold = float(up_threshold)
+        self.down_threshold = float(down_threshold)
+        self.retry_cooldown = max(0, int(retry_cooldown))
+        self.current = max_depth
+        self._full_hits: deque[int] = deque(maxlen=window)
+        self._cooldown = 0
+
+    @property
+    def full_acceptance(self) -> float:
+        if not self._full_hits:
+            return 0.0
+        return sum(self._full_hits) / len(self._full_hits)
+
+    @property
+    def samples(self) -> int:
+        return len(self._full_hits)
+
+    @property
+    def cooldown(self) -> int:
+        return self._cooldown
+
+    def reset(self, *, restart_at_max: bool = False) -> None:
+        """Discard evidence after a live-batch composition change."""
+        self._full_hits.clear()
+        if restart_at_max:
+            self.current = self.max_depth
+            self._cooldown = 0
+
+    def observe(self, accepted: int) -> DepthDecision:
+        previous = self.current
+        self._full_hits.append(int(accepted >= previous))
+        if self._cooldown:
+            self._cooldown -= 1
+
+        rate = self.full_acceptance
+        samples = self.samples
+        reason = None
+        if samples >= self.min_samples:
+            if previous > self.min_depth and rate < self.down_threshold:
+                self.current = previous - 1
+                self._cooldown = self.retry_cooldown
+                reason = "low_acceptance"
+            elif (
+                previous < self.max_depth
+                and self._cooldown == 0
+                and rate >= self.up_threshold
+            ):
+                self.current = previous + 1
+                reason = "high_acceptance"
+
+        decision = DepthDecision(
+            previous=previous,
+            current=self.current,
+            full_acceptance=rate,
+            samples=samples,
+            reason=reason,
+        )
+        if self.current != previous:
+            self._full_hits.clear()
+        return decision
 
 
 @dataclass
@@ -75,11 +184,34 @@ class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *,
                  eos_token_ids, k=1, chunk=512, prefix_cache=8,
                  prefix_cache_dir=None, output_log_dir=None,
-                 output_decode=None, debug=False, log=None):
+                 output_decode=None, debug=False, log=None,
+                 dynamic_depth=False, dynamic_depth_window=16,
+                 dynamic_depth_min_samples=8,
+                 dynamic_depth_up_threshold=0.80,
+                 dynamic_depth_down_threshold=0.50,
+                 dynamic_depth_retry_cooldown=24):
         self.eng = engine
         self.dr = drafter
-        # No MTP head -> no speculation possible; k is forced to 0 (pure AR).
-        self.k = k if drafter is not None else 0
+        # No MTP head -> no speculation possible; depth is forced to 0 (AR).
+        self.max_k = max(int(k), 0) if drafter is not None else 0
+        self.dynamic_depth = bool(dynamic_depth and self.max_k > 1)
+        self.depth_controller = (
+            DynamicDepthController(
+                self.max_k,
+                window=dynamic_depth_window,
+                min_samples=dynamic_depth_min_samples,
+                up_threshold=dynamic_depth_up_threshold,
+                down_threshold=dynamic_depth_down_threshold,
+                retry_cooldown=dynamic_depth_retry_cooldown,
+            )
+            if self.dynamic_depth
+            else None
+        )
+        self.k = (
+            self.depth_controller.current
+            if self.depth_controller is not None
+            else self.max_k
+        )
         self.chunk = chunk
         self.eos = set(eos_token_ids)
         self.debug = debug
@@ -250,6 +382,7 @@ class Scheduler:
         self.rows = reqs
         if self.dr is not None:
             self.dcache = self.dr.merge_caches(dcaches)
+        self._reset_dynamic_depth(restart_at_max=False)
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
 
@@ -290,7 +423,13 @@ class Scheduler:
             if k:
                 if len(rows[i].accept_counts) < k:
                     rows[i].accept_counts.extend([0] * (k - len(rows[i].accept_counts)))
+                if len(rows[i].accept_trials_by_depth) < k:
+                    rows[i].accept_trials_by_depth.extend(
+                        [0] * (k - len(rows[i].accept_trials_by_depth))
+                    )
                 rows[i].accept_trials += 1
+                for n in range(k):
+                    rows[i].accept_trials_by_depth[n] += 1
                 for n in range(a):
                     rows[i].accept_counts[n] += 1
         m = min(accs)
@@ -361,15 +500,32 @@ class Scheduler:
         tok_s = total_tokens / max(total_seconds, 1e-9)
         prob = self._bonus_probs(trunk_logits, trunk_pred, m) if self.debug else None
         prob_text = f" prob={prob}" if prob is not None else ""
-        self._log(f"ADVANCE {[r.rid for r in rows]} accept={accs} min={m} "
-                  f"{prob_text} {tok_s:.0f} tok/s")
+        depth_text = f" depth=D{k}"
+        decision = None
+        if self.depth_controller is not None:
+            decision = self.depth_controller.observe(m)
+            self.k = decision.current
+            depth_text += (
+                f"/D{self.max_k} full={decision.full_acceptance:.3f}"
+                f" n={decision.samples}"
+            )
+        self._log(
+            f"ADVANCE {[r.rid for r in rows]} accept={accs} min={m}"
+            f"{depth_text}{prob_text} {tok_s:.0f} tok/s"
+        )
+        if decision is not None and decision.current != decision.previous:
+            self._log(
+                f"DEPTH D{decision.previous}->D{decision.current} "
+                f"reason={decision.reason} "
+                f"full={decision.full_acceptance:.3f} n={decision.samples}"
+            )
         self.state, self.h, self.primary = state, h, primary
         self.prefix_cache.capture_session_blocks(rows, state, dcache=self.dcache, h=h)
 
         if finished:
             exits = [
                 f"{rows[i].rid} acc_rate="
-                f"{[round(c / rows[i].accept_trials, 3) for c in rows[i].accept_counts]}"
+                f"{self._acceptance_rates(rows[i])}"
                 for i in finished
             ]
             self._log(f"EXIT {exits}")
@@ -460,6 +616,20 @@ class Scheduler:
         except Exception:
             pass
 
+    @staticmethod
+    def _acceptance_rates(req: Req) -> list[float]:
+        trials = req.accept_trials_by_depth
+        return [
+            round(count / trials[index], 3) if index < len(trials) and trials[index] else 0.0
+            for index, count in enumerate(req.accept_counts)
+        ]
+
+    def _reset_dynamic_depth(self, *, restart_at_max: bool) -> None:
+        if self.depth_controller is None:
+            return
+        self.depth_controller.reset(restart_at_max=restart_at_max)
+        self.k = self.depth_controller.current
+
     def _keep(self, keep: list[int]) -> None:
         """Retain only the given row indices in the live batch, dropping the
         rest from every parallel structure (state cache, draft cache, primary,
@@ -471,10 +641,12 @@ class Scheduler:
             self.primary = self.primary[mx.array(keep)]
             self.h = self.h[mx.array(keep)]
             self.rows = [self.rows[i] for i in keep]
+            self._reset_dynamic_depth(restart_at_max=False)
         else:
             self.state = self.h = self.primary = None
             self.rows = []
             self.dcache = self.dr.make_cache() if self.dr is not None else None
+            self._reset_dynamic_depth(restart_at_max=True)
 
     def drop(self, rids) -> None:
         """Remove rows for the given request ids (client disconnected)."""
