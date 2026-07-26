@@ -5,13 +5,27 @@ description = "Local LLM inference on mlx-lm: batched MTP speculative decoding w
 requires-python = ">=3.10"
 dependencies = [
     "huggingface-hub>=0.24",
-    "mlx>=0.20",
+    "mlx>=0.32",
     "mlx-lm>=0.31",
     "numpy>=1.26",
+    # Backend by platform. On macOS the `mlx` wheel pulls `mlx-metal` itself, so
+    # nothing is needed here. On Linux it pulls no GPU backend at all — the CUDA
+    # one is an extra. `mlx[cuda13]`'s own markers are already Linux-only, so the
+    # marker below is redundant for correctness and kept for legibility.
+    "mlx[cuda13]>=0.32; platform_system == 'Linux'",
+    # The CUDA backend JIT-compiles kernels at runtime and needs CUDA headers;
+    # the mlx-cuda wheel bundles the runtime libs but not the headers. Without
+    # this, the first mx.eval() dies with "Can not find locations of CUDA
+    # headers". Note the name has no -cu13 suffix (that spelling has no wheel).
+    # Point CUDA_HOME at it: see README "Linux / CUDA".
+    "nvidia-cuda-runtime; platform_system == 'Linux'",
 ]
 
 [project.optional-dependencies]
 cli = ["prompt_toolkit>=3.0"]   # try_engine.py Chat CLI only
+# For a CUDA 12 driver instead of 13. Install as ".[cuda12]"; the cuda13 pin
+# above still resolves, so uninstall mlx-cuda-13 if both being present matters.
+cuda12 = ["mlx[cuda12]>=0.32; platform_system == 'Linux'"]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -41,6 +41,36 @@ pip install -e ".[cli]"
 Dependencies are declared in `pyproject.toml`; there is no separate
 `requirements.txt`.
 
+### Linux / CUDA
+
+The same `pip install -e .` works: the backend is selected by platform marker,
+so macOS resolves `mlx-metal` and Linux resolves `mlx-cuda-13`. No source
+changes — the kernel uses no Metal-specific API. For a CUDA 12 driver install
+`-e ".[cuda12]"` instead.
+
+Two environment requirements that are not dependencies:
+
+```bash
+# MLX's CUDA backend JIT-compiles kernels and needs CUDA headers at runtime.
+# (`nvidia` is a namespace package, hence __path__ rather than __file__.)
+export CUDA_HOME="$(python -c 'import nvidia, pathlib
+print(pathlib.Path(list(nvidia.__path__)[0]) / "cu13")')"
+```
+
+Without `CUDA_HOME` the first forward fails with `Can not find locations of
+CUDA headers`. The host also needs **glibc >= 2.35** (Ubuntu 22.04+); the
+`mlx-cuda` wheels are `manylinux_2_35` and genuinely reference glibc 2.34
+symbols, so 20.04 cannot load them.
+
+Numerical note: on CUDA, prefilling the same prompt at different chunk sizes
+can flip a sampled token, because the logit difference between reduction
+orders (mean ~0.19 on a 4-bit 0.6B model) exceeds the typical top1-top2 gap.
+On Metal the same difference is ~5x smaller and stays under that gap. A single
+decode path is still bit-reproducible on both. The practical consequence is
+that prefix-cache reuse is not guaranteed token-identical to a cold prefill on
+CUDA; `test_prefixcache_e2e.py` asserts that equality and so reports a couple
+of failures there.
+
 ## Models
 
 Pass a local model path, a model name discovered under `~/.mtplx/models`, a
