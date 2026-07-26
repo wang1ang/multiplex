@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Serve a model, and point the coding agents on this machine at it.
 #
-# Usage: ./serve.sh --model MODEL_NAME [any multiplex.server flag...]
+# Usage: ./serve.sh [any multiplex.server flag...]   # picks a model if none given
 #
 # Wiring up pi and Codex belongs here, not in the server: what else is installed
 # on the machine is none of the server's business, and `trap EXIT` already does
@@ -111,28 +111,30 @@ main() {
     esac
   done
 
-  "$PYTHON" -m multiplex.server "$@" &
-  local server=$!
-  trap 'codex_restore' EXIT
-  trap 'kill "$server" 2>/dev/null || true' INT TERM
+  # The server runs in the FOREGROUND so it keeps the terminal: with no --model
+  # it prompts for one, and bash gives a background job /dev/null for stdin,
+  # which the prompt reads as "not interactive". So the waiting is what goes to
+  # the background instead.
+  attach "$host" "$port" &
+  local attacher=$!
+  trap 'kill "$attacher" 2>/dev/null; codex_restore' EXIT
 
-  # Codex needs the served model's id, which the server already reports on
-  # /v1/models — waiting for that doubles as waiting for it to come up.
+  "$PYTHON" -m multiplex.server "$@"
+}
+
+attach() {  # host port
+  # Codex needs the served model's id, which the server reports on /v1/models —
+  # waiting for that doubles as waiting for it to come up (and for the user to
+  # pick a model, and for the weights to load, so this cannot time out). The
+  # EXIT trap kills this if the server never gets there.
   local card=''
-  while kill -0 "$server" 2>/dev/null; do
-    card="$(curl -sf --max-time 2 "http://$host:$port/v1/models" || true)"
-    [ -n "$card" ] && break
+  until card="$(curl -sf --max-time 2 "http://$1:$2/v1/models")" && [ -n "$card" ]; do
     sleep 1
   done
-
-  if [ -n "$card" ]; then
-    local id
-    id="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$card" | head -1)"
-    pi_install
-    codex_switch "$id" "$host" "$port"
-  fi
-
-  wait "$server"
+  local id
+  id="$(sed -n 's/.*"id"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' <<<"$card" | head -1)"
+  pi_install
+  codex_switch "$id" "$1" "$2"
 }
 
 # Sourcing this file (the tests do) must define the functions without serving.

@@ -155,7 +155,7 @@ and prefix-cache behavior.
 
 ```bash
 python try_engine.py --model MODEL_NAME  # dynamic D1..D3 by default
-python try_engine.py --model MODEL_NAME -d 3 --prompt-file prompts.jsonl
+python try_engine.py --model MODEL_NAME --prompt-file prompts.jsonl
 python try_engine.py --model MODEL_NAME -d 2  # dynamic D1..D2
 python try_engine.py --model MODEL_NAME --no-dynamic-depth  # fixed D3
 python try_engine.py --model MODEL_NAME --no-debug
