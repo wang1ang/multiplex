@@ -3,10 +3,8 @@
 #
 # Usage: ./serve.sh [any multiplex.server flag...]   # picks a model if none given
 #
-# Wiring up pi and Codex belongs here, not in the server: what else is installed
-# on the machine is none of the server's business, and `trap EXIT` already does
-# properly what a Python signal handler can only approximate. The served model's
-# id comes back from GET /v1/models, so this script knows nothing about models.
+# Which agents are installed on the machine is none of the server's business, so
+# their wiring lives here. The served model's id comes back from GET /v1/models.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -31,9 +29,8 @@ pi_install() {
 }
 
 # --- Codex -------------------------------------------------------------------
-# Codex has no dynamic discovery and its model picker does not reliably offer a
-# custom provider, so its base config is the only dependable route. That is a
-# global switch — an already-open session changes model too — hence the restore.
+# Codex has no dynamic discovery, so its base config is the only route in. That
+# is a global switch — open sessions change model too — hence the restore.
 
 CODEX_BEGIN='# >>> multiplex begin — added while serving; removed on exit'
 CODEX_END='# <<< multiplex end'
@@ -111,22 +108,27 @@ main() {
     esac
   done
 
-  # The server runs in the FOREGROUND so it keeps the terminal: with no --model
-  # it prompts for one, and bash gives a background job /dev/null for stdin,
-  # which the prompt reads as "not interactive". So the waiting is what goes to
-  # the background instead.
+  # Backgrounded so traps run on arrival (bash defers them while waiting on a
+  # foreground child); `<&0` keeps the tty the model picker needs.
+  "$PYTHON" -m multiplex.server "$@" <&0 &
+  local server=$!
   attach "$host" "$port" &
-  local attacher=$!
-  trap 'kill "$attacher" 2>/dev/null; codex_restore' EXIT
+  # Not EXIT alone: Ctrl-C kills a trap-less bash outright, skipping it.
+  trap "cleanup $server $!" EXIT INT TERM HUP
 
-  "$PYTHON" -m multiplex.server "$@"
+  wait "$server"
+}
+
+cleanup() {  # server_pid attacher_pid
+  trap - EXIT INT TERM HUP           # or the exit after a signal fires it twice
+  kill "$1" "$2" 2>/dev/null || true  # both usually gone; set -e must not stop here
+  codex_restore
 }
 
 attach() {  # host port
-  # Codex needs the served model's id, which the server reports on /v1/models —
-  # waiting for that doubles as waiting for it to come up (and for the user to
-  # pick a model, and for the weights to load, so this cannot time out). The
-  # EXIT trap kills this if the server never gets there.
+  # The served model's id, which Codex needs, comes from /v1/models, so this
+  # doubles as waiting for the server to be up. No timeout: the user may still
+  # be picking a model, and weights take as long as they take.
   local card=''
   until card="$(curl -sf --max-time 2 "http://$1:$2/v1/models")" && [ -n "$card" ]; do
     sleep 1
