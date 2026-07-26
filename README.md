@@ -2,9 +2,9 @@
 
 Local OpenAI-compatible LLM serving for Apple Silicon, built on `mlx-lm`.
 
-Aimed at personal agent workloads where requests overlap, prompts repeat, and
-long conversations get resent often. Combines a small HTTP server, a
-dynamic-batch scheduler, MTP speculative decoding, and prefix-cache reuse.
+Run a local model as a drop-in backend for OpenAI-compatible coding agents
+(Codex, pi, ...) — point them at `multiplex` instead of a paid API and keep
+working the same way, fully offline.
 
 ## Features
 
@@ -26,23 +26,18 @@ pip install -e ".[cli]"     # + the Chat CLI
 
 ### Linux / CUDA
 
-`pip install -e .` also works on Linux — the backend is picked by platform
-marker (`mlx-cuda-13`; use `-e ".[cuda12]"` for a CUDA 12 driver). One thing
-you still need to set yourself:
+Set `CUDA_HOME` before the first run — MLX's CUDA backend JIT-compiles
+kernels and fails without it (use `-e ".[cuda12]"` for a CUDA 12 driver):
 
 ```bash
 export CUDA_HOME="$(python -c 'import nvidia, pathlib
 print(pathlib.Path(list(nvidia.__path__)[0]) / "cu13")')"
 ```
 
-MLX's CUDA backend JIT-compiles kernels and needs CUDA headers at runtime;
-without `CUDA_HOME` the first forward pass fails. Also requires **glibc >= 2.35**
-(Ubuntu 22.04+).
-
 ## Quick start
 
 ```bash
-python -m multiplex.server --model MODEL_NAME
+./serve.sh --model MODEL_NAME
 ```
 
 Pass a local path, a name under `~/.mtplx/models`, a Hugging Face repo id, or
@@ -71,8 +66,9 @@ conversation.
 - `--mtp /path/to/sidecar.safetensors` — override automatic MTP discovery.
 - `--no-debug` — silence scheduler/request logs.
 
-`./serve.sh` takes the same flags and also points local coding agents (pi,
-Codex) at the running server for the duration, restoring their config on exit.
+`serve.sh` also points local coding agents (pi, Codex) at the running server
+for the duration, restoring their config on exit. Run the server directly with
+`python -m multiplex.server` (same flags) to skip that.
 
 ## Chat CLI
 
@@ -88,10 +84,6 @@ python try_engine.py --model MODEL_NAME
 
 - macOS on Apple Silicon with an available Metal device (or Linux/CUDA, see above).
 - Python 3.10+.
-
-## Status
-
-Active local-serving project, not a general-purpose hosted inference stack.
 
 ## License
 
