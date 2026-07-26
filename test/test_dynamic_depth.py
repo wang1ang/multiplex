@@ -1,5 +1,12 @@
 import inspect
+import sys
 import unittest
+from pathlib import Path
+
+# try_vision.py sits at the repo root and is not part of the package. conftest.py
+# handles this under pytest; repeat it here so `python test/test_dynamic_depth.py`
+# also works.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from multiplex.hub import Hub
 from multiplex.scheduler import DynamicDepthController, Req, Scheduler

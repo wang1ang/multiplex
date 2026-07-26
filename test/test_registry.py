@@ -6,7 +6,7 @@ from pathlib import Path
 
 
 def _load_registry():
-    path = Path(__file__).parent / "multiplex" / "registry.py"
+    path = Path(__file__).resolve().parent.parent / "multiplex" / "registry.py"
     spec = importlib.util.spec_from_file_location("registry_under_test", path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module

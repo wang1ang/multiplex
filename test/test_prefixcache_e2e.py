@@ -7,7 +7,7 @@ SSM/MTP state) shows up as divergent output, not as an error.
 Runs with k=0 (pure AR) for exact token equality, then k>0 to exercise the MTP
 block path. Also checks reuse across a process restart via the disk store.
 
-Run:  .venv/bin/python test_prefixcache_e2e.py [model_path]
+Run:  .venv/bin/python test/test_prefixcache_e2e.py [model_path]
 """
 
 import os

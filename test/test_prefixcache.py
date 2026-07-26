@@ -1,7 +1,7 @@
 """Unit tests for the prefix-cache policy: chain keying + byte-budget LRU.
 
 Pure policy tests — payloads are plain MLX arrays, no model or engine involved.
-Run: .venv/bin/python test_prefixcache.py
+Run: .venv/bin/python test/test_prefixcache.py
 """
 
 from __future__ import annotations
