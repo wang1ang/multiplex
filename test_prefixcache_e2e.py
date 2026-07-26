@@ -47,9 +47,9 @@ def run(sch, prompt_ids, n):
     return out
 
 
-def make_sched(eng, dr, *, k, cap, disk=None, chunk=CHUNK):
+def make_sched(eng, dr, *, k, budget, disk=None, chunk=CHUNK):
     return Scheduler(eng, dr, eos_token_ids=eng.tokenizer.eos_token_ids, k=k,
-                     chunk=chunk, prefix_cache=cap, prefix_cache_dir=disk)
+                     chunk=chunk, prefix_cache=budget, prefix_cache_dir=disk)
 
 
 def main():
@@ -79,11 +79,11 @@ def main():
         print(f"\nreuse correctness ({label})")
 
         # Cold reference: fresh scheduler, caching disabled entirely.
-        ref_a = run(make_sched(eng, dr, k=k, cap=0), shared + tail_a, N)
-        ref_b = run(make_sched(eng, dr, k=k, cap=0), shared + tail_b, N)
+        ref_a = run(make_sched(eng, dr, k=k, budget=0), shared + tail_a, N)
+        ref_b = run(make_sched(eng, dr, k=k, budget=0), shared + tail_b, N)
 
         # Warm: one scheduler, prompt A populates the cache, then A and B reuse it.
-        sch = make_sched(eng, dr, k=k, cap=8)
+        sch = make_sched(eng, dr, k=k, budget="2GiB")
         got_a1 = run(sch, shared + tail_a, N)
         entries = len(list(sch.prefix_cache.cache._resident_entries()))
         check(f"{label} blocks stored", entries > 0, f"entries={entries}")
@@ -110,19 +110,28 @@ def main():
         check(f"{label} divergent-tail reuse matches cold", got_b == ref_b,
               f"\n    got={got_b[:8]}\n    ref={ref_b[:8]}")
 
+        # Byte budget must actually bound residency under churn, and a cache
+        # squeezed to its floor must stay correct (fall back to cold prefill).
+        tiny = make_sched(eng, dr, k=k, budget=1024**2)
+        got_tiny = run(tiny, shared + tail_a, N)
+        check(f"{label} correct under 1MiB budget", got_tiny == ref_a,
+              f"\n    got={got_tiny[:8]}\n    ref={ref_a[:8]}")
+        resident = tiny.prefix_cache.cache.resident_bytes("prompt")
+        check(f"{label} 1MiB budget respected", resident <= 1024**2,
+              f"resident={resident}")
 
     print("\ndisk reuse across restart")
     d = tempfile.mkdtemp(prefix="mpx-e2e-")
     try:
-        ref = run(make_sched(eng, dr, k=0, cap=0), shared + tail_a, N)
+        ref = run(make_sched(eng, dr, k=0, budget=0), shared + tail_a, N)
 
-        warm = make_sched(eng, dr, k=0, cap=8, disk=d)
+        warm = make_sched(eng, dr, k=0, budget="2GiB", disk=d)
         run(warm, shared + tail_a, N)
         warm.prefix_cache.cache.flush()
         warm.prefix_cache.cache.close()
 
         # Fresh cache object over the same dir: metadata only, tensors lazy.
-        cold = make_sched(eng, dr, k=0, cap=8, disk=d)
+        cold = make_sched(eng, dr, k=0, budget="2GiB", disk=d)
         m = cold.prefix_cache.cache.find(shared + tail_a)
         check("reloaded prefix found", m is not None and m.prefix_len >= CHUNK,
               f"prefix_len={m and m.prefix_len}")
@@ -132,7 +141,7 @@ def main():
         cold.prefix_cache.cache.close()
 
         # A dir written at chunk=512 must not be adopted at a different chunk.
-        other = make_sched(eng, dr, k=0, cap=8, disk=d, chunk=256)
+        other = make_sched(eng, dr, k=0, budget="2GiB", disk=d, chunk=256)
         got_other = run(other, shared + tail_a, N)
         check("chunk change stays correct", got_other == ref,
               f"\n    got={got_other[:8]}\n    ref={ref[:8]}")

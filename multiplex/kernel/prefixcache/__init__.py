@@ -9,7 +9,7 @@ the longest matching snapshot and only prefills the tail.
 Split into runtime plus two lower pieces under L3:
   * ``runtime`` — scheduler-facing hooks for find/restore/store/prune timing.
   * ``policy`` — near-pure logic: chunk-chain longest-prefix matching over
-    stored entries and per-pool LRU eviction. Blocks are keyed by
+    stored entries and per-pool byte-budgeted LRU eviction. Blocks are keyed by
     ``H(parent_key, chunk_tokens)``, so a lookup rehashes the request chunk by
     chunk rather than indexing individual tokens. This is what could become a
     standalone library.

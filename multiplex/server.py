@@ -424,7 +424,7 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
-          debug=False, prefix_cache_dir="auto", depth=3,
+          debug=False, prefix_cache_dir="auto", prefix_cache="4GiB", depth=3,
           dynamic_depth=True):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
@@ -435,7 +435,8 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
     print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
     backend = Hub(model_path, mtp_path, k=depth, debug=debug,
                   dynamic_depth=dynamic_depth,
-                  prefix_cache_dir=prefix_cache_dir)
+                  prefix_cache_dir=prefix_cache_dir,
+                  prefix_cache=prefix_cache)
     httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
           f"(/v1/chat/completions, /v1/responses, /v1/models)]")
@@ -467,6 +468,9 @@ def parse_args(argv=None):
     ap.add_argument("--prefix-cache-dir", default="auto",
                     help="prefix cache load dir; default 'auto' reads "
                          "~/.cache/multiplex/prefixcache/<model>.")
+    ap.add_argument("--prefix-cache", default="4GiB",
+                    help="resident prefix-cache budget per pool, in bytes or "
+                         "with a unit (e.g. 512MiB, 4GiB); 0 disables reuse.")
     return ap.parse_args(argv)
 
 
@@ -484,7 +488,8 @@ def main():
     except (FileNotFoundError, RuntimeError, ValueError) as e:
         sys.exit(str(e))
     serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug,
-          prefix_cache_dir=args.prefix_cache_dir, depth=max(args.depth, 0),
+          prefix_cache_dir=args.prefix_cache_dir,
+          prefix_cache=args.prefix_cache, depth=max(args.depth, 0),
           dynamic_depth=args.dynamic_depth)
 
 

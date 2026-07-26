@@ -115,11 +115,13 @@ class RequestManager:
 
 class Hub:
     def __init__(self, model_path, mtp_path, *, k=3, chunk=512, debug=False,
-                 prefix_cache_dir="auto", dynamic_depth=True):
+                 prefix_cache_dir="auto", prefix_cache="4GiB",
+                 dynamic_depth=True):
         self.model_id = model_path.rstrip("/").split("/")[-1]
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,
                          prefix_cache_dir=prefix_cache_dir,
+                         prefix_cache=prefix_cache,
                          dynamic_depth=dynamic_depth)
         self._default_enable_thinking = self._load_default_enable_thinking(model_path)
         self._request_log_dir = Path("logs") / "requests"
@@ -301,6 +303,7 @@ class Hub:
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"],
                                 dynamic_depth=c["dynamic_depth"],
                                 prefix_cache_dir=c["prefix_cache_dir"],
+                                prefix_cache=c["prefix_cache"],
                                 output_log_dir=self._request_log_dir if c["debug"] else None,
                                 output_decode=lambda ids: self._decode(
                                     ids, skip_special_tokens=False

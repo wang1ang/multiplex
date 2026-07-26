@@ -76,6 +76,33 @@ def block_key(
     return h.hexdigest()
 
 
+def tree_nbytes(value: Any) -> int:
+    """Total bytes of every MLX array in a payload tree."""
+    if value is None:
+        return 0
+    if isinstance(value, mx.array):
+        return int(value.nbytes)
+    if isinstance(value, (list, tuple)):
+        return sum(tree_nbytes(v) for v in value)
+    return 0
+
+
+def spec_nbytes(spec: Any) -> int:
+    """Total tensor bytes an encoded (on-disk) spec tree accounts for."""
+    if spec is None:
+        return 0
+    if isinstance(spec, dict):
+        kind = spec.get("k")
+        if kind == "tensor":
+            return int(spec.get("nbytes", 0))
+        if kind == "blocks":
+            return sum(int(b.get("nbytes", 0)) for b in spec.get("blocks", []))
+        return sum(spec_nbytes(v) for v in spec.values())
+    if isinstance(spec, list):
+        return sum(spec_nbytes(v) for v in spec)
+    return 0
+
+
 def encode_tree(value: Any, *, block_size: int = 256) -> tuple[Any, dict[str, bytes]]:
     tensors: dict[str, bytes] = {}
     block_size = max(1, int(block_size))

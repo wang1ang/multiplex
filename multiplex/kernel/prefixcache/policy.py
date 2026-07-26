@@ -14,6 +14,9 @@ The core invariant is:
   * SSM is stored on reusable boundary nodes;
   * a match restores the parent-chain attention blocks plus that node's SSM.
 
+Residency is bounded by *bytes*, not entry count: one 100k-token session block
+costs ~200x a 512-token one, so counting entries cannot bound memory.
+
 When ``disk_dir`` is set, block records are written in the background. Startup
 restores only metadata and loads tensor blobs lazily on cache hits.
 """
@@ -25,14 +28,74 @@ import os
 from pathlib import Path
 from typing import Any, Iterator
 
-from .disk import AsyncPrefixDiskStore, DiskBlockRecord, block_key
+from .disk import (
+    AsyncPrefixDiskStore,
+    DiskBlockRecord,
+    block_key,
+    spec_nbytes,
+    tree_nbytes,
+)
 
 
 ROOT_KEY = ""
 
+_BYTE_UNITS = {
+    "b": 1,
+    "k": 1000, "kb": 1000, "kib": 1024,
+    "m": 1000**2, "mb": 1000**2, "mib": 1024**2,
+    "g": 1000**3, "gb": 1000**3, "gib": 1024**3,
+    "t": 1000**4, "tb": 1000**4, "tib": 1024**4,
+}
+
+# A bare int below this is almost certainly the old entry-count budget rather
+# than a byte count; refuse it instead of caching nothing.
+MIN_BYTE_BUDGET = 1024**2
+
+
+def parse_bytes(value: int | str) -> int:
+    """Parse a byte budget: an int of bytes, or a string like ``"4GiB"``."""
+    if isinstance(value, bool):
+        raise ValueError(f"invalid prefix-cache budget: {value!r}")
+    if isinstance(value, int):
+        size = value
+    elif isinstance(value, str):
+        text = value.strip().lower().replace(" ", "")
+        if not text:
+            raise ValueError("empty prefix-cache budget")
+        digits = len(text)
+        while digits and not (text[digits - 1].isdigit() or text[digits - 1] == "."):
+            digits -= 1
+        number, unit = text[:digits], text[digits:]
+        if not number:
+            raise ValueError(f"invalid prefix-cache budget: {value!r}")
+        if unit and unit not in _BYTE_UNITS:
+            raise ValueError(
+                f"unknown prefix-cache budget unit {unit!r} in {value!r}; "
+                f"expected one of {sorted(_BYTE_UNITS)}"
+            )
+        size = int(float(number) * _BYTE_UNITS.get(unit, 1))
+    else:
+        raise TypeError(f"unsupported prefix-cache budget: {type(value)!r}")
+
+    if size < 0:
+        raise ValueError(f"negative prefix-cache budget: {value!r}")
+    if 0 < size < MIN_BYTE_BUDGET:
+        raise ValueError(
+            f"prefix-cache budget {value!r} resolves to {size} bytes, below the "
+            f"{MIN_BYTE_BUDGET}-byte floor. The budget is now measured in bytes, "
+            f'not entries — pass e.g. 4 * 1024**3 or "4GiB".'
+        )
+    return size
+
+
 @dataclass
 class Node:
-    """One chunk-aligned block in the prefix chain."""
+    """One chunk-aligned block in the prefix chain.
+
+    ``attn_nbytes``/``payload_nbytes`` are content properties fixed at creation,
+    independent of whether the tensors are currently resident, so eviction can
+    price an entry without loading it from disk.
+    """
 
     key: str
     pos: int
@@ -44,6 +107,8 @@ class Node:
     pool: str = "default"
     touch: int = 0
     reusable: bool = False
+    attn_nbytes: int = 0
+    payload_nbytes: int = 0
 
 
 @dataclass
@@ -56,9 +121,12 @@ class Match:
 
 
 class PrefixCache:
-    """Chunk-chain prefix cache with independent per-pool LRU.
+    """Chunk-chain prefix cache with independent per-pool byte budgets.
 
-    ``capacity`` bounds resident reusable payloads per pool.
+    ``budget`` bounds resident bytes per pool: an entry is priced as its own
+    payload (SSM + boundary hidden state) plus the attention blocks on its
+    ancestor chain. Chains shared between two pools are counted once per pool,
+    which only makes eviction conservative.
 
     Prefix-chain nodes backed by a disk record are retained after their tensors
     are dropped so cold entries can lazy-load from SSD; memory-only nodes are
@@ -67,7 +135,7 @@ class PrefixCache:
 
     def __init__(
         self,
-        capacity: int | dict[str, int] = 8,
+        budget: int | str | dict[str, int | str] = "4GiB",
         disk_dir: str | os.PathLike | None = None,
         chunk: int = 512,
         log=None,
@@ -76,12 +144,13 @@ class PrefixCache:
         if self.chunk <= 0:
             raise ValueError(f"prefix-cache chunk must be positive, got {chunk!r}")
 
-        if isinstance(capacity, dict):
-            self.capacity = {str(k): int(v) for k, v in capacity.items()}
-            self._default_capacity = max(self.capacity.values(), default=0)
+        if isinstance(budget, dict):
+            self.budget = {str(k): parse_bytes(v) for k, v in budget.items()}
+            self._default_budget = max(self.budget.values(), default=0)
         else:
-            self.capacity = {"default": int(capacity)}
-            self._default_capacity = int(capacity)
+            parsed = parse_bytes(budget)
+            self.budget = {"default": parsed}
+            self._default_budget = parsed
 
         self._root = Node(key=ROOT_KEY, pos=0)
         self._blocks: dict[str, Node] = {ROOT_KEY: self._root}
@@ -96,6 +165,10 @@ class PrefixCache:
     def _debug(self, msg: str) -> None:
         if self._log is not None:
             self._log(f"PREFIX DISK {msg}")
+
+    def _note(self, msg: str) -> None:
+        if self._log is not None:
+            self._log(f"PREFIX CACHE {msg}")
 
     # ---------------------------------------------------------------- keys
 
@@ -166,12 +239,16 @@ class PrefixCache:
             pool=record.pool,
             touch=record.touch,
             reusable=record.ssm_spec is not None,
+            attn_nbytes=spec_nbytes(record.attn_spec),
+            payload_nbytes=(
+                spec_nbytes(record.ssm_spec) + spec_nbytes(record.cached_h_spec)
+            ),
         )
 
     # ---------------------------------------------------------------- accounting
 
-    def _capacity_for(self, pool: str) -> int:
-        return self.capacity.get(pool, self._default_capacity)
+    def _budget_for(self, pool: str) -> int:
+        return self.budget.get(pool, self._default_budget)
 
     def _resident_entries(self) -> Iterator[Node]:
         for node in self._blocks.values():
@@ -185,14 +262,29 @@ class PrefixCache:
             yield cur
             cur = cur.parent
 
-    def _resident_count(self, pool: str) -> int:
-        return sum(1 for n in self._resident_entries() if n.pool == pool)
+    def resident_bytes(self, pool: str | None = None) -> int:
+        """Bytes an entry set costs: own payloads plus shared ancestor attention."""
+        total = 0
+        seen: set[str] = set()
+        for node in self._resident_entries():
+            if pool is not None and node.pool != pool:
+                continue
+            total += node.payload_nbytes
+            for anc in self._chain(node):
+                if anc.key not in seen:
+                    seen.add(anc.key)
+                    total += anc.attn_nbytes
+        return total
 
     def _evict(self) -> None:
-        pools = set(self.capacity)
+        pools = set(self.budget)
         pools.update(node.pool for node in self._resident_entries())
         for pool in pools:
-            while self._resident_count(pool) > self._capacity_for(pool):
+            limit = self._budget_for(pool)
+            while True:
+                used = self.resident_bytes(pool)
+                if used <= limit:
+                    break
                 victim = min(
                     (n for n in self._resident_entries() if n.pool == pool),
                     key=lambda n: n.touch,
@@ -200,6 +292,10 @@ class PrefixCache:
                 )
                 if victim is None:
                     break
+                self._note(
+                    f"EVICT pool={pool} pos={victim.pos} "
+                    f"cost={victim.payload_nbytes} used={used} limit={limit}"
+                )
                 self._drop_payload(victim)
         self._drop_cold_blocks()
 
@@ -335,6 +431,7 @@ class PrefixCache:
             self._blocks[key] = node
         node.parent = parent
         node.attn = attn
+        node.attn_nbytes = tree_nbytes(attn)
 
         if ssm is not None:
             self._clock += 1
@@ -344,6 +441,7 @@ class PrefixCache:
             node.cached_h = cached_h
             node.reusable = True
             node.touch = self._clock
+            node.payload_nbytes = tree_nbytes(ssm) + tree_nbytes(cached_h)
             self._evict()
         if self._disk is not None and (new_node or ssm is not None):
             self._disk.submit_block(

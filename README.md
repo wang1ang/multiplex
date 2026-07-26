@@ -19,7 +19,8 @@ See `docs/ARCHITECTURE.md` for the layer and dependency boundaries.
 - Tool-call parsing for OpenAI-style clients.
 - Dynamic batching: new requests can prefill and join a live decode batch.
 - MTP speculative decoding when a sidecar is present; pure AR fallback otherwise.
-- Prefix cache with in-memory LRU payloads and optional SSD persistence.
+- Prefix cache with byte-budgeted in-memory LRU payloads and optional SSD
+  persistence.
 - Model discovery under `~/.mtplx/models`.
 - Chat CLI (`try_engine.py`) for local testing and scheduler log inspection.
 
@@ -88,6 +89,11 @@ Useful flags:
 - `--prefix-cache-dir auto`: default; persists prefix-cache blocks under
   `~/.cache/multiplex/prefixcache/<model>-<hash>`.
 - `--prefix-cache-dir none`: disable SSD-backed prefix cache.
+- `--prefix-cache 4GiB`: default; resident prefix-cache budget, applied
+  independently to the prompt and session pools. Accepts raw bytes or a unit
+  (`512MiB`, `1.5GiB`); `0` disables prefix reuse entirely. The budget is in
+  bytes, not entries — one 100k-token session block costs what ~200 short prompt
+  blocks do, so counting entries cannot bound memory.
 - `--mtp /path/to/sidecar.safetensors`: override automatic MTP discovery.
 
 ## API

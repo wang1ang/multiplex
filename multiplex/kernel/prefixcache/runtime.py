@@ -15,7 +15,7 @@ from typing import Any
 import mlx.core as mx
 
 from ..engine import BatchState, Engine
-from .policy import ROOT_KEY, PrefixCache
+from .policy import ROOT_KEY, PrefixCache, parse_bytes
 from .state import PrefixCacheState
 
 
@@ -28,7 +28,7 @@ class PrefixCacheRuntime:
         engine: Engine,
         *,
         drafter=None,
-        capacity: int | dict[str, int] = 8,
+        budget: int | str | dict[str, int | str] = "4GiB",
         disk_dir=None,
         chunk: int = 512,
         log=None,
@@ -38,16 +38,19 @@ class PrefixCacheRuntime:
         self.chunk = chunk
         self.log = log
         cache_dir = self._cache_dir(disk_dir)
-        cache_capacity = capacity if isinstance(capacity, dict) else {
-            "prompt": capacity,
-            "session": capacity,
+        # Each pool gets the full budget independently: a long-lived session
+        # must not be evicted by prompt-cache churn, or vice versa.
+        cache_budget = budget if isinstance(budget, dict) else {
+            "prompt": budget,
+            "session": budget,
         }
+        enabled = bool(budget) and any(parse_bytes(v) for v in cache_budget.values())
         self.cache = PrefixCache(
-            capacity=cache_capacity,
+            budget=cache_budget,
             disk_dir=cache_dir,
             chunk=chunk,
             log=self._log,
-        ) if capacity else None
+        ) if enabled else None
         self.state = PrefixCacheState(engine) if self.cache is not None else None
 
     def _log(self, msg: str) -> None:

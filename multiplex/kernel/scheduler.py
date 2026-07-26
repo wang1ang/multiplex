@@ -182,7 +182,7 @@ class PrefillGroup:
 
 class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *,
-                 eos_token_ids, k=3, chunk=512, prefix_cache=8,
+                 eos_token_ids, k=3, chunk=512, prefix_cache="4GiB",
                  prefix_cache_dir=None, output_log_dir=None,
                  output_decode=None, debug=False, log=None,
                  dynamic_depth=True, dynamic_depth_window=16,
@@ -220,7 +220,7 @@ class Scheduler:
         self.output_log_dir = Path(output_log_dir) if output_log_dir else None
         self.output_decode = output_decode
         self.prefix_cache = PrefixCacheRuntime(
-            engine, drafter=drafter, capacity=prefix_cache, disk_dir=prefix_cache_dir,
+            engine, drafter=drafter, budget=prefix_cache, disk_dir=prefix_cache_dir,
             chunk=chunk, log=self._log,
         )
 
