@@ -14,6 +14,12 @@ import os
 import shutil
 import sys
 import tempfile
+from pathlib import Path
+
+# conftest.py does this under pytest, but is not imported when this file is run
+# directly — which its docstring above documents — so the repo root has to go on
+# sys.path here too.
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from multiplex.engine import Engine
 from multiplex.mtp import find_drafter

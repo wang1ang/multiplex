@@ -8,6 +8,14 @@ from __future__ import annotations
 
 import tempfile
 
+# conftest.py does this under pytest, but is not imported when this file is run
+# directly — which its docstring above documents — so the repo root has to go on
+# sys.path here too.
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 import mlx.core as mx
 
 from multiplex.kernel.prefixcache.disk import block_key, spec_nbytes, encode_tree

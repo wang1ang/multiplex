@@ -15,7 +15,6 @@ logs/
 # local-only legacy/dev files removed from git
 requirements.txt
 smoke_engine.py
-test_scheduler.py
 
 # build artifacts
 dist/

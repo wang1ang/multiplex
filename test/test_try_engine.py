@@ -5,6 +5,9 @@ import pytest
 from try_engine import load_prompt_file, parse_args
 
 
+# The other entry points' depth defaults are asserted together in
+# test_dynamic_depth.py; this one is separate because importing try_engine costs
+# the [cli] extra, which that test does not otherwise need.
 def test_defaults_to_dynamic_depth_three():
     args = parse_args([])
 
