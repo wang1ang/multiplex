@@ -17,6 +17,8 @@ DEFAULT_MODELS = (
     "mlx-community/Qwen3-1.7B-4bit",
     "mlx-community/Qwen3-4B-4bit",
     "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
+    "wang-yang/Qwen3.6-27B-Q4-MTPLX",
+    "wang-yang/Ornith-1.0-35B-MTPLX",
 )
 
 
@@ -136,7 +138,7 @@ def select(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry:
         raise FileNotFoundError(f"no models found under {where}")
 
     labels = [e.name for e in r]
-    labels.extend(f"{_hf_names(model)[0]} (需下载)" for model in downloads)
+    labels.extend(f"{_hf_names(model)[0]} (needs download)" for model in downloads)
     lines = "\n".join(f"  [{i}] {label}" for i, label in enumerate(labels))
     if not sys.stdin.isatty():
         raise RuntimeError(

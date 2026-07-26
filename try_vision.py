@@ -85,8 +85,7 @@ def run(model_path, image, prompt, max_tokens, k, text_only,
 
 def parse_args(argv=None):
     ap = argparse.ArgumentParser()
-    ap.add_argument("--model", default="/Users/yang.wang/.mtplx/models/"
-                    "Gemma-4-12B-MTPLX-6bit-mtp4bit")
+    ap.add_argument("--model", required=True, help="path to a Gemma 4 MTPLX model")
     ap.add_argument("--image", default="/tmp/vtest.png")
     ap.add_argument("--prompt", default="Describe this image. What color and "
                     "shape do you see?")

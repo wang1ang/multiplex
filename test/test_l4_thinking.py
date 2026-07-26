@@ -2,8 +2,8 @@ import json
 
 import mlx.core as mx
 
-from multiplex.hub import Hub
-from multiplex.scheduler import Req, Scheduler
+from multiplex.kernel.hub import Hub
+from multiplex.kernel.scheduler import Req, Scheduler
 from multiplex.server import (
     _chat_stream,
     _enable_thinking_from_body,

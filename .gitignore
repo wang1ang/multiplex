@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 .venv/
 .DS_Store
+.pytest_cache/
 # docs (not committed for now)
 PLAN.md
 *.html

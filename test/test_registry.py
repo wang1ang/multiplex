@@ -142,7 +142,7 @@ def test_interactive_selection_can_download_default_model(
 
     assert entry.name == "org--default-model"
     assert calls == [(default_model, str(tmp_path))]
-    assert "org/default-model (需下载)" in capsys.readouterr().out
+    assert "org/default-model (needs download)" in capsys.readouterr().out
 
 
 def test_noninteractive_selection_marks_missing_default_models(
@@ -165,4 +165,4 @@ def test_noninteractive_selection_marks_missing_default_models(
 
     assert "a-model" in message
     assert "b-model" in message
-    assert "org/default-model (需下载)" in message
+    assert "org/default-model (needs download)" in message

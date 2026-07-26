@@ -7,7 +7,8 @@ SSM/MTP state) shows up as divergent output, not as an error.
 Runs with k=0 (pure AR) for exact token equality, then k>0 to exercise the MTP
 block path. Also checks reuse across a process restart via the disk store.
 
-Run:  .venv/bin/python test/test_prefixcache_e2e.py [model_path]
+Requires a local model — there is no bundled default. Run:
+    .venv/bin/python test/test_prefixcache_e2e.py MODEL_PATH
 """
 
 import os
@@ -21,14 +22,9 @@ from pathlib import Path
 # sys.path here too.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from multiplex.engine import Engine
-from multiplex.mtp import find_drafter
-from multiplex.scheduler import Scheduler, Req, PrefillGroup
-
-# TODO: this default is one developer's local checkout, so the test cannot run
-# anywhere else without an argument. Make model_path required, or skip cleanly
-# when it is absent, before this lands anywhere others run tests.
-MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
+from multiplex.kernel.engine import Engine
+from multiplex.kernel.mtp import find_drafter
+from multiplex.kernel.scheduler import Scheduler, Req, PrefillGroup
 
 # Prefill stores blocks on chunk boundaries only, and the prompt pool needs
 # >4096 tokens (PROMPT_CACHE_MIN_TOKENS), so the shared prefix must be long.
@@ -62,7 +58,9 @@ def make_sched(eng, dr, *, k, budget, disk=None, chunk=CHUNK):
 
 
 def main():
-    model_path = sys.argv[1] if len(sys.argv) > 1 else MODEL
+    if len(sys.argv) < 2:
+        raise SystemExit(f"usage: {sys.argv[0]} MODEL_PATH")
+    model_path = sys.argv[1]
     eng = Engine(model_path)
     dr = find_drafter(eng)
     print(f"[model={os.path.basename(model_path)} "

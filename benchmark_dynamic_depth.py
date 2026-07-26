@@ -14,9 +14,9 @@ import time
 
 import mlx.core as mx
 
-from multiplex.engine import Engine
-from multiplex.mtp import find_drafter
-from multiplex.scheduler import PrefillGroup, Req, Scheduler
+from multiplex.kernel.engine import Engine
+from multiplex.kernel.mtp import find_drafter
+from multiplex.kernel.scheduler import PrefillGroup, Req, Scheduler
 
 
 def load_prompts(paths: list[Path], limit_per_suite: int) -> list[dict]:

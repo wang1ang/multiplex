@@ -9,7 +9,7 @@ to the live batch. ``--prompt`` and ``--prompt-file`` submit an initial request
 automatically. JSON/JSONL prompt files use the first object's ``prompt`` field.
 :q or Ctrl-C quits.
 
-Drives multiplex.scheduler.Scheduler: new requests are chunk-prefilled and
+Drives multiplex.kernel.scheduler.Scheduler: new requests are chunk-prefilled and
 merged into the running batch. Dynamic D1..D3 is the default. ``-d`` changes
 the maximum, ``--no-dynamic-depth`` makes it fixed, and ``-d 0`` selects pure
 AR.
@@ -29,9 +29,9 @@ from prompt_toolkit.key_binding import KeyBindings
 from prompt_toolkit.document import Document
 
 from multiplex import registry
-from multiplex.engine import Engine
-from multiplex.mtp import find_drafter
-from multiplex.scheduler import Scheduler, Req, PrefillGroup
+from multiplex.kernel.engine import Engine
+from multiplex.kernel.mtp import find_drafter
+from multiplex.kernel.scheduler import Scheduler, Req, PrefillGroup
 
 
 def to_ids(tokenizer, text, raw):

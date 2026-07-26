@@ -8,8 +8,8 @@ from pathlib import Path
 # also works.
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from multiplex.hub import Hub
-from multiplex.scheduler import DynamicDepthController, Req, Scheduler
+from multiplex.kernel.hub import Hub
+from multiplex.kernel.scheduler import DynamicDepthController, Req, Scheduler
 from multiplex.server import parse_args as parse_server_args, serve
 from try_vision import parse_args as parse_vision_args
 
@@ -38,7 +38,7 @@ class DynamicDepthTests(unittest.TestCase):
         self.assertEqual(server_args.depth, 3)
         self.assertIs(server_args.dynamic_depth, True)
 
-        vision_args = parse_vision_args([])
+        vision_args = parse_vision_args(["--model", "/tmp/fake-model"])
         self.assertEqual(vision_args.depth, 3)
         self.assertIs(vision_args.dynamic_depth, True)
 
