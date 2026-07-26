@@ -55,6 +55,27 @@ _NUMPY_TO_MLX_DTYPE: dict[str, Any] = {
 }
 
 
+def block_key(
+    tokens: tuple[int, ...] | list[int],
+    *,
+    parent: str | None = None,
+) -> str:
+    """Chain hash identifying one block: ``H(parent_key, chunk_tokens)``.
+
+    Keying a block by its parent's key rather than by its absolute token prefix
+    makes the key fixed-size and O(chunk) to extend, while still being unique to
+    the whole path: two identical chunks under different prefixes get different
+    keys. ``parent=None`` and ``parent=""`` both mean "root".
+    """
+    h = hashlib.sha256()
+    h.update(b"multiplex-prefix-block-v1\0")
+    h.update((parent or "").encode("ascii"))
+    h.update(b"\0")
+    for token in tokens:
+        h.update(int(token).to_bytes(8, byteorder="little", signed=True))
+    return h.hexdigest()
+
+
 def encode_tree(value: Any, *, block_size: int = 256) -> tuple[Any, dict[str, bytes]]:
     tensors: dict[str, bytes] = {}
     block_size = max(1, int(block_size))
@@ -298,20 +319,6 @@ class AsyncPrefixDiskStore:
             daemon=True,
         )
         self._thread.start()
-
-    def make_block_key(
-        self,
-        tokens: tuple[int, ...] | list[int],
-        *,
-        parent: str | None = None,
-    ) -> str:
-        h = hashlib.sha256()
-        h.update(b"multiplex-prefix-block-v1\0")
-        h.update((parent or "").encode("ascii"))
-        h.update(b"\0")
-        for token in tokens:
-            h.update(int(token).to_bytes(8, byteorder="little", signed=True))
-        return h.hexdigest()
 
     def submit_block(
         self,

@@ -8,9 +8,11 @@ the longest matching snapshot and only prefills the tail.
 
 Split into runtime plus two lower pieces under L3:
   * ``runtime`` — scheduler-facing hooks for find/restore/store/prune timing.
-  * ``policy`` — pure logic (no MLX): trie longest-prefix matching over stored
-    entries and per-pool LRU eviction. This is what could become a standalone
-    library.
+  * ``policy`` — near-pure logic: chunk-chain longest-prefix matching over
+    stored entries and per-pool LRU eviction. Blocks are keyed by
+    ``H(parent_key, chunk_tokens)``, so a lookup rehashes the request chunk by
+    chunk rather than indexing individual tokens. This is what could become a
+    standalone library.
   * ``state`` — L3 adapter for MLX cache objects: clone attention blocks,
     snapshot SSM, and restore a matched prefix into a single-row BatchState.
   * L3 scheduler wires runtime into request flow.

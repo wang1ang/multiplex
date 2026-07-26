@@ -1,10 +1,16 @@
-"""Prefix-cache policy: block-tree longest-prefix matching + per-pool LRU.
+"""Prefix-cache policy: chunk-chain longest-prefix matching + per-pool LRU.
 
 This module has no model knowledge. It only tracks token prefixes and opaque
 payloads supplied by the L3 state adapter.
 
 The core invariant is:
-  * attention KV is stored as per-block deltas on tree edges;
+  * prefill is chunk-aligned, so every stored block spans exactly
+    ``[i * chunk, (i + 1) * chunk)`` and the tree of blocks is a chain of
+    fixed-size chunks;
+  * a block is identified by ``key = H(parent_key, chunk_tokens)``, so the
+    deepest reusable prefix is found by rehashing the request chunk by chunk
+    instead of indexing individual tokens;
+  * attention KV is stored as per-block deltas on those chain nodes;
   * SSM is stored on reusable boundary nodes;
   * a match restores the parent-chain attention blocks plus that node's SSM.
 
@@ -14,28 +20,29 @@ restores only metadata and loads tensor blobs lazily on cache hits.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
-from .disk import AsyncPrefixDiskStore, DiskBlockRecord
+from .disk import AsyncPrefixDiskStore, DiskBlockRecord, block_key
 
+
+ROOT_KEY = ""
 
 @dataclass
 class Node:
+    """One chunk-aligned block in the prefix chain."""
+
+    key: str
     pos: int
+    parent: "Node | None" = None
     attn: Any | None = None
     ssm: Any | None = None
-    start: int = 0
-    prefix: tuple[int, ...] = ()
-    parent: "Node | None" = None
-    children: dict[tuple[int, ...], "Node"] = field(default_factory=dict)
+    cached_h: Any | None = None
     source: str | None = None
     pool: str = "default"
-    cached_h: Any | None = None
     touch: int = 0
-    disk_key: str | None = None
     reusable: bool = False
 
 
@@ -45,28 +52,30 @@ class Match:
     payload: Any
     source: str | None = None
     pool: str = "default"
-
-
-@dataclass
-class _TrieNode:
-    children: dict[int, "_TrieNode"] = field(default_factory=dict)
-    entries: list[Node] = field(default_factory=list)
+    key: str | None = None
 
 
 class PrefixCache:
-    """Block-tree prefix cache with independent LRU pools.
+    """Chunk-chain prefix cache with independent per-pool LRU.
 
-    ``capacity`` bounds resident reusable payloads per pool. Prefix-tree nodes
-    and disk-backed metadata are retained so misses can be inspected and cold
-    entries can lazy-load their tensors from SSD.
+    ``capacity`` bounds resident reusable payloads per pool.
+
+    Prefix-chain nodes backed by a disk record are retained after their tensors
+    are dropped so cold entries can lazy-load from SSD; memory-only nodes are
+    removed once their tensors go, so node count stays bounded.
     """
 
     def __init__(
         self,
         capacity: int | dict[str, int] = 8,
         disk_dir: str | os.PathLike | None = None,
+        chunk: int = 512,
         log=None,
     ):
+        self.chunk = int(chunk)
+        if self.chunk <= 0:
+            raise ValueError(f"prefix-cache chunk must be positive, got {chunk!r}")
+
         if isinstance(capacity, dict):
             self.capacity = {str(k): int(v) for k, v in capacity.items()}
             self._default_capacity = max(self.capacity.values(), default=0)
@@ -74,9 +83,8 @@ class PrefixCache:
             self.capacity = {"default": int(capacity)}
             self._default_capacity = int(capacity)
 
-        self._block_root = Node(pos=0, prefix=())
-        self._blocks: dict[tuple[int, ...], Node] = {(): self._block_root}
-        self._root = _TrieNode()
+        self._root = Node(key=ROOT_KEY, pos=0)
+        self._blocks: dict[str, Node] = {ROOT_KEY: self._root}
         self._clock = 0
         self._log = log
         self.disk_dir = Path(disk_dir).expanduser() if disk_dir else None
@@ -88,6 +96,33 @@ class PrefixCache:
     def _debug(self, msg: str) -> None:
         if self._log is not None:
             self._log(f"PREFIX DISK {msg}")
+
+    # ---------------------------------------------------------------- keys
+
+    def _iter_chain_keys(self, token_ids) -> Iterator[str]:
+        """Yield chain keys for complete chunks of ``token_ids``."""
+        parent = ROOT_KEY
+        chunk = self.chunk
+        for start in range(0, len(token_ids) - chunk + 1, chunk):
+            parent = block_key(token_ids[start:start + chunk], parent=parent)
+            yield parent
+
+    def chain_keys(self, token_ids) -> list[str]:
+        """Chain keys for every chunk boundary of ``token_ids``, root excluded."""
+        return list(self._iter_chain_keys(token_ids))
+
+    def key_at(self, token_ids, pos: int) -> str | None:
+        """Chain key for the block ending at ``pos``, or None if unreachable."""
+        if pos == 0:
+            return ROOT_KEY
+        if pos % self.chunk or pos > len(token_ids):
+            return None
+        parent = ROOT_KEY
+        for start in range(0, pos, self.chunk):
+            parent = block_key(token_ids[start:start + self.chunk], parent=parent)
+        return parent
+
+    # ---------------------------------------------------------------- disk load
 
     def _load_disk(self) -> None:
         """Restore record metadata only; tensor blobs stay lazy until a hit."""
@@ -102,75 +137,56 @@ class PrefixCache:
         if self._disk is None:
             return
 
-        loaded = 0
-        key_to_node: dict[str | None, Node] = {None: self._block_root}
+        loaded = skipped = 0
         for record in sorted(self._disk.records(), key=lambda r: r.pos):
-            parent = key_to_node.get(record.parent)
+            if record.pos - record.start != self.chunk:
+                skipped += 1
+                continue
+            parent = self._blocks.get(record.parent or ROOT_KEY)
             if parent is None:
                 self._debug(f"LOAD SKIP missing_parent key={record.key[:12]}")
                 continue
             node = self._node_from_record(record, parent)
-            self._blocks[node.prefix] = node
-            parent.children[tuple(record.tokens)] = node
-            key_to_node[record.key] = node
+            self._blocks[node.key] = node
             self._clock = max(self._clock, record.touch)
             loaded += 1
+        if skipped:
+            self._debug(f"LOAD SKIP chunk_mismatch records={skipped} "
+                        f"chunk={self.chunk}")
         if loaded:
             self._evict()
-            self._rebuild_index()
             self._debug(f"LOAD records={loaded} path={self.disk_dir}")
 
     def _node_from_record(self, record: DiskBlockRecord, parent: Node) -> Node:
-        prefix = parent.prefix + tuple(record.tokens)
         return Node(
+            key=record.key,
             pos=record.pos,
-            start=record.start,
-            prefix=prefix,
             parent=parent,
             source=record.source,
             pool=record.pool,
             touch=record.touch,
-            disk_key=record.key,
             reusable=record.ssm_spec is not None,
         )
+
+    # ---------------------------------------------------------------- accounting
 
     def _capacity_for(self, pool: str) -> int:
         return self.capacity.get(pool, self._default_capacity)
 
-    def iter_entries(self):
+    def _resident_entries(self) -> Iterator[Node]:
         for node in self._blocks.values():
-            if node is not self._block_root and self._is_reusable_node(node):
+            if node is not self._root and node.ssm is not None:
                 yield node
 
     @staticmethod
-    def _is_reusable_node(node: Node) -> bool:
-        return node.ssm is not None or node.reusable
+    def _chain(node: Node) -> Iterator[Node]:
+        cur: Node | None = node
+        while cur is not None and cur.key != ROOT_KEY:
+            yield cur
+            cur = cur.parent
 
-    def _entry_count(self, pool: str | None = None) -> int:
-        if pool is None:
-            return sum(1 for _ in self.iter_entries())
-        return sum(1 for node in self.iter_entries() if node.pool == pool)
-
-    def _resident_entries(self):
-        for node in self.iter_entries():
-            if node.ssm is not None:
-                yield node
-
-    def _resident_count(self, pool: str | None = None) -> int:
-        if pool is None:
-            return sum(1 for _ in self._resident_entries())
-        return sum(1 for node in self._resident_entries() if node.pool == pool)
-
-    def _rebuild_index(self) -> None:
-        self._root = _TrieNode()
-        for node in self.iter_entries():
-            self._index_block_entry(node)
-
-    def _index_block_entry(self, node: Node) -> None:
-        cur = self._root
-        for tok in node.prefix:
-            cur = cur.children.setdefault(tok, _TrieNode())
-        cur.entries.append(node)
+    def _resident_count(self, pool: str) -> int:
+        return sum(1 for n in self._resident_entries() if n.pool == pool)
 
     def _evict(self) -> None:
         pools = set(self.capacity)
@@ -178,104 +194,83 @@ class PrefixCache:
         for pool in pools:
             while self._resident_count(pool) > self._capacity_for(pool):
                 victim = min(
-                    (node for node in self._resident_entries() if node.pool == pool),
-                    key=lambda node: node.touch,
+                    (n for n in self._resident_entries() if n.pool == pool),
+                    key=lambda n: n.touch,
                     default=None,
                 )
                 if victim is None:
                     break
                 self._drop_payload(victim)
-        self._drop_cold_attention()
-
-    def _prune_block(self, node: Node) -> None:
-        """Release payload from a non-reusable leaf while keeping its node."""
-        if (
-            node is not self._block_root
-            and not node.children
-            and not self._is_reusable_node(node)
-        ):
-            node.attn = None
-
-    def prune_unreferenced(self) -> None:
-        """Release cold payloads without removing prefix-tree nodes."""
-        for node in list(self._blocks.values()):
-            if node is self._block_root:
-                continue
-            if not self._is_reusable_node(node) and not node.children:
-                self._prune_block(node)
-        self._drop_cold_attention()
-
-    def find(self, token_ids) -> Match | None:
-        """Return the deepest reusable prefix of ``token_ids``."""
-        token_ids = tuple(token_ids)
-        candidates: list[Node] = []
-        cur = self._root
-        for tok in token_ids:
-            cur = cur.children.get(tok)
-            if cur is None:
-                break
-            if cur.entries:
-                candidates.extend(cur.entries)
-
-        candidates.sort(key=lambda node: (node.pos, node.touch), reverse=True)
-        for best in candidates:
-            self._clock += 1
-            best.touch = self._clock
-            if not self._load_reusable_payload(best):
-                self._debug(
-                    f"MISS payload_unavailable pos={best.pos} "
-                    f"disk={best.disk_key[:12] if best.disk_key else None}"
-                )
-                continue
-            blocks = self._path_blocks(best)
-            if blocks is None:
-                self._debug(
-                    f"MISS attention_unavailable pos={best.pos} "
-                    f"disk={best.disk_key[:12] if best.disk_key else None}"
-                )
-                continue
-
-            payload = ("blocks", blocks, best.ssm, best.pos)
-            if best.cached_h is not None:
-                payload += (best.cached_h,)
-            self._evict()
-            return Match(prefix_len=best.pos, payload=payload, source=best.source,
-                         pool=best.pool)
-        return None
-
-    def _path_blocks(self, node: Node) -> list[Any] | None:
-        blocks = []
-        cur = node
-        while cur is not self._block_root:
-            if cur.parent is None or not self._load_attention(cur):
-                return None
-            blocks.append(cur.attn)
-            cur = cur.parent
-        blocks.reverse()
-        return blocks
-
-    def _disk_record(self, node: Node) -> DiskBlockRecord | None:
-        if self._disk is None or node.disk_key is None:
-            return None
-        return self._disk.get_record(node.disk_key)
+        self._drop_cold_blocks()
 
     def _drop_payload(self, node: Node) -> None:
         node.ssm = None
         node.cached_h = None
 
-    def _drop_cold_attention(self) -> None:
-        keep: set[int] = set()
+    def _drop_cold_blocks(self) -> None:
+        """Release attention off every resident chain; forget unbacked nodes."""
+        keep: set[str] = set()
         for node in self._resident_entries():
-            cur = node
-            while cur is not self._block_root:
-                keep.add(id(cur))
-                if cur.parent is None:
-                    break
-                cur = cur.parent
+            for anc in self._chain(node):
+                keep.add(anc.key)
 
-        for node in self._blocks.values():
-            if node is not self._block_root and id(node) not in keep:
-                node.attn = None
+        for key, node in list(self._blocks.items()):
+            if node is self._root or key in keep:
+                continue
+            node.attn = None
+            if self._disk_record(node) is None:
+                del self._blocks[key]
+
+    def prune_unreferenced(self) -> None:
+        """Release cold payloads without touching resident chains."""
+        self._drop_cold_blocks()
+
+    # ---------------------------------------------------------------- lookup
+
+    def find(self, token_ids) -> Match | None:
+        """Return the deepest reusable prefix of ``token_ids``."""
+        candidates: list[Node] = []
+        for key in self._iter_chain_keys(token_ids):
+            node = self._blocks.get(key)
+            if node is None:
+                break
+            if node.ssm is not None or node.reusable:
+                candidates.append(node)
+
+        for best in reversed(candidates):
+            if not self._load_reusable_payload(best):
+                self._debug(f"MISS payload_unavailable pos={best.pos} "
+                            f"key={best.key[:12]}")
+                continue
+            blocks = self._path_blocks(best)
+            if blocks is None:
+                self._debug(f"MISS attention_unavailable pos={best.pos} "
+                            f"key={best.key[:12]}")
+                continue
+
+            self._clock += 1
+            best.touch = self._clock
+            payload = ("blocks", blocks, best.ssm, best.pos)
+            if best.cached_h is not None:
+                payload += (best.cached_h,)
+            self._evict()
+            return Match(prefix_len=best.pos, payload=payload, source=best.source,
+                         pool=best.pool, key=best.key)
+        return None
+
+    def _path_blocks(self, node: Node) -> list[Any] | None:
+        blocks = []
+        for cur in self._chain(node):
+            if cur.parent is None or not self._load_attention(cur):
+                return None
+            blocks.append(cur.attn)
+        blocks.reverse()
+        return blocks
+
+    def _disk_record(self, node: Node) -> DiskBlockRecord | None:
+        if self._disk is None:
+            return None
+        return self._disk.get_record(node.key)
 
     def _load_attention(self, node: Node) -> bool:
         if node.attn is not None:
@@ -297,6 +292,8 @@ class PrefixCache:
                 node.cached_h = self._disk.load_cached_h(record)
         return node.ssm is not None
 
+    # ---------------------------------------------------------------- store
+
     def store_block(
         self,
         full_prefix,
@@ -308,45 +305,36 @@ class PrefixCache:
         source: str | None = None,
         pool: str = "default",
         cached_h=None,
-    ) -> bool:
-        """Add one attention block and optionally make its end reusable."""
-        full_prefix = tuple(full_prefix)
+        parent_key: str | None = None,
+    ) -> str | None:
+        """Add one chunk-aligned attention block; optionally make its end reusable."""
         start = int(start)
         pos = int(pos)
         if pos <= start or start < 0 or pos > len(full_prefix):
             raise ValueError("invalid prefix-cache block range")
+        if pos - start != self.chunk or start % self.chunk:
+            raise ValueError(
+                f"prefix-cache block [{start}:{pos}] is not aligned to "
+                f"chunk={self.chunk}"
+            )
 
-        parent_prefix = full_prefix[:start]
-        prefix = full_prefix[:pos]
-        parent = self._blocks.get(parent_prefix)
-        if parent is None:
+        if start == 0:
+            parent_key = ROOT_KEY
+        elif parent_key is None:
+            parent_key = self.key_at(full_prefix, start)
+        parent = self._blocks.get(parent_key) if parent_key is not None else None
+        if parent is None or parent.pos != start:
             self._debug(f"STORE BLOCK SKIP missing_parent start={start} pos={pos}")
-            return False
+            return None
 
-        key = tuple(full_prefix[start:pos])
-        disk_key = None
-        if self._disk is not None:
-            disk_key = self._disk.make_block_key(key, parent=parent.disk_key)
-        node = self._blocks.get(prefix)
+        key = block_key(full_prefix[start:pos], parent=parent_key)
+        node = self._blocks.get(key)
         new_node = node is None
         if node is None:
-            node = Node(
-                pos=pos,
-                start=start,
-                prefix=prefix,
-                parent=parent,
-                attn=attn,
-                disk_key=disk_key,
-            )
-            self._blocks[prefix] = node
-        else:
-            node.pos = pos
-            node.start = start
-            node.prefix = prefix
-            node.parent = parent
-            node.attn = attn
-            node.disk_key = disk_key or node.disk_key
-        parent.children[key] = node
+            node = Node(key=key, pos=pos, parent=parent)
+            self._blocks[key] = node
+        node.parent = parent
+        node.attn = attn
 
         if ssm is not None:
             self._clock += 1
@@ -357,16 +345,11 @@ class PrefixCache:
             node.reusable = True
             node.touch = self._clock
             self._evict()
-            self._rebuild_index()
-        if (
-            self._disk is not None
-            and node.disk_key is not None
-            and (new_node or ssm is not None)
-        ):
+        if self._disk is not None and (new_node or ssm is not None):
             self._disk.submit_block(
-                key=node.disk_key,
-                parent=parent.disk_key,
-                tokens=key,
+                key=key,
+                parent=parent_key or None,
+                tokens=full_prefix[start:pos],
                 start=start,
                 pos=pos,
                 attn=attn,
@@ -376,7 +359,7 @@ class PrefixCache:
                 source=node.source,
                 touch=node.touch,
             )
-        return True
+        return key
 
     def flush(self) -> None:
         if self._disk is not None:

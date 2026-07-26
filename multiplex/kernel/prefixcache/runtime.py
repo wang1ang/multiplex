@@ -15,7 +15,7 @@ from typing import Any
 import mlx.core as mx
 
 from ..engine import BatchState, Engine
-from .policy import PrefixCache
+from .policy import ROOT_KEY, PrefixCache
 from .state import PrefixCacheState
 
 
@@ -45,6 +45,7 @@ class PrefixCacheRuntime:
         self.cache = PrefixCache(
             capacity=cache_capacity,
             disk_dir=cache_dir,
+            chunk=chunk,
             log=self._log,
         ) if capacity else None
         self.state = PrefixCacheState(engine) if self.cache is not None else None
@@ -66,6 +67,9 @@ class PrefixCacheRuntime:
     def begin_prefill(self, req: Any, group: Any) -> None:
         ids = req.prompt
         match = self.cache.find(ids) if self.cache is not None else None
+        req._prefix_cache_cursor = (
+            (match.prefix_len, match.key) if match is not None else (0, ROOT_KEY)
+        )
         self._log_find(req, ids, match)
 
         group.cached_h = None
@@ -117,10 +121,13 @@ class PrefixCacheRuntime:
             source = f"prompt rid={req.rid} block={block}"
             cached_h = h[:, -1:, :]
             mx.eval(cached_h)
+        parent_key = self._parent_key(req, ids, start)
         stored = self.cache.store_block(
             ids, start, end, block_payload, ssm=ssm, source=source,
-            pool="prompt", cached_h=cached_h,
+            pool="prompt", cached_h=cached_h, parent_key=parent_key,
         )
+        if stored:
+            req._prefix_cache_cursor = (end, stored)
         if stored and ssm is not None:
             self._log(f"PREFIX STORE block={end // self.chunk} "
                       f"len={end}/{len(ids)} rid={req.rid}")
@@ -153,17 +160,24 @@ class PrefixCacheRuntime:
             if cached_h is not None:
                 mx.eval(cached_h)
             block = pos // self.chunk
-            if self.cache.store_block(
+            parent_key = self._parent_key(req, prefix, start)
+            stored = self.cache.store_block(
                 prefix, start, pos, block_payload, ssm=ssm,
                 source=f"session rid={req.rid} block={block}",
-                pool="session", cached_h=cached_h,
-            ):
+                pool="session", cached_h=cached_h, parent_key=parent_key,
+            )
+            if stored:
+                req._prefix_cache_cursor = (pos, stored)
                 req.session_cache_pos.add(pos)
                 self._log(f"SESSION STORE block={block} len={pos} rid={req.rid}")
 
     def prune_unreferenced(self) -> None:
         if self.cache is not None:
             self.cache.prune_unreferenced()
+
+    def _parent_key(self, req: Any, ids: list[int], start: int) -> str | None:
+        pos, key = getattr(req, "_prefix_cache_cursor", (0, ROOT_KEY))
+        return key if pos == start else self.cache.key_at(ids, start)
 
     def _cold_prefill(self, req: Any, group: Any, ids: list[int], *,
                       log: bool = True) -> None:
