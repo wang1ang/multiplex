@@ -19,6 +19,9 @@ from multiplex.engine import Engine
 from multiplex.mtp import find_drafter
 from multiplex.scheduler import Scheduler, Req, PrefillGroup
 
+# TODO: this default is one developer's local checkout, so the test cannot run
+# anywhere else without an argument. Make model_path required, or skip cleanly
+# when it is absent, before this lands anywhere others run tests.
 MODEL = os.path.expanduser("~/.mtplx/models/Agents-A1-MTPLX")
 
 # Prefill stores blocks on chunk boundaries only, and the prompt pool needs
