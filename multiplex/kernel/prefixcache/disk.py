@@ -242,6 +242,16 @@ class DiskBlockTask:
     cached_h: Any | None = None
 
 
+@dataclass(frozen=True)
+class _RecordSizes:
+    """On-disk sizes measured once per cleanup, so admission can price a chain
+    by table lookup instead of re-stat'ing shared files per candidate."""
+
+    record_bytes: dict[str, int]
+    blob_refs: dict[str, set[str]]
+    blob_bytes: dict[str, int]
+
+
 @dataclass
 class DiskBlockRecord:
     """Metadata-only view of a persisted prefix-cache block."""
@@ -448,7 +458,9 @@ class AsyncPrefixDiskStore:
             return {"records_deleted": 0, "blobs_deleted": 0, "bytes_before": 0}
 
         records = self._scan_record_files()
-        bytes_before = self._disk_bytes()
+        sizes = self._record_sizes(records)
+        bytes_before = (sum(sizes.record_bytes.values())
+                        + sum(sizes.blob_bytes.values()))
         if bytes_before <= self.max_bytes:
             blobs_deleted = self._delete_unreferenced_blobs(records)
             return {
@@ -459,15 +471,30 @@ class AsyncPrefixDiskStore:
 
         target = int(self.max_bytes * 0.9)
         by_key = {record.key: record for record in records}
+        # Admit chains newest-first, pricing only what each chain adds to the
+        # keep set — re-walking the whole set per candidate made this quadratic.
         keep: set[str] = set()
+        kept_blobs: set[str] = set()
+        kept_bytes = 0
         for record in sorted(records, key=lambda r: r.touch, reverse=True):
             chain = self._ancestor_chain(record, by_key)
             if not chain:
                 continue
-            proposed = keep | chain
-            proposed_bytes = self._referenced_bytes(proposed, by_key)
-            if proposed_bytes <= target or not keep:
-                keep = proposed
+            added_keys = chain - keep
+            if not added_keys:
+                continue
+            added_blobs: set[str] = set()
+            added_bytes = 0
+            for key in added_keys:
+                added_bytes += sizes.record_bytes.get(key, 0)
+                added_blobs |= sizes.blob_refs.get(key, set())
+            for digest in added_blobs - kept_blobs:
+                added_bytes += sizes.blob_bytes.get(digest, 0)
+            if kept_bytes + added_bytes > target and keep:
+                continue
+            keep |= added_keys
+            kept_blobs |= added_blobs
+            kept_bytes += added_bytes
 
         deleted = 0
         for record in records:
@@ -591,31 +618,32 @@ class AsyncPrefixDiskStore:
             cur = by_key.get(cur.parent) if cur.parent else None
         return chain
 
-    def _referenced_bytes(
-        self,
-        keep: set[str],
-        by_key: dict[str, DiskBlockRecord],
-    ) -> int:
-        total = 0
-        blob_refs: set[str] = set()
-        for key in keep:
-            record = by_key.get(key)
-            if record is None:
-                continue
-            path = self._record_path(key)
+    def _record_sizes(self, records: list[DiskBlockRecord]) -> _RecordSizes:
+        """Price every record once: its own JSON plus the blobs it references."""
+        record_bytes: dict[str, int] = {}
+        blob_refs: dict[str, set[str]] = {}
+        for record in records:
             try:
-                total += path.stat().st_size
+                record_bytes[record.key] = self._record_path(record.key).stat().st_size
             except OSError:
-                pass
-            _collect_blob_refs(record.attn_spec, blob_refs)
-            _collect_blob_refs(record.ssm_spec, blob_refs)
-            _collect_blob_refs(record.cached_h_spec, blob_refs)
-        for digest in blob_refs:
-            try:
-                total += self._blob_store._blob_path(digest).stat().st_size
-            except OSError:
-                pass
-        return total
+                record_bytes[record.key] = 0
+            refs: set[str] = set()
+            _collect_blob_refs(record.attn_spec, refs)
+            _collect_blob_refs(record.ssm_spec, refs)
+            _collect_blob_refs(record.cached_h_spec, refs)
+            blob_refs[record.key] = refs
+
+        # Blobs are shared, so one pass over the blob dir beats a stat per
+        # reference: N records on the same chain would stat the same blob N times.
+        blob_bytes: dict[str, int] = {}
+        blob_root = self.base_dir / "blobs"
+        if blob_root.exists():
+            for path in blob_root.glob("*/*.bin"):
+                try:
+                    blob_bytes[path.stem] = path.stat().st_size
+                except OSError:
+                    pass
+        return _RecordSizes(record_bytes, blob_refs, blob_bytes)
 
     def _delete_unreferenced_blobs(self, records: list[DiskBlockRecord]) -> int:
         keep: set[str] = set()
@@ -654,18 +682,6 @@ class AsyncPrefixDiskStore:
                     path.unlink()
             except OSError:
                 pass
-
-    def _disk_bytes(self) -> int:
-        total = 0
-        if not self.base_dir.exists():
-            return 0
-        for path in self.base_dir.rglob("*"):
-            if path.is_file():
-                try:
-                    total += path.stat().st_size
-                except OSError:
-                    pass
-        return total
 
     def _debug(self, msg: str) -> None:
         if self._log is not None:
