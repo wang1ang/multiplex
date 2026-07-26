@@ -126,6 +126,11 @@ Useful flags:
   blocks do, so counting entries cannot bound memory.
 - `--mtp /path/to/sidecar.safetensors`: override automatic MTP discovery.
 
+`./serve.sh` takes the same flags and additionally points the coding agents
+installed on the machine (pi, Codex) at the server while it runs, restoring
+their config on exit; what it writes lives in `agents/`. `MULTIPLEX_PYTHON`
+picks the interpreter it runs.
+
 ## API
 
 ```bash
