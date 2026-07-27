@@ -2,9 +2,9 @@
 
 Local OpenAI-compatible LLM serving for Apple Silicon, built on `mlx-lm`.
 
-Run a local model as a drop-in backend for OpenAI-compatible coding agents
-(Codex, pi, ...) — point them at `multiplex` instead of a paid API and keep
-working the same way, fully offline.
+Run a local model as a drop-in backend for OpenAI-compatible coding agents.
+Point them at `multiplex` instead of a paid API and keep working the same
+way, fully offline.
 
 ## Features
 
@@ -12,7 +12,7 @@ working the same way, fully offline.
 - Dynamic batching: new requests can prefill and join a live decode batch.
 - MTP speculative decoding when a sidecar is present; falls back to plain autoregressive decoding otherwise.
 - Prefix cache with a byte-budgeted in-memory LRU and optional SSD persistence.
-- Model discovery under `~/.mtplx/models`, plus download-by-name from Hugging Face.
+- Local model discovery, plus download-by-name from Hugging Face.
 - Chat CLI (`try_engine.py`) for local testing and scheduler log inspection.
 
 See `docs/ARCHITECTURE.md` for how the code is layered.
@@ -40,8 +40,8 @@ print(pathlib.Path(list(nvidia.__path__)[0]) / "cu13")')"
 ./serve.sh --model MODEL_NAME
 ```
 
-Pass a local path, a name under `~/.mtplx/models`, a Hugging Face repo id, or
-a Hugging Face URL — anything not found locally gets downloaded automatically.
+Pass a local path, a discovered model's name, a Hugging Face repo id, or a
+Hugging Face URL — anything not found locally gets downloaded automatically.
 Omit `--model` in an interactive terminal to pick from a numbered list.
 
 ```bash
