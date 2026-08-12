@@ -23,8 +23,10 @@ Correctness facts (verified by experiment):
 
 from __future__ import annotations
 
+import importlib
 import json
 import os
+import sys
 import time
 from dataclasses import dataclass
 from typing import Any
@@ -33,6 +35,67 @@ import mlx.core as mx
 from mlx_lm import load
 from mlx_lm.generate import _make_cache
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
+
+
+# A fresh model_type string whose weights follow a schema mlx-lm already ships
+# (the Qwen3.6-as-qwen3_5 precedent, expected to repeat for the next Qwen). Map
+# the architectures class the config names to the implementing mlx-lm module.
+_ARCH_ALIAS_MODULES: tuple[tuple[str, str], ...] = (
+    ("qwen3_5", "qwen3_5"),
+    ("qwen3_6", "qwen3_5"),
+    ("qwen3_next", "qwen3_5"),
+)
+
+
+def _maybe_register_model_type_alias(load_path: str) -> None:
+    """Let a checkpoint with an unknown ``model_type`` but a known ``architectures``
+    schema load through the implementing module.
+
+    mlx-lm resolves the model class from ``model_type`` alone
+    (``importlib.import_module(f"mlx_lm.models.{model_type}")``), so a renamed
+    config that keeps a supported architecture (e.g. Qwen3.6 shipped as
+    ``model_type: qwen3_5``, the precedent the next Qwen is expected to repeat)
+    passes discovery but hard-fails at load with "Model type X not supported".
+    When that happens, register a ``sys.modules`` alias to the module whose
+    ``architectures`` class matches — the same shim mechanism transformers uses.
+    An unknown model_type with an unknown architecture is left to fail loudly.
+    """
+    cfg_path = os.path.join(load_path, "config.json")
+    if not os.path.isfile(cfg_path):
+        return
+    try:
+        with open(cfg_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return
+    model_type = cfg.get("model_type")
+    if not isinstance(model_type, str) or not model_type:
+        return
+
+    from mlx_lm.utils import MODEL_REMAPPING
+
+    resolved = MODEL_REMAPPING.get(model_type, model_type)
+    module_name = f"mlx_lm.models.{resolved}"
+    try:
+        importlib.import_module(module_name)
+        return  # native model_type — nothing to alias
+    except ImportError:
+        pass
+
+    architectures = cfg.get("architectures") or []
+    text_cfg = cfg.get("text_config") or {}
+    if isinstance(text_cfg, dict):
+        architectures = list(architectures) + list(text_cfg.get("architectures") or [])
+    markers = " ".join(str(a).lower() for a in architectures)
+    if not markers:
+        return
+    for needle, impl in _ARCH_ALIAS_MODULES:
+        if needle in markers:
+            impl_module = importlib.import_module(f"mlx_lm.models.{impl}")
+            if not (hasattr(impl_module, "Model") and hasattr(impl_module, "ModelArgs")):
+                return
+            sys.modules[module_name] = impl_module
+            return
 
 
 def _resolve_load_path(model_path: str) -> str:
@@ -82,6 +145,7 @@ class Engine:
             model_path = expanded
         t0 = time.time()
         load_path = _resolve_load_path(model_path)
+        _maybe_register_model_type_alias(load_path)
         self.model, self.tokenizer = load(load_path)
         # mlx-lm's multimodal wrappers (e.g. gemma4) expose the text stack under
         # ``.language_model``; a plain text model (e.g. gemma4_text, used as the

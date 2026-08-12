@@ -113,6 +113,27 @@ def _mtp_norms_are_delta_encoded(model_path: str) -> bool:
     )
 
 
+def _num_mtp_layers(model_path: str) -> int:
+    """Draft-layer count the sidecar declares. The Qwen MTP contract is N-generic
+    in the vLLM reference (``mtp_num_hidden_layers`` stacked full-attention draft
+    layers); a checkpoint that omits the key is the depth-1 template. Returns at
+    least 1 so a headless config still builds one layer."""
+    with open(os.path.join(model_path, "config.json")) as f:
+        cfg = json.load(f)
+    tcfg = cfg.get("text_config", cfg)
+    n = (
+        tcfg.get("mtp_num_hidden_layers")
+        or tcfg.get("num_nextn_predict_layers")
+        or cfg.get("mtp_num_hidden_layers")
+        or cfg.get("num_nextn_predict_layers")
+        or 0
+    )
+    try:
+        return max(int(n), 1)
+    except (TypeError, ValueError):
+        return 1
+
+
 def _infer_prequant_group_size(weights: dict, bits: int) -> int | None:
     """Infer the sidecar's real quantization group size from packed tensors."""
     if bits <= 0 or 32 % bits:
@@ -137,25 +158,39 @@ def _infer_prequant_group_size(weights: dict, bits: int) -> int | None:
 
 
 class MTPHead(nn.Module):
-    """One MTP layer. Reuses the trunk's embed_tokens and lm_head (not owned)."""
+    """The MTP draft stack. Reuses the trunk's embed_tokens and lm_head (not owned).
 
-    def __init__(self, targs: q5.TextModelArgs):
+    The vLLM Qwen contract is N-generic: ``fc`` and the pre/post RMS norms are a
+    single shared set, and ``mtp_num_hidden_layers`` full-attention DecoderLayers
+    are stacked after ``fc`` and run in sequence. ``n_layers == 1`` is the
+    depth-1 template and is byte-identical to the previous single-layer head.
+    """
+
+    def __init__(self, targs: q5.TextModelArgs, n_layers: int = 1):
         super().__init__()
         eps = targs.rms_norm_eps
         self.pre_fc_norm_embedding = nn.RMSNorm(targs.hidden_size, eps=eps)
         self.pre_fc_norm_hidden = nn.RMSNorm(targs.hidden_size, eps=eps)
         self.fc = nn.Linear(targs.hidden_size * 2, targs.hidden_size, bias=False)
-        # A full-attention layer: layer_idx = full_attention_interval - 1.
-        self.layers = [q5.DecoderLayer(targs, targs.full_attention_interval - 1)]
+        # Stacked full-attention draft layers: layer_idx = full_attention_interval - 1
+        # (the same full-attention slot for every draft layer).
+        fa_idx = targs.full_attention_interval - 1
+        self.layers = [q5.DecoderLayer(targs, fa_idx) for _ in range(max(int(n_layers), 1))]
         self.norm = nn.RMSNorm(targs.hidden_size, eps=eps)
 
     def __call__(self, embed: mx.array, hidden: mx.array, cache) -> mx.array:
-        """Return post-norm hidden ``[B, L, H]`` for the drafted position(s)."""
+        """Return post-norm hidden ``[B, L, H]`` for the drafted position(s).
+
+        ``cache`` is the per-layer draft-cache list (one KVCache per draft layer);
+        all draft caches advance in lockstep, so the mask from the first layer's
+        offset is valid for every layer.
+        """
         e = self.pre_fc_norm_embedding(embed)
         h = self.pre_fc_norm_hidden(hidden)
         x = self.fc(mx.concatenate([e, h], axis=-1))
-        mask = create_attention_mask(x, cache)
-        x = self.layers[0](x, mask=mask, cache=cache)
+        mask = create_attention_mask(x, cache[0])
+        for layer, layer_cache in zip(self.layers, cache):
+            x = layer(x, mask=mask, cache=layer_cache)
         return self.norm(x)
 
 
@@ -169,7 +204,7 @@ def build_qwen_head(engine, mtp_path: str):
     """
     cfg = engine.model.args.text_config
     targs = q5.TextModelArgs.from_dict(cfg)
-    head = MTPHead(targs)
+    head = MTPHead(targs, n_layers=_num_mtp_layers(engine.model_path))
     head.embed = engine.model.language_model.model.embed_tokens
     qc = _quant_config(engine.model_path)
 
@@ -306,10 +341,13 @@ class GemmaHead:
         token(s) being predicted from, ``hidden`` the trunk hidden of the same
         position(s). Returns the drafter's post-hidden, shaped like ``hidden``.
 
-        Attention borrows the trunk's live shared-KV at its current offset; the
-        query position is pinned to ``offset-1`` (the position of the primary
-        token that produced ``hidden``), matching the MLX-VLM/MTPLX drafter.
+        ``cache`` is the draft-cache list; the shared-KV Gemma head keeps no real
+        draft KV, so it uses only ``cache[0]`` as a position counter. Attention
+        borrows the trunk's live shared-KV at its current offset; the query
+        position is pinned to ``offset-1`` (the position of the primary token
+        that produced ``hidden``), matching the MLX-VLM/MTPLX drafter.
         """
+        counter = cache[0]
         trunk = self._trunk_cache()
         off = self._trunk_offset(trunk)
         # Query position advances within the draft block: step i (0-based) drafts
@@ -336,7 +374,7 @@ class GemmaHead:
         # ever attending to it: write one dummy slot per input token.
         L = int(inputs_embeds.shape[1])
         dummy = mx.zeros((inputs_embeds.shape[0], 1, L, 1), dtype=post.dtype)
-        cache.update_and_fetch(dummy, dummy)
+        counter.update_and_fetch(dummy, dummy)
         return post
 
     def logits(self, post: mx.array) -> mx.array:
@@ -418,49 +456,58 @@ class Drafter:
         self.engine = engine
         self.head = head
         self.embed = head.embed
+        # A native head stacks ``mtp_num_hidden_layers`` draft layers, each with
+        # its own KV cache; an external drafter (Gemma shared-KV) keeps no real
+        # draft KV and uses a single dummy cache as a position counter.
+        self.n_layers = len(getattr(head, "layers", None) or [None])
         # External drafters project drafts through their own head; native heads
         # reuse the trunk's (engine.logits). Predicate: head advertises .logits.
         self.draft_logits = getattr(head, "logits", None) or engine.logits
 
     def make_cache(self) -> list:
-        return [KVCache()]
+        return [KVCache() for _ in range(self.n_layers)]
 
     @staticmethod
     def trim_cache_to(cache: list, size: int) -> None:
         target = max(0, int(size))
-        cur = int(cache[0].size())
-        if cur > target:
-            cache[0].trim(cur - target)
+        for c in cache:
+            cur = int(c.size())
+            if cur > target:
+                c.trim(cur - target)
 
     def merge_caches(self, caches: list[list]) -> list:
         if not caches:
             return self.make_cache()
         if len(caches) == 1:
             return caches[0]
-        return [BatchKVCache.merge([cache[0] for cache in caches])]
+        n = len(caches[0])
+        return [BatchKVCache.merge([cache[li] for cache in caches]) for li in range(n)]
 
     @staticmethod
     def extract_cache_row(cache: list, row: int) -> list:
-        c = cache[0]
-        if hasattr(c, "extract"):
-            return [c.extract(row)]
-        single = KVCache()
-        if c.keys is not None:
-            single.keys = mx.contiguous(c.keys[row:row + 1, :, :c.offset, :])
-            single.values = mx.contiguous(c.values[row:row + 1, :, :c.offset, :])
-            single.offset = int(c.offset)
-        return [single]
+        out = []
+        for c in cache:
+            if hasattr(c, "extract"):
+                out.append(c.extract(row))
+                continue
+            single = KVCache()
+            if c.keys is not None:
+                single.keys = mx.contiguous(c.keys[row:row + 1, :, :c.offset, :])
+                single.values = mx.contiguous(c.values[row:row + 1, :, :c.offset, :])
+                single.offset = int(c.offset)
+            out.append(single)
+        return out
 
     @staticmethod
     def filter_cache(cache: list, keep: list[int]) -> None:
-        """Keep only rows ``keep`` in the draft KVCache. Plain KVCache has no
-        filter(), so slice its [B, H, L, D] keys/values by row."""
-        c = cache[0]
-        if hasattr(c, "filter"):
-            c.filter(keep)
-        elif c.keys is not None:
-            c.keys = c.keys[keep]
-            c.values = c.values[keep]
+        """Keep only rows ``keep`` in every draft-layer KVCache. Plain KVCache has
+        no filter(), so slice its [B, H, L, D] keys/values by row."""
+        for c in cache:
+            if hasattr(c, "filter"):
+                c.filter(keep)
+            elif c.keys is not None:
+                c.keys = c.keys[keep]
+                c.values = c.values[keep]
 
     @staticmethod
     def _row_view(c, row: int | None = None):
@@ -483,40 +530,55 @@ class Drafter:
 
     def clone_cache_block(self, cache: list, start: int, pos: int, *,
                           row: int | None = None):
-        """Clone MTP KV deltas needed for trunk prefix ``[start:pos]``.
+        """Clone MTP KV deltas needed for trunk prefix ``[start:pos]``, per layer.
 
         MTP history for a trunk prefix of length ``pos`` contains transitions
         for token positions ``1..pos-1``. A trunk cache block ``[start:pos]``
-        therefore contributes MTP slots ``max(1, start)..pos-1``.
+        therefore contributes MTP slots ``max(1, start)..pos-1``. Returns a
+        per-layer list (one ``[k, v]`` block per draft layer, or ``None`` per
+        layer when the slice is empty) — ``n_layers == 1`` yields the previous
+        single-block layout.
         """
         start = int(start)
         pos = int(pos)
         mtp_start = max(1, start) - 1
         mtp_end = max(0, pos - 1)
         if mtp_end <= mtp_start:
-            return [None]
-        keys, values, length = self._row_view(cache[0], row=row)
-        if mtp_end > length:
-            raise ValueError(
-                f"invalid MTP block slice [{mtp_start}:{mtp_end}] "
-                f"for length={length}"
-            )
-        k = keys[..., mtp_start:mtp_end, :] + 0
-        v = values[..., mtp_start:mtp_end, :] + 0
-        mx.eval(k, v)
-        return [[k, v]]
+            return [None] * len(cache)
+        blocks = []
+        leaves = []
+        for c in cache:
+            keys, values, length = self._row_view(c, row=row)
+            if mtp_end > length:
+                raise ValueError(
+                    f"invalid MTP block slice [{mtp_start}:{mtp_end}] "
+                    f"for length={length}"
+                )
+            k = keys[..., mtp_start:mtp_end, :] + 0
+            v = values[..., mtp_start:mtp_end, :] + 0
+            blocks.append([k, v])
+            leaves.extend([k, v])
+        mx.eval(*leaves)
+        return blocks
 
     def restore_cache_blocks(self, blocks: list) -> list:
+        """Rebuild a per-layer draft cache by concatenating each layer's chunk
+        deltas across the restored blocks. Mirrors the trunk attention restore."""
         cache = self.make_cache()
-        parts = [block[0] for block in blocks if block[0] is not None]
-        if not parts:
-            return cache
-        keys = mx.concatenate([p[0] for p in parts], axis=2) \
-            if len(parts) > 1 else parts[0][0] + 0
-        values = mx.concatenate([p[1] for p in parts], axis=2) \
-            if len(parts) > 1 else parts[0][1] + 0
-        mx.eval(keys, values)
-        cache[0].state = [keys, values]
+        for layer_idx, c in enumerate(cache):
+            parts = [
+                block[layer_idx]
+                for block in blocks
+                if layer_idx < len(block) and block[layer_idx] is not None
+            ]
+            if not parts:
+                continue
+            keys = mx.concatenate([p[0] for p in parts], axis=2) \
+                if len(parts) > 1 else parts[0][0] + 0
+            values = mx.concatenate([p[1] for p in parts], axis=2) \
+                if len(parts) > 1 else parts[0][1] + 0
+            mx.eval(keys, values)
+            c.state = [keys, values]
         return cache
 
     def append_history(self, cache: list, hidden: mx.array, tokens) -> None:
@@ -534,8 +596,8 @@ class Drafter:
         # counter. The native head (Qwen) has no begin_draft and needs the append.
         if hasattr(self.head, "begin_draft"):
             return
-        post = self.head(self.embed(tok), hidden, cache[0])
-        mx.eval(post, *cache[0].state)
+        post = self.head(self.embed(tok), hidden, cache)
+        mx.eval(post, *[s for c in cache for s in c.state])
 
     def draft(self, hidden: mx.array, tokens: mx.array, k: int, cache: list) -> mx.array:
         """Draft k tokens per row (greedy). Returns draft tokens ``[B, k]``.
@@ -555,7 +617,7 @@ class Drafter:
         tok = tokens[:, None]                       # [B, 1]
         drafts = []
         for _ in range(k):
-            post = self.head(self.embed(tok), h, cache[0])   # [B, 1, H]
+            post = self.head(self.embed(tok), h, cache)   # [B, 1, H]
             tok = mx.argmax(self.draft_logits(post)[:, -1, :], axis=-1)[:, None]  # [B, 1]
             drafts.append(tok)
             h = post
