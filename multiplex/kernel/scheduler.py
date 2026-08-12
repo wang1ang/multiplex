@@ -17,6 +17,7 @@ from __future__ import annotations
 
 from collections import deque
 from pathlib import Path
+import os
 import random
 import sys
 import time
@@ -189,9 +190,20 @@ class Scheduler:
                  dynamic_depth_min_samples=8,
                  dynamic_depth_up_threshold=0.80,
                  dynamic_depth_down_threshold=0.50,
-                 dynamic_depth_retry_cooldown=24):
+                 dynamic_depth_retry_cooldown=24,
+                 per_row_commit=None):
         self.eng = engine
         self.dr = drafter
+        # Per-row (ragged) commit bypass: each row commits its OWN accepted depth
+        # instead of the batch min (take-min). Opt-in and reversible so the
+        # default decode path is byte-identical; gated to pure-attention trunks
+        # (SSM / rotating-KV rollback is not per-row and falls back to take-min).
+        # Default from MULTIPLEX_PER_ROW_COMMIT (0/1); explicit arg wins.
+        if per_row_commit is None:
+            self.per_row_commit = os.environ.get("MULTIPLEX_PER_ROW_COMMIT", "0") not in ("0", "", "false", "False")
+        else:
+            self.per_row_commit = bool(per_row_commit)
+        self._per_row_fallback_logged = False
         # No MTP head -> no speculation possible; depth is forced to 0 (AR).
         self.max_k = max(int(k), 0) if drafter is not None else 0
         self.dynamic_depth = bool(dynamic_depth and self.max_k > 1)
@@ -434,9 +446,31 @@ class Scheduler:
                     rows[i].accept_counts[n] += 1
         m = min(accs)
 
+        # Per-row (ragged) commit is only sound where the round can be rolled
+        # back per row: a pure-attention trunk trims its committed KV directly.
+        # Hybrid SSM and rotating-KV trunks roll back by rewind-and-replay of a
+        # single shared prefix, which take-min needs, so fall back there.
+        use_per_row = (
+            self.per_row_commit
+            and k != 0
+            and B > 1
+            and min(accs) != max(accs)
+            and not eng.has_rotating_cache(state)
+            and not (snap is not None and any(s is not None for s in snap))
+        )
+        if self.per_row_commit and not use_per_row and not self._per_row_fallback_logged and B > 1:
+            self._per_row_fallback_logged = True
+            self._log("PER-ROW COMMIT unavailable on this trunk/round; using take-min")
+
+        # Tokens each row commits this round: its own accepted depth (per-row) or
+        # the batch minimum (take-min). Emission, KV, and the draft cache all key
+        # off this so the two paths share one loop.
+        commit_counts = list(accs) if use_per_row else [m] * B
+
         emitted, finished = [], []
         for i in range(B):
-            toks = draft_ids[i][:m] + [int(trunk_pred[i, m])]
+            c = commit_counts[i]
+            toks = draft_ids[i][:c] + [int(trunk_pred[i, c])]
             for j, t in enumerate(toks):
                 if t in eos or len(rows[i].out) + j + 1 >= rows[i].max_tokens:
                     toks = toks[: j + 1]
@@ -445,6 +479,15 @@ class Scheduler:
             rows[i].out.extend(toks)
             self._log_output(rows[i], toks)
             emitted.append((rows[i].rid, toks))
+
+        if use_per_row:
+            state, h, primary = self._commit_per_row(
+                state, vhidden, trunk_pred, draft_ids, accs,
+                lengths_before, dcache_base, k)
+            self.state, self.h, self.primary = state, h, primary
+            self._finish_step(state, h, primary, rows, emitted, finished,
+                              accs, m, k, trunk_logits, trunk_pred, t0)
+            return emitted
 
         primary = trunk_pred[:, m]
         if k != 0:
@@ -489,6 +532,52 @@ class Scheduler:
             eng.trim_attention(state, k - m)
             state.lengths = [n + m + 1 for n in lengths_before]
             h = vhidden[:, m:m + 1, :]
+        self.state, self.h, self.primary = state, h, primary
+        self._finish_step(state, h, primary, rows, emitted, finished,
+                          accs, m, k, trunk_logits, trunk_pred, t0)
+        return emitted
+
+    def _commit_per_row(self, state, vhidden, trunk_pred, draft_ids, accs,
+                        lengths_before, dcache_base, k):
+        """Ragged commit: row i keeps its OWN accepted depth ``accs[i]`` instead
+        of the batch minimum. Decomposes the batch into single-row states (the
+        same primitive ``merge_ready`` uses), trims each row's committed KV to
+        its own length, advances its own draft cache, then re-merges. Only valid
+        for pure-attention trunks (the caller gates SSM / rotating)."""
+        eng, dr = self.eng, self.dr
+        B = len(accs)
+        singles, hs, prims, dcaches = [], [], [], []
+        for i in range(B):
+            a = accs[i]
+            single = eng.extract_row(state, i)          # len = before_i + k + 1
+            eng.trim_attention(single, k - a)           # drop this row's rejected tail
+            single.lengths = [lengths_before[i] + a + 1]
+            singles.append(single)
+            hs.append(vhidden[i:i + 1, a:a + 1, :])     # row i's committed hidden
+            prims.append(trunk_pred[i:i + 1, a])        # row i's bonus token
+            if dr is not None:
+                drow = dr.extract_cache_row(self.dcache, i)
+                dr.trim_cache_to(drow, dcache_base + 1)
+                if a:
+                    dr.append_history(
+                        drow, vhidden[i:i + 1, :a, :],
+                        mx.array([draft_ids[i][:a]], dtype=mx.int32),
+                    )
+                dcaches.append(drow)
+        state = eng.merge_states(singles)
+        h = mx.concatenate(hs, axis=0)
+        primary = mx.concatenate(prims, axis=0)
+        if dr is not None:
+            self.dcache = dr.merge_caches(dcaches)
+        return state, h, primary
+
+    def _finish_step(self, state, h, primary, rows, emitted, finished,
+                     accs, m, k, trunk_logits, trunk_pred, t0):
+        """Shared step tail: telemetry, dynamic-depth observation, session-block
+        capture, and dropping finished rows. Identical for take-min and per-row
+        (``m == min(accs)`` is the acceptance signal fed to the depth controller
+        either way)."""
+        B = len(rows)
         mx.eval(h, primary)
         dt = max(time.perf_counter() - t0, 1e-9)
         emitted_by_rid = {rid: toks for rid, toks in emitted}
@@ -531,8 +620,6 @@ class Scheduler:
             self._log(f"EXIT {exits}")
             self._keep([i for i in range(B) if i not in finished])
             self.prefix_cache.prune_unreferenced()
-
-        return emitted
 
     def _append_prefill_mtp_history(self, group: PrefillGroup, ids: list[int],
                                     start: int, end: int, h) -> None:
