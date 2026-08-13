@@ -739,6 +739,18 @@ class DFlashDrafter:
         return self.make_cache()
 
 
+def find_dflash(model_path: str) -> str | None:
+    """Return the target's DFlash draft sidecar directory, or None.
+
+    Mirrors ``mtp.find_mtp``: a DFlash-enabled target ships its matched draft as
+    a ``dflash/`` subdir (config.json + weights) beside the model, so the draft
+    travels with the model and needs no hardcoded, machine-specific path."""
+    sidecar = os.path.join(os.path.expanduser(model_path), "dflash")
+    if os.path.isdir(sidecar) and os.path.exists(os.path.join(sidecar, "config.json")):
+        return sidecar
+    return None
+
+
 def build_dflash_drafter(engine, draft_dir: str) -> DFlashDrafter:
     """Load a DFlash draft model from ``draft_dir`` and wrap it as a drafter
     bound to ``engine``'s trunk. The caller must also enable the engine's hidden

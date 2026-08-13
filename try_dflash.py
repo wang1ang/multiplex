@@ -2,8 +2,8 @@
 
 No arguments -> interactive chat CLI, like ``try_engine.py`` but on the DFlash
 product path (Engine + build_dflash_drafter + hidden taps + Scheduler). Picks the
-target from ``~/.mtplx/models`` and defaults the draft to
-``~/models/Qwen3.6-27B-DFlash``.
+target from ``~/.mtplx/models`` and auto-discovers the draft from the target's
+``dflash/`` sidecar (see ``find_dflash``).
 
     python try_dflash.py
 
@@ -28,11 +28,9 @@ from pathlib import Path
 from multiplex import registry
 from multiplex.kernel.engine import Engine
 from multiplex.kernel.dflash import (
-    build_dflash_drafter, load, load_draft, stream_generate,
+    build_dflash_drafter, find_dflash, load, load_draft, stream_generate,
 )
 from multiplex.kernel.scheduler import Scheduler, Req, PrefillGroup
-
-DEFAULT_DRAFT = "~/models/Qwen3.6-27B-DFlash"
 
 
 def to_ids(tokenizer, text, raw, think=None):
@@ -87,7 +85,8 @@ def load_prompt_file(path: str) -> str:
 def main_reference(argv) -> int:
     ap = argparse.ArgumentParser(prog="try_dflash.py (reference mode)")
     ap.add_argument("--target", required=True, help="target model dir or HF id")
-    ap.add_argument("--draft", default=DEFAULT_DRAFT, help="DFlash draft dir or HF id")
+    ap.add_argument("--draft", default=None,
+                    help="DFlash draft dir or HF id (default: the target's dflash/ sidecar)")
     ap.add_argument("--prompt", default="Write a quicksort in Python.")
     ap.add_argument("--max-tokens", type=int, default=128)
     ap.add_argument("--temperature", type=float, default=0.0)
@@ -96,7 +95,10 @@ def main_reference(argv) -> int:
 
     t0 = time.perf_counter()
     model, tokenizer = load(args.target)
-    draft = load_draft(os.path.expanduser(args.draft))
+    draft_dir = args.draft or find_dflash(args.target)
+    if draft_dir is None:
+        ap.error(f"no --draft given and target has no dflash/ sidecar: {args.target}")
+    draft = load_draft(os.path.expanduser(draft_dir))
     print(f"[load] target+draft in {time.perf_counter() - t0:.1f}s")
 
     messages = [{"role": "user", "content": args.prompt}]
@@ -141,14 +143,14 @@ def main_interactive() -> int:
     from prompt_toolkit.key_binding import KeyBindings
     from prompt_toolkit.document import Document
 
-    draft_dir = os.path.expanduser(DEFAULT_DRAFT)
-    if not os.path.isdir(draft_dir):
-        print(f"[error] default DFlash draft dir not found: {draft_dir}\n"
-              f"        run with args for reference mode, or place the draft there.",
+    entry = registry.select(None)
+    draft_dir = find_dflash(entry.path)
+    if draft_dir is None:
+        print(f"[error] selected model has no DFlash sidecar: {entry.path}/dflash\n"
+              f"        pick a DFlash-enabled target (one that ships a dflash/ dir), "
+              f"or run with args for reference mode.",
               file=sys.stderr)
         return 1
-
-    entry = registry.select(None)
     eng = Engine(entry.path)
     tokenizer = eng.tokenizer
     drafter = build_dflash_drafter(eng, draft_dir)

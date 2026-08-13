@@ -21,11 +21,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 TARGET = os.environ.get(
     "MULTIPLEX_TEST_DFLASH_TARGET",
-    os.path.expanduser("~/.mtplx/models/Youssofal--Qwen3.6-27B-MTPLX-Optimized-Speed"),
+    os.path.expanduser("~/.mtplx/models/Qwen3.6-27B-Q4-MTPLX-v2-Q2Mix11-L29UpQ4-Q3KO16"),
 )
 DRAFT = os.environ.get(
     "MULTIPLEX_TEST_DFLASH_DRAFT",
-    os.path.expanduser("~/models/Qwen3.6-27B-DFlash"),
+    os.path.join(TARGET, "dflash"),
 )
 HAS_MODELS = (
     os.path.isfile(os.path.join(TARGET, "config.json"))

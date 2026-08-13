@@ -428,6 +428,9 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
           dynamic_depth=True, dflash=None):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
+    if dflash is None:
+        from .kernel.dflash import find_dflash
+        dflash = find_dflash(model_path)   # auto-detect <model>/dflash sidecar
     if dflash is not None:
         if not os.path.isdir(os.path.expanduser(dflash)):
             raise FileNotFoundError(f"--dflash draft dir not found: {dflash}")
