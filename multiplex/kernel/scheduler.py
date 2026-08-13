@@ -426,7 +426,7 @@ class Scheduler:
             # taken for it). Rebuild it row-aligned with self.h so the next
             # draft() sees a matching batch dimension.
             if self.ctx is not None:
-                self.ctx = mx.concatenate(ctxs, axis=0)
+                self.ctx = self.dr.merge_context(ctxs)
         self._reset_dynamic_depth(restart_at_max=False)
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
@@ -759,7 +759,7 @@ class Scheduler:
             self.primary = self.primary[mx.array(keep)]
             self.h = self.h[mx.array(keep)]
             if self.ctx is not None:
-                self.ctx = self.ctx[mx.array(keep)]
+                self.ctx = self.dr.filter_context(self.ctx, keep)
             self.rows = [self.rows[i] for i in keep]
             self._reset_dynamic_depth(restart_at_max=False)
         else:

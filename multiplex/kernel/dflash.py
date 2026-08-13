@@ -635,7 +635,7 @@ class DFlashDrafter:
     wants_taps = True
     supports_dynamic_depth = False   # trained for a fixed block; k is pinned
     supports_prefix_reuse = False
-    supports_batching = False
+    supports_batching = True
 
     def __init__(self, engine, model: DFlashDraftModel):
         self.engine = engine
@@ -652,12 +652,16 @@ class DFlashDrafter:
         return self.block_size - 1
 
     def make_cache(self) -> list:
-        return self.model.make_cache()
+        # The multi-row draft cache is a list with one entry per batch row; each
+        # entry is the draft model's own 5-layer cache. Rows are kept separate
+        # (not fused into BatchKVCache) so each row's draft forward uses the
+        # validated single-sequence attention path, looped in draft().
+        return [self.model.make_cache()]
 
     def cache_size(self, cache) -> int:
-        # Committed ctx length, read off the full-attention layer. Unused by the
+        # Committed ctx length of row 0's full-attention layer. Unused by the
         # DFlash step path (kept for interface parity with MTP).
-        return int(cache[-1].offset)
+        return int(cache[0][-1].offset) if cache else 0
 
     def make_context(self, engine, hidden_full):
         """DFlash conditions on the trunk's TAPPED hiddens for the forward that
@@ -670,21 +674,42 @@ class DFlashDrafter:
         return taps
 
     def update_prefill_context(self, engine, hidden, previous):
+        # Per-row context is a one-element list ``[taps]`` while a single request
+        # prefills; chunks accumulate on the sequence axis.
         taps = self.make_context(engine, hidden)
-        return taps if previous is None else mx.concatenate([previous, taps], axis=1)
+        if previous is None:
+            return [taps]
+        return [mx.concatenate([previous[0], taps], axis=1)]
 
     def update_context_after_commit(self, engine, hidden, accepted):
+        # Return the committed positions' taps PER ROW (ragged across rows is
+        # fine: draft() consumes each row separately).
         taps = self.make_context(engine, hidden)
-        return taps[:, :int(accepted) + 1, :]
+        a = int(accepted) + 1
+        return [taps[i:i + 1, :a, :] for i in range(int(taps.shape[0]))]
+
+    def merge_context(self, ctxs):
+        # Each element is a per-row context list; flatten into one list of rows.
+        return [row for sub in ctxs for row in sub]
+
+    def filter_context(self, ctx, keep):
+        return [ctx[i] for i in keep]
 
     def draft(self, ctx, primary, k, cache) -> mx.array:
         if k == 0:
             return mx.zeros((primary.shape[0], 0), dtype=primary.dtype)
-        B = int(primary.shape[0])
-        masks = mx.full((B, k), self.mask_id, dtype=primary.dtype)
-        block = mx.concatenate([primary[:, None], masks], axis=1)   # [B, 1+k]
-        logits = self.model(block, ctx, cache, logits_start=1)      # [B, k, vocab]
-        return mx.argmax(logits, axis=-1)
+        # Draft each row on its own 5-layer cache (single-sequence path). The
+        # draft model is small; looping B times is cheap next to the batched
+        # trunk verify, and it sidesteps a batched/left-padded rewrite of the
+        # ctx/prop-split attention.
+        outs = []
+        for i in range(len(cache)):
+            prim = primary[i:i + 1]                                   # [1]
+            masks = mx.full((1, k), self.mask_id, dtype=primary.dtype)
+            block = mx.concatenate([prim[:, None], masks], axis=1)    # [1, 1+k]
+            logits = self.model(block, ctx[i], cache[i], logits_start=1)  # [1,k,V]
+            outs.append(mx.argmax(logits, axis=-1))                   # [1, k]
+        return mx.concatenate(outs, axis=0)                          # [B, k]
 
     def commit(self, cache, m, draft_ids, hidden) -> None:
         # No-op: DFlash records committed context inside the NEXT draft() (it
@@ -692,20 +717,15 @@ class DFlashDrafter:
         # the drafted block to its cache, so there is nothing to trim or append.
         pass
 
-    # --- batch lifecycle: single-stream in v1 --------------------------------
+    # --- batch lifecycle: per-row draft caches (list, one entry per row) -----
     def extract_cache_row(self, cache, i):
-        if i != 0:
-            raise NotImplementedError("DFlash is single-stream (B=1) in v1")
-        return cache
+        return [cache[i]]
 
     def merge_caches(self, caches):
-        if len(caches) == 1:
-            return caches[0]
-        raise NotImplementedError("DFlash is single-stream (B=1) in v1")
+        return [row for dc in caches for row in dc]
 
     def filter_cache(self, cache, keep):
-        if list(keep) not in ([0], []):
-            raise NotImplementedError("DFlash is single-stream (B=1) in v1")
+        cache[:] = [cache[i] for i in keep]
 
     # --- prefix cache: reuse of the draft ctx is not supported in v1 ---------
     def clone_cache_block(self, cache, start, pos, *, row=None):

@@ -58,10 +58,12 @@ class DFlashSchedulerTests(unittest.TestCase):
         orig = D.DFlashDrafter.draft
 
         def traced(self, ctx, primary, k, cache):
-            before = int(cache[-1].offset)
-            ctx_len = 0 if ctx is None else int(ctx.shape[1])
+            # cache is a per-row list; each entry is that row's 5-layer draft
+            # cache. This test runs B=1, so inspect row 0's full-attention layer.
+            before = int(cache[0][-1].offset)
+            ctx_len = 0 if ctx is None else int(ctx[0].shape[1])
             out = orig(self, ctx, primary, k, cache)
-            deltas.append((ctx_len, int(cache[-1].offset) - before))
+            deltas.append((ctx_len, int(cache[0][-1].offset) - before))
             return out
 
         D.DFlashDrafter.draft = traced

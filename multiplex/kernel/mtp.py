@@ -492,6 +492,15 @@ class Drafter:
     def update_context_after_commit(self, engine, hidden, accepted):
         return hidden
 
+    def merge_context(self, ctxs):
+        """Combine per-row contexts on join. MTP context is a [rows,1,H] array,
+        so this is a row concatenation (each element is already a row slice)."""
+        return mx.concatenate(ctxs, axis=0)
+
+    def filter_context(self, ctx, keep):
+        """Keep only rows ``keep`` on leave."""
+        return ctx[mx.array(keep)]
+
     @staticmethod
     def trim_cache_to(cache: list, size: int) -> None:
         target = max(0, int(size))
