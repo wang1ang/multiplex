@@ -431,7 +431,7 @@ def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
     if dflash is not None:
         if not os.path.isdir(os.path.expanduser(dflash)):
             raise FileNotFoundError(f"--dflash draft dir not found: {dflash}")
-        print(f"[DFlash drafter: {dflash}  (single-stream)]")
+        print(f"[DFlash drafter: {dflash}]")
         mtp_path = None
     else:
         if mtp_path is None:
@@ -460,7 +460,7 @@ def parse_args(argv=None):
     ap.add_argument("--dflash", default=None,
                     help="DFlash draft-model dir (block-diffusion speculative "
                          "decoding); pairs with a Qwen3.6-27B target. "
-                         "Single-stream in v1. Overrides --mtp.")
+                         "Overrides --mtp.")
     ap.add_argument("-d", "--depth", type=int, default=3,
                     help="maximum dynamic MTP depth (default: 3); fixed with "
                          "--no-dynamic-depth; 0 disables speculation")

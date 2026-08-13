@@ -13,8 +13,8 @@ and print acceptance / throughput stats.
 
     python try_dflash.py --target <dir> --draft <dir> [--prompt ...] [--max-tokens N]
 
-DFlash is single-stream (B=1); in the interactive mode extra prompts queue and are
-admitted once the batch drains. :q or Ctrl-C quits the interactive UI.
+DFlash is batched: prompts typed while a response is running join the live
+decode batch (like ``try_engine.py``). :q or Ctrl-C quits the interactive UI.
 """
 
 import argparse
@@ -154,7 +154,7 @@ def main_interactive() -> int:
     drafter = build_dflash_drafter(eng, draft_dir)
     eng.enable_hidden_taps(drafter.tap_layer_ids)
     print(f"[loaded {entry.name} + DFlash drafter "
-          f"(block={drafter.block_size}, D{drafter.max_draft_len}, single-stream)]")
+          f"(block={drafter.block_size}, D{drafter.max_draft_len})]")
 
     debug_lines = []
 
@@ -172,7 +172,6 @@ def main_interactive() -> int:
 
     prompts = {}
     produced_text = {}
-    waiting = []
     max_tokens = 8192
 
     output_buf = Buffer(read_only=True)
@@ -180,13 +179,10 @@ def main_interactive() -> int:
 
     def render():
         output_lines = [
-            "[Type a prompt + Enter. DFlash is single-stream: extra prompts "
-            "queue. :q quits.]",
+            "[Type a prompt + Enter. Add more while it runs (they join the "
+            "batch). :q quits.]",
             "",
         ]
-        if waiting:
-            output_lines.append(f"(queued: {len(waiting)})")
-            output_lines.append("")
         for rid in sorted(produced_text):
             output_lines.append(f"--- req{rid}: {prompts.get(rid, '')[:50]!r}")
             output_lines.extend(produced_text[rid].split("\n"))
@@ -215,9 +211,9 @@ def main_interactive() -> int:
 
     next_rid = [0]
 
-    def admit(text):
-        """Prefill one request and merge it into the (empty) batch. Only called
-        when no rows are live — DFlash is single-stream."""
+    def add(text):
+        """Prefill one request and merge it into the live batch (concurrent —
+        DFlash batches, so new prompts join a running decode)."""
         rid = next_rid[0]
         next_rid[0] += 1
         prompts[rid] = text
@@ -235,10 +231,6 @@ def main_interactive() -> int:
             produced_text[r] += decode(tokenizer, [first])
         render()
 
-    def submit(text):
-        waiting.append(text)
-        render()
-
     kb = KeyBindings()
 
     @kb.add("enter")
@@ -248,7 +240,7 @@ def main_interactive() -> int:
         if text == ":q":
             event.app.exit()
         elif text:
-            submit(text)
+            add(text)
 
     @kb.add("c-c")
     def _(event):
@@ -266,9 +258,6 @@ def main_interactive() -> int:
                     produced_text[rid] = produced_text.get(rid, "") + decode(tokenizer, toks)
                 render()
                 app.invalidate()
-            elif waiting:
-                admit(waiting.pop(0))
-                app.invalidate()
             await asyncio.sleep(0.001)
 
     async def run_app():
@@ -280,12 +269,6 @@ def main_interactive() -> int:
 
     asyncio.run(run_app())
     return 0
-
-
-args_max_tokens = 8192   # interactive default (kept simple; reference mode has --max-tokens)
-
-
-args_max_tokens = 8192   # interactive default (kept simple; reference mode has --max-tokens)
 
 
 def main() -> int:

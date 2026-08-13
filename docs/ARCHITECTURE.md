@@ -12,7 +12,7 @@ L1  kernel/engine.py        batched forward, logits, cache clone/filter/restore,
 ```
 
 L2 is the **speculation layer**: L3 talks to a generic drafter contract
-(`make_cache` / `cache_size` / `draft` / `make_context` / … — see
+(`make_cache` / `draft` / `commit` / `update_prefill_context` / … — see
 `docs/DRAFTER_INTERFACE.md`), and MTP is one implementation, DFlash another. L3
 stays the KV-cache manager for both the trunk and the draft cache — it speaks
 shape-agnostic verbs, not MTP-specific ones. A model with no head/drafter runs
@@ -37,9 +37,8 @@ Each layer owns one job; the lines between them are what keep the kernel boring.
   what L4 streams and never touches tokens, caches, or scheduling.
 - **L4 `hub.py`** — the funnel. Many HTTP threads submit here; one engine thread
   runs the model (MLX's GPU stream is thread-bound). Owns chat-template
-  rendering, tokenization, the `<think>` split, request admission (incl. keeping
-  a non-batchable drafter single-stream), and picks the drafter implementation.
-  It does not decode or manage caches.
+  rendering, tokenization, the `<think>` split, request admission, and picks the
+  drafter implementation. It does not decode or manage caches.
 - **L3 `scheduler.py`** — the batch + **KV-cache manager**. Owns prefill,
   merge/join, the speculative decode step (verify / accept-longest-prefix /
   take-min), cancellation, and the prefix cache. See the cache rule below.
@@ -66,11 +65,13 @@ lifecycle as intent, not mechanism. MTP writes speculative tokens into its draft
 cache, so after a verify L3 trims the rejected tail (`trim_to`). **DFlash writes
 only committed context into its cache (the drafted block never enters it), so the
 trim is a no-op and nothing is rolled back** — DFlash still HAS a cache (5 layers)
-and still needs it; it just never accumulates anything to undo. (DFlash v1 is
-also single-stream, so merge/filter aren't exercised yet either.)
+and still needs it; it just never accumulates anything to undo. Its cache is
+per-row (one 5-layer cache per batch row), so merge/filter are exercised under
+B>1 batching.
 
 Because L3 speaks these as **shape-agnostic verbs**
-(`make_cache` / `cache_size` / `trim_to` / `extract_row` / `merge` / `filter` /
+(`make_cache` / `draft` / `commit` / `merge_context` / `extract_row` / `merge` /
+`filter` /
 `snapshot`), never MTP-specific ones (no `dcache[0]`, no “base+1”), one manager
 drives both MTP's single-layer cache and DFlash's five. Only the draft
 *algorithm* and the *model-compute* that grows the cache live in L2. See

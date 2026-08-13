@@ -475,17 +475,6 @@ class Drafter:
     def make_cache(self) -> list:
         return [KVCache() for _ in range(self.n_layers)]
 
-    def cache_size(self, cache) -> int:
-        """Committed length of the draft cache — the generic verb the scheduler
-        uses instead of poking ``cache[0]`` directly (all layers share it)."""
-        return int(cache[0].size())
-
-    def make_context(self, engine, hidden_full):
-        """Draft context for a forward whose FINAL hidden is ``hidden_full``. MTP
-        drafts from the final hidden, so the context IS that hidden (identity);
-        DFlash overrides this to return the trunk's tapped hiddens."""
-        return hidden_full
-
     def update_prefill_context(self, engine, hidden, previous):
         return hidden[:, -1:, :]
 

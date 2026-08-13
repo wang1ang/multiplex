@@ -1,10 +1,12 @@
-"""L2 - DFlash block-diffusion speculative decoding (single-sequence).
+"""L2 - DFlash block-diffusion speculative decoding.
 
-Vendored from the official DFlash MLX reference
+The vendored reference (``DFlashDraftModel`` + ``stream_generate``) is a faithful
+copy of the official DFlash MLX code
 (z-lab/dflash `dflash/model_mlx.py`, MIT License, Copyright (c) 2026 Z Lab),
-kept faithful so behaviour matches the reference bit-for-bit. Local edits are
-limited to: this header, and ``load_draft`` accepting a local directory in
-addition to a Hugging Face repo id.
+kept bit-for-bit; its ``stream_generate`` loop is single-sequence. Below it,
+``DFlashDrafter`` adapts the model to multiplex's batched scheduler (B>1). Local
+edits to the vendored part are limited to this header and ``load_draft``
+accepting a local directory in addition to a Hugging Face repo id.
 
 DFlash drafts a whole block in ONE parallel forward (mask tokens), not the
 AR-chained single-token drafting used by ``kernel/mtp.py``'s ``Drafter``. Its
@@ -627,9 +629,12 @@ class DFlashDrafter:
     committed-history append, so the scheduler needs no separate append/trim on
     the commit path.
 
-    v1 scope: single-stream (B=1). Batched decode across rows over 5 caches
-    (incl. rotating windows) and prefix-cache reuse of the draft ctx are not yet
-    implemented and are advertised off; the Hub keeps DFlash single-stream.
+    Batched decode (B>1) is supported: each row keeps its own 5-layer draft
+    cache and its own context (a per-row list), and ``draft()`` loops the draft
+    model over rows. This reuses the validated single-sequence attention and
+    sidesteps a batched/left-padded rewrite; the per-row draft forwards are not
+    yet parallelized (see docs/DFLASH.md). Prefix-cache reuse of the draft ctx
+    is not supported (``supports_prefix_reuse=False``).
     """
 
     wants_taps = True
@@ -658,14 +663,9 @@ class DFlashDrafter:
         # validated single-sequence attention path, looped in draft().
         return [self.model.make_cache()]
 
-    def cache_size(self, cache) -> int:
-        # Committed ctx length of row 0's full-attention layer. Unused by the
-        # DFlash step path (kept for interface parity with MTP).
-        return int(cache[0][-1].offset) if cache else 0
-
-    def make_context(self, engine, hidden_full):
-        """DFlash conditions on the trunk's TAPPED hiddens for the forward that
-        produced ``hidden_full`` (the engine stashed them)."""
+    def _taps(self, engine):
+        """The trunk's tapped hiddens from the latest forward (the engine stashed
+        them); DFlash conditions the draft on these."""
         taps = engine.last_hidden_taps
         if taps is None:
             raise RuntimeError(
@@ -676,7 +676,7 @@ class DFlashDrafter:
     def update_prefill_context(self, engine, hidden, previous):
         # Per-row context is a one-element list ``[taps]`` while a single request
         # prefills; chunks accumulate on the sequence axis.
-        taps = self.make_context(engine, hidden)
+        taps = self._taps(engine)
         if previous is None:
             return [taps]
         return [mx.concatenate([previous[0], taps], axis=1)]
@@ -684,7 +684,7 @@ class DFlashDrafter:
     def update_context_after_commit(self, engine, hidden, accepted):
         # Return the committed positions' taps PER ROW (ragged across rows is
         # fine: draft() consumes each row separately).
-        taps = self.make_context(engine, hidden)
+        taps = self._taps(engine)
         accepts = ([int(accepted)] * int(taps.shape[0])
                    if isinstance(accepted, int) else accepted)
         return [
