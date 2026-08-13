@@ -34,11 +34,14 @@ from multiplex.kernel.mtp import find_drafter
 from multiplex.kernel.scheduler import Scheduler, Req, PrefillGroup
 
 
-def to_ids(tokenizer, text, raw):
+def to_ids(tokenizer, text, raw, think=None):
     if raw:
         return tokenizer.encode(text)
+    kwargs = {}
+    if think is not None:
+        kwargs["enable_thinking"] = think
     return tokenizer.apply_chat_template(
-        [{"role": "user", "content": text}], add_generation_prompt=True
+        [{"role": "user", "content": text}], add_generation_prompt=True, **kwargs
     )
 
 
@@ -98,6 +101,9 @@ def parse_args(argv=None):
     )
     ap.add_argument("--debug", action=argparse.BooleanOptionalAction, default=True,
                     help="show scheduler debug log in the log pane")
+    ap.add_argument("--think", action=argparse.BooleanOptionalAction, default=None,
+                    help="toggle chat-template thinking mode (enable_thinking); "
+                         "default: leave to the template")
     initial = ap.add_mutually_exclusive_group()
     initial.add_argument("--prompt", help="submit this prompt when the UI starts")
     initial.add_argument(
@@ -183,7 +189,7 @@ def main() -> int:
         # Prefill the new request and merge it into the live batch. The
         # merge returns each joined request's FIRST token — show it now (it is
         # not part of the next step()'s output).
-        group = PrefillGroup(req=Req(rid, to_ids(tokenizer, text, args.raw), args.max_tokens))
+        group = PrefillGroup(req=Req(rid, to_ids(tokenizer, text, args.raw, args.think), args.max_tokens))
         while True:
             done = sch.prefill_chunk(group)
             if done is None:
