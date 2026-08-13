@@ -33,6 +33,27 @@ HAS_MODELS = (
 )
 
 
+class _FakeEngine:
+    def __init__(self, taps):
+        self.last_hidden_taps = taps
+
+
+class DFlashContextTests(unittest.TestCase):
+    def test_ragged_commit_keeps_each_rows_context_length(self):
+        import mlx.core as mx
+        from multiplex.kernel.dflash import DFlashDrafter
+
+        drafter = DFlashDrafter.__new__(DFlashDrafter)
+        taps = mx.arange(2 * 6 * 3, dtype=mx.float32).reshape(2, 6, 3)
+        ctx = drafter.update_context_after_commit(
+            _FakeEngine(taps), None, [5, 1]
+        )
+
+        self.assertEqual([tuple(x.shape) for x in ctx], [(1, 6, 3), (1, 2, 3)])
+        self.assertTrue(mx.all(ctx[0] == taps[0:1, :6, :]).item())
+        self.assertTrue(mx.all(ctx[1] == taps[1:2, :2, :]).item())
+
+
 @unittest.skipUnless(HAS_MODELS, f"DFlash target/draft not found ({TARGET}; {DRAFT})")
 class DFlashSchedulerTests(unittest.TestCase):
     def test_end_to_end_generates(self):
