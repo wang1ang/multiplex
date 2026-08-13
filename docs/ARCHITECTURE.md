@@ -12,8 +12,8 @@ L1  kernel/engine.py        batched forward, logits, cache clone/filter/restore,
 ```
 
 L2 is the **speculation layer**: L3 talks to a generic drafter contract
-(`make_cache` / `draft` / `commit` / `update_prefill_context` / … — see
-`docs/DRAFTER_INTERFACE.md`), and MTP is one implementation, DFlash another. L3
+(`make_cache` / `draft` / `commit` / `update_prefill_context` / …), and MTP is
+one implementation, DFlash another. L3
 stays the KV-cache manager for both the trunk and the draft cache — it speaks
 shape-agnostic verbs, not MTP-specific ones. A model with no head/drafter runs
 pure AR.
@@ -74,5 +74,5 @@ Because L3 speaks these as **shape-agnostic verbs**
 `filter` /
 `snapshot`), never MTP-specific ones (no `dcache[0]`, no “base+1”), one manager
 drives both MTP's single-layer cache and DFlash's five. Only the draft
-*algorithm* and the *model-compute* that grows the cache live in L2. See
-`docs/DRAFTER_INTERFACE.md` for the full contract and migration map.
+*algorithm* and the *model-compute* that grows the cache live in L2 (see the
+drafter implementations in `kernel/mtp.py` and `kernel/dflash.py`).

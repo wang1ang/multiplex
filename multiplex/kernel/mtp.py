@@ -464,7 +464,7 @@ class Drafter:
         # reuse the trunk's (engine.logits). Predicate: head advertises .logits.
         self.draft_logits = getattr(head, "logits", None) or engine.logits
 
-    # --- generic drafter capabilities (see docs/DRAFTER_INTERFACE.md) -------
+    # --- generic drafter capabilities (see docs/ARCHITECTURE.md) -------
     # MTP is the AR-chained, final-hidden implementation of the drafter contract.
     wants_taps = False            # reads the trunk's FINAL hidden, not taps
     tap_layer_ids = None

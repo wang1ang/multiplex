@@ -609,7 +609,7 @@ def stream_generate(
 
 # ---------------------------------------------------------------------------
 # multiplex integration: DFlash as a drafter behind the generic contract
-# (see docs/DRAFTER_INTERFACE.md). This is NOT part of the vendored reference.
+# (see docs/ARCHITECTURE.md). This is NOT part of the vendored reference.
 # ---------------------------------------------------------------------------
 
 
