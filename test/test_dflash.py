@@ -1,4 +1,4 @@
-"""DFlash speculative-decoding integration tests (single-stream, v1).
+"""DFlash speculative-decoding integration tests.
 
 Exercises the DFlash product path through the real scheduler:
   * end-to-end generation via the Hub produces coherent tokens;
