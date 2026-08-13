@@ -685,8 +685,12 @@ class DFlashDrafter:
         # Return the committed positions' taps PER ROW (ragged across rows is
         # fine: draft() consumes each row separately).
         taps = self.make_context(engine, hidden)
-        a = int(accepted) + 1
-        return [taps[i:i + 1, :a, :] for i in range(int(taps.shape[0]))]
+        accepts = ([int(accepted)] * int(taps.shape[0])
+                   if isinstance(accepted, int) else accepted)
+        return [
+            taps[i:i + 1, :int(a) + 1, :]
+            for i, a in enumerate(accepts)
+        ]
 
     def merge_context(self, ctxs):
         # Each element is a per-row context list; flatten into one list of rows.

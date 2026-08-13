@@ -518,7 +518,7 @@ class Scheduler:
                 state, vhidden, trunk_pred, draft_ids, accs,
                 lengths_before, k)
             self.state, self.h, self.primary = state, h, primary
-            self.ctx = dr.update_context_after_commit(eng, h, m)
+            self.ctx = dr.update_context_after_commit(eng, h, accs)
             self._finish_step(state, h, primary, rows, emitted, finished,
                               accs, m, k, trunk_logits, trunk_pred, t0)
             return emitted
