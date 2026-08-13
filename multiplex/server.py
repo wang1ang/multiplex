@@ -425,18 +425,24 @@ def make_handler(backend: Hub):
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
           debug=False, prefix_cache_dir="auto", prefix_cache="4GiB", depth=3,
-          dynamic_depth=True):
+          dynamic_depth=True, dflash=None):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
-    if mtp_path is None:
-        mtp_path = find_mtp(model_path)
-    elif not os.path.exists(mtp_path):
+    if dflash is not None:
+        if not os.path.isdir(os.path.expanduser(dflash)):
+            raise FileNotFoundError(f"--dflash draft dir not found: {dflash}")
+        print(f"[DFlash drafter: {dflash}  (single-stream)]")
         mtp_path = None
-    print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
+    else:
+        if mtp_path is None:
+            mtp_path = find_mtp(model_path)
+        elif not os.path.exists(mtp_path):
+            mtp_path = None
+        print(f"[{'MTP head: ' + mtp_path if mtp_path else 'headless (pure AR)'}]")
     backend = Hub(model_path, mtp_path, k=depth, debug=debug,
                   dynamic_depth=dynamic_depth,
                   prefix_cache_dir=prefix_cache_dir,
-                  prefix_cache=prefix_cache)
+                  prefix_cache=prefix_cache, dflash_path=dflash)
     httpd = ThreadingHTTPServer((host, port), make_handler(backend))
     print(f"[serving {backend.model_id} on http://{host}:{port}  "
           f"(/v1/chat/completions, /v1/responses, /v1/models)]")
@@ -451,6 +457,10 @@ def parse_args(argv=None):
                     help="model path or name; default: scan ~/.mtplx/models")
     # Default: derive <model>/mtp.safetensors (present -> speculate, absent -> AR).
     ap.add_argument("--mtp", default=None)
+    ap.add_argument("--dflash", default=None,
+                    help="DFlash draft-model dir (block-diffusion speculative "
+                         "decoding); pairs with a Qwen3.6-27B target. "
+                         "Single-stream in v1. Overrides --mtp.")
     ap.add_argument("-d", "--depth", type=int, default=3,
                     help="maximum dynamic MTP depth (default: 3); fixed with "
                          "--no-dynamic-depth; 0 disables speculation")
@@ -490,7 +500,7 @@ def main():
     serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug,
           prefix_cache_dir=args.prefix_cache_dir,
           prefix_cache=args.prefix_cache, depth=max(args.depth, 0),
-          dynamic_depth=args.dynamic_depth)
+          dynamic_depth=args.dynamic_depth, dflash=args.dflash)
 
 
 if __name__ == "__main__":

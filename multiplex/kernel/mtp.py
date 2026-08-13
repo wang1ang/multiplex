@@ -464,8 +464,27 @@ class Drafter:
         # reuse the trunk's (engine.logits). Predicate: head advertises .logits.
         self.draft_logits = getattr(head, "logits", None) or engine.logits
 
+    # --- generic drafter capabilities (see docs/DRAFTER_INTERFACE.md) -------
+    # MTP is the AR-chained, final-hidden implementation of the drafter contract.
+    wants_taps = False            # reads the trunk's FINAL hidden, not taps
+    tap_layer_ids = None
+    supports_dynamic_depth = True
+    supports_prefix_reuse = True
+    supports_batching = True
+
     def make_cache(self) -> list:
         return [KVCache() for _ in range(self.n_layers)]
+
+    def cache_size(self, cache) -> int:
+        """Committed length of the draft cache — the generic verb the scheduler
+        uses instead of poking ``cache[0]`` directly (all layers share it)."""
+        return int(cache[0].size())
+
+    def make_context(self, engine, hidden_full):
+        """Draft context for a forward whose FINAL hidden is ``hidden_full``. MTP
+        drafts from the final hidden, so the context IS that hidden (identity);
+        DFlash overrides this to return the trunk's tapped hiddens."""
+        return hidden_full
 
     @staticmethod
     def trim_cache_to(cache: list, size: int) -> None:

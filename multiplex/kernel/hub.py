@@ -116,13 +116,14 @@ class RequestManager:
 class Hub:
     def __init__(self, model_path, mtp_path, *, k=3, chunk=512, debug=False,
                  prefix_cache_dir="auto", prefix_cache="4GiB",
-                 dynamic_depth=True):
+                 dynamic_depth=True, dflash_path=None):
         self.model_id = model_path.rstrip("/").split("/")[-1]
         self._cfg = dict(model_path=model_path, mtp_path=mtp_path,
                          k=k, chunk=chunk, debug=debug,
                          prefix_cache_dir=prefix_cache_dir,
                          prefix_cache=prefix_cache,
-                         dynamic_depth=dynamic_depth)
+                         dynamic_depth=dynamic_depth,
+                         dflash_path=dflash_path)
         self._default_enable_thinking = self._load_default_enable_thinking(model_path)
         self._request_log_dir = Path("logs") / "requests"
         # The model must be loaded AND used on the same thread (MLX's GPU stream
@@ -297,7 +298,16 @@ class Hub:
         # Build the architecture-specific head before wrapping it in the
         # model-agnostic Drafter.  The configured path may be an explicit
         # --mtp override; without one, find_drafter also handles pair bundles.
-        self.drafter = find_drafter(self.eng, c["mtp_path"])
+        self.drafter = None
+        if c.get("dflash_path"):
+            from .dflash import build_dflash_drafter
+            self.drafter = build_dflash_drafter(self.eng, c["dflash_path"])
+            self.eng.enable_hidden_taps(self.drafter.tap_layer_ids)
+            # v1: the DFlash draft context is rebuilt per session, not stored in
+            # the prefix cache, so disable prefix reuse to avoid stale ctx.
+            c["prefix_cache"] = 0
+        else:
+            self.drafter = find_drafter(self.eng, c["mtp_path"])
         self._sched = Scheduler(self.eng, self.drafter,
                                 eos_token_ids=self.tokenizer.eos_token_ids,
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"],
@@ -327,7 +337,15 @@ class Hub:
                     self._requests.finish(rid, notify=False)
             waiting.extend(pending)
 
-            if prefill_group is None and waiting:
+            # A drafter that can't batch (DFlash v1) serves one stream at a
+            # time: don't admit a new prefill while rows are live; the request
+            # waits in the queue until the live batch drains.
+            can_admit = (
+                self.drafter is None
+                or getattr(self.drafter, "supports_batching", True)
+                or not sched.has_rows()
+            )
+            if prefill_group is None and waiting and can_admit:
                 prefill_group = PrefillGroup(req=waiting.pop(0))
 
             if prefill_group is not None:

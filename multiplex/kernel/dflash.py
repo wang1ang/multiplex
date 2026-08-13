@@ -603,3 +603,106 @@ def stream_generate(
     finally:
         if _capture is not None:
             _capture.close()
+
+
+# ---------------------------------------------------------------------------
+# multiplex integration: DFlash as a drafter behind the generic contract
+# (see docs/DRAFTER_INTERFACE.md). This is NOT part of the vendored reference.
+# ---------------------------------------------------------------------------
+
+
+class DFlashDrafter:
+    """DFlash block-diffusion drafter behind multiplex's generic drafter contract.
+
+    Unlike MTP (AR-chained, drafts one token at a time from the trunk's FINAL
+    hidden, single-layer draft cache), DFlash drafts a whole block in ONE
+    parallel forward, conditioned on the trunk's TAPPED hidden states
+    (``config.target_layer_ids``), with its own multi-layer KV cache. It reads
+    the taps from the engine (``engine.last_hidden_taps``, populated when
+    ``engine.enable_hidden_taps`` is on), not the final hidden.
+
+    ``draft(ctx, primary, k, cache)`` feeds ``ctx`` (the taps of the positions
+    committed since the last draft — the whole prompt for the first draft) as the
+    draft model's cross-attention context; recording it there IS DFlash's
+    committed-history append, so the scheduler needs no separate append/trim on
+    the commit path.
+
+    v1 scope: single-stream (B=1). Batched decode across rows over 5 caches
+    (incl. rotating windows) and prefix-cache reuse of the draft ctx are not yet
+    implemented and are advertised off; the Hub keeps DFlash single-stream.
+    """
+
+    wants_taps = True
+    supports_dynamic_depth = False   # trained for a fixed block; k is pinned
+    supports_prefix_reuse = False
+    supports_batching = False
+
+    def __init__(self, engine, model: DFlashDraftModel):
+        self.engine = engine
+        self.model = model
+        model.bind(engine.model)
+        self.tap_layer_ids = tuple(int(i) for i in model.config.target_layer_ids)
+        self.block_size = int(model.config.block_size)
+        self.mask_id = int(model.config.mask_token_id)
+
+    @property
+    def max_draft_len(self) -> int:
+        # A block is ``[committed_token, mask*(block_size-1)]``; the masked tail
+        # is what gets drafted, so the draft depth is block_size - 1.
+        return self.block_size - 1
+
+    def make_cache(self) -> list:
+        return self.model.make_cache()
+
+    def cache_size(self, cache) -> int:
+        # Committed ctx length, read off the full-attention layer. Unused by the
+        # DFlash step path (kept for interface parity with MTP).
+        return int(cache[-1].offset)
+
+    def make_context(self, engine, hidden_full):
+        """DFlash conditions on the trunk's TAPPED hiddens for the forward that
+        produced ``hidden_full`` (the engine stashed them)."""
+        taps = engine.last_hidden_taps
+        if taps is None:
+            raise RuntimeError(
+                "DFlash drafter needs engine hidden taps; call "
+                "engine.enable_hidden_taps(tap_layer_ids) before serving.")
+        return taps
+
+    def draft(self, ctx, primary, k, cache) -> mx.array:
+        if k == 0:
+            return mx.zeros((primary.shape[0], 0), dtype=primary.dtype)
+        B = int(primary.shape[0])
+        masks = mx.full((B, k), self.mask_id, dtype=primary.dtype)
+        block = mx.concatenate([primary[:, None], masks], axis=1)   # [B, 1+k]
+        logits = self.model(block, ctx, cache, logits_start=1)      # [B, k, vocab]
+        return mx.argmax(logits, axis=-1)
+
+    # --- batch lifecycle: single-stream in v1 --------------------------------
+    def extract_cache_row(self, cache, i):
+        if i != 0:
+            raise NotImplementedError("DFlash is single-stream (B=1) in v1")
+        return cache
+
+    def merge_caches(self, caches):
+        if len(caches) == 1:
+            return caches[0]
+        raise NotImplementedError("DFlash is single-stream (B=1) in v1")
+
+    def filter_cache(self, cache, keep):
+        if list(keep) not in ([0], []):
+            raise NotImplementedError("DFlash is single-stream (B=1) in v1")
+
+    # --- prefix cache: reuse of the draft ctx is not supported in v1 ---------
+    def clone_cache_block(self, cache, start, pos, *, row=None):
+        return [None]
+
+    def restore_cache_blocks(self, blocks):
+        return self.make_cache()
+
+
+def build_dflash_drafter(engine, draft_dir: str) -> DFlashDrafter:
+    """Load a DFlash draft model from ``draft_dir`` and wrap it as a drafter
+    bound to ``engine``'s trunk. The caller must also enable the engine's hidden
+    taps for ``drafter.tap_layer_ids``."""
+    return DFlashDrafter(engine, load_draft(draft_dir))

@@ -128,6 +128,26 @@ class BatchState:
         return len(self.lengths)
 
 
+class _TapLayer:
+    """Transparent proxy around a trunk decoder layer that records its output
+    into a shared store slot. Delegates everything else to the real layer, so
+    the model's forward is unchanged except that the layer's output is observed.
+    Used only when ``Engine.enable_hidden_taps`` is on."""
+
+    def __init__(self, layer, slot: int, store: list):
+        self._layer = layer
+        self._slot = slot
+        self._store = store
+
+    def __call__(self, *args, **kwargs):
+        out = self._layer(*args, **kwargs)
+        self._store[self._slot] = out[0] if isinstance(out, tuple) else out
+        return out
+
+    def __getattr__(self, name):
+        return getattr(self._layer, name)
+
+
 class Engine:
     """Loads a model. Runs correct batched forwards. Nothing else."""
 
@@ -159,6 +179,38 @@ class Engine:
         # shared-KV) borrows the trunk's live K/V from here at draft time; the
         # native-head path never reads it.
         self.last_trunk_cache = None
+        # Optional intermediate-hidden taps (DFlash conditions on the trunk's
+        # hidden states at specific layer ids). Default OFF: no wrapping, and
+        # ``last_hidden_taps`` stays None, so the MTP/AR paths are unaffected.
+        # When enabled, every forward/prefill sets ``last_hidden_taps`` to the
+        # tapped layers' outputs concatenated on the feature axis: ``[B,L,ΣH]``.
+        self._hidden_tap_ids = None
+        self._hidden_tap_store = None
+        self.last_hidden_taps = None
+
+    def enable_hidden_taps(self, layer_ids) -> None:
+        """Capture the outputs of trunk decoder layers ``layer_ids`` on every
+        forward, exposing them (concatenated on the last axis) as
+        ``self.last_hidden_taps``. Wraps the layer objects in a lightweight
+        capturing proxy — the same mechanism the DFlash reference uses, but
+        instance-scoped rather than a global monkey-patch. Idempotent."""
+        if self._hidden_tap_ids is not None:
+            return
+        layers = self.model.language_model.model.layers
+        ids = [int(i) for i in layer_ids]
+        store: list = [None] * len(ids)
+        for slot, lid in enumerate(ids):
+            layers[lid] = _TapLayer(layers[lid], slot, store)
+        self._hidden_tap_ids = ids
+        self._hidden_tap_store = store
+
+    def _collect_taps(self):
+        """Concatenate the current forward's tapped hidden states, or None if
+        taps are disabled / not all fired (never expected on a normal pass)."""
+        store = self._hidden_tap_store
+        if store is None or any(p is None for p in store):
+            return None
+        return mx.concatenate(list(store), axis=-1)
 
     def logits(self, hidden: mx.array) -> mx.array:
         """Trunk head over hidden -> logits ``[..., vocab]``. Mirrors mlx-lm's
@@ -180,6 +232,7 @@ class Engine:
         mx.eval(h, *(c.state for c in state.cache))
         state.lengths[0] += len(ids)
         self.last_trunk_cache = state.cache
+        self.last_hidden_taps = self._collect_taps()
         return h
 
     def prefill_embeds(self, state: BatchState, embeds: mx.array) -> mx.array:
@@ -193,6 +246,7 @@ class Engine:
         mx.eval(h, *(c.state for c in state.cache))
         state.lengths[0] += int(embeds.shape[1])
         self.last_trunk_cache = state.cache
+        self.last_hidden_taps = self._collect_taps()
         return h
 
     def forward(self, state: BatchState, tokens: mx.array) -> mx.array:
@@ -205,6 +259,7 @@ class Engine:
         h = self.model.language_model.model(tokens, cache=state.cache)
         state.lengths = [n + k for n in state.lengths]
         self.last_trunk_cache = state.cache
+        self.last_hidden_taps = self._collect_taps()
         return h
 
     def snapshot_ssm(self, state: BatchState) -> list:
