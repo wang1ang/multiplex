@@ -54,6 +54,51 @@ class DFlashContextTests(unittest.TestCase):
         self.assertTrue(mx.all(ctx[1] == taps[1:2, :2, :]).item())
 
 
+class _FakeDrafter:
+    """Minimal fixed-block drafter: pins its draft width but opts into adaptive
+    trunk-verify (like DFlash)."""
+    supports_dynamic_depth = False
+    supports_adaptive_verify = True
+    max_draft_len = 15
+
+    def make_cache(self):
+        return []
+
+
+class DFlashAdaptiveVerifyWiringTests(unittest.TestCase):
+    def _sched(self, drafter, **kw):
+        from multiplex.kernel.scheduler import Scheduler
+        return Scheduler(_FakeEngine(None), drafter, eos_token_ids=[0],
+                         k=15, prefix_cache="0", **kw)
+
+    def test_controller_built_for_adaptive_verify_even_with_dynamic_off(self):
+        sch = self._sched(_FakeDrafter(), dynamic_depth=False)
+        self.assertTrue(sch.adaptive_verify)
+        self.assertIsNotNone(sch.depth_controller)
+        # Draft width stays pinned at the fixed block; verify starts at the max.
+        self.assertEqual(sch.max_k, 15)
+        self.assertEqual(sch.k, 15)
+
+    def test_verify_width_narrows_on_low_acceptance(self):
+        sch = self._sched(_FakeDrafter(), dynamic_depth=False)
+        # Feed the controller a run of full-depth misses; verify width steps
+        # down while max_k (the draft width) is untouched.
+        for _ in range(16):
+            sch.k = sch.depth_controller.observe(0).current
+        self.assertLess(sch.k, sch.max_k)
+        self.assertEqual(sch.max_k, 15)
+
+    def test_plain_drafter_keeps_verify_equal_to_draft(self):
+        class _Plain:
+            supports_dynamic_depth = True
+            supports_adaptive_verify = False
+            max_draft_len = 3
+            def make_cache(self):
+                return []
+        sch = self._sched(_Plain(), dynamic_depth=True)
+        self.assertFalse(sch.adaptive_verify)
+
+
 @unittest.skipUnless(HAS_MODELS, f"DFlash target/draft not found ({TARGET}; {DRAFT})")
 class DFlashSchedulerTests(unittest.TestCase):
     def test_end_to_end_generates(self):

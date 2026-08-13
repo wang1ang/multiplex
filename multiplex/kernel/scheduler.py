@@ -207,11 +207,25 @@ class Scheduler:
         self._per_row_fallback_logged = False
         # No MTP head -> no speculation possible; depth is forced to 0 (AR).
         self.max_k = max(int(k), 0) if drafter is not None else 0
+        supports_dyn = (
+            getattr(drafter, "supports_dynamic_depth", True)
+            if drafter is not None else True
+        )
         # A drafter trained for a fixed block (DFlash) pins its own draft depth
         # and cannot adapt it; honour that over --depth/dynamic-depth.
-        if drafter is not None and not getattr(drafter, "supports_dynamic_depth", True):
+        if drafter is not None and not supports_dyn:
             self.max_k = int(getattr(drafter, "max_draft_len", self.max_k))
             dynamic_depth = False
+        # Adaptive-verify: the draft width stays pinned at the fixed block, but
+        # the depth controller picks a (smaller) trunk-verify width. Build the
+        # controller for such a drafter even though dynamic depth is off, so we
+        # stop verifying the full block in low-acceptance regions.
+        self.adaptive_verify = bool(
+            drafter is not None
+            and not supports_dyn
+            and getattr(drafter, "supports_adaptive_verify", False)
+            and self.max_k > 1
+        )
         self.dynamic_depth = bool(dynamic_depth and self.max_k > 1)
         self.depth_controller = (
             DynamicDepthController(
@@ -222,7 +236,7 @@ class Scheduler:
                 down_threshold=dynamic_depth_down_threshold,
                 retry_cooldown=dynamic_depth_retry_cooldown,
             )
-            if self.dynamic_depth
+            if (self.dynamic_depth or self.adaptive_verify)
             else None
         )
         self.k = (
@@ -444,8 +458,12 @@ class Scheduler:
         if k == 0:                                  # no head -> no draft
             draft_ids = [[] for _ in range(B)]
         else:
-            drafts = dr.draft(self.ctx, primary, k, self.dcache)
-            draft_ids = [[int(x) for x in drafts[i]] for i in range(B)]
+            # Adaptive-verify drafters (DFlash) always draft the full fixed-width
+            # block they were trained on, then we VERIFY only a k-long prefix of
+            # it. For every other drafter the draft width already IS k.
+            draft_k = self.max_k if self.adaptive_verify else k
+            drafts = dr.draft(self.ctx, primary, draft_k, self.dcache)
+            draft_ids = [[int(x) for x in drafts[i]][:k] for i in range(B)]
 
         snap = eng.snapshot_ssm(state) if k else None
         lengths_before = list(state.lengths)

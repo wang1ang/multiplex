@@ -469,6 +469,10 @@ class Drafter:
     wants_taps = False            # reads the trunk's FINAL hidden, not taps
     tap_layer_ids = None
     supports_dynamic_depth = True
+    # Adaptive-verify: draft a fixed-width block but let the scheduler verify
+    # only a (smaller) prefix of it. Off for MTP, whose draft width already IS
+    # the verify width and is governed by dynamic depth instead.
+    supports_adaptive_verify = False
     supports_prefix_reuse = True
     supports_batching = True
 

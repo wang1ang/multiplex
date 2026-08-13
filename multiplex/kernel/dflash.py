@@ -639,6 +639,12 @@ class DFlashDrafter:
 
     wants_taps = True
     supports_dynamic_depth = False   # trained for a fixed block; k is pinned
+    # ...but the fixed-width block can be VERIFIED at an adaptive (smaller)
+    # prefix: the draft cache only ever stores committed context (the block's
+    # own K/V is never written — see DFlashAttention), so shrinking the trunk
+    # verify width needs no draft-cache rollback. The scheduler drafts the full
+    # block and verifies self.k <= max_draft_len of it.
+    supports_adaptive_verify = True
     supports_prefix_reuse = False
     supports_batching = True
 
