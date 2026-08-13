@@ -75,9 +75,21 @@ class DFlashAdaptiveVerifyWiringTests(unittest.TestCase):
         sch = self._sched(_FakeDrafter(), dynamic_depth=False)
         self.assertTrue(sch.adaptive_verify)
         self.assertIsNotNone(sch.depth_controller)
-        # Draft width stays pinned at the fixed block; verify starts at the max.
+        # Draft width stays pinned at the fixed block; verify WARMS UP mid-block
+        # (default 7) rather than at the full 15, so short generations benefit.
         self.assertEqual(sch.max_k, 15)
-        self.assertEqual(sch.k, 15)
+        self.assertEqual(sch.k, 7)
+
+    def test_warm_start_clamps_to_max_k(self):
+        sch = self._sched(_FakeDrafter(), dynamic_depth=False,
+                          adaptive_verify_start=999)
+        self.assertEqual(sch.k, sch.max_k)
+
+    def test_reset_restarts_at_warm_start_not_full_block(self):
+        sch = self._sched(_FakeDrafter(), dynamic_depth=False)
+        sch.depth_controller.current = 3
+        sch._reset_dynamic_depth(restart_at_max=True)
+        self.assertEqual(sch.k, 7)
 
     def test_verify_width_narrows_on_low_acceptance(self):
         sch = self._sched(_FakeDrafter(), dynamic_depth=False)

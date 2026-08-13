@@ -192,6 +192,7 @@ class Scheduler:
                  dynamic_depth_up_threshold=0.80,
                  dynamic_depth_down_threshold=0.50,
                  dynamic_depth_retry_cooldown=24,
+                 adaptive_verify_start=7,
                  per_row_commit=None):
         self.eng = engine
         self.dr = drafter
@@ -244,6 +245,19 @@ class Scheduler:
             if self.depth_controller is not None
             else self.max_k
         )
+        # Adaptive-verify warms up near DFlash's typical accepted width, not the
+        # full block: starting at max_k would spend a whole short generation
+        # stepping the verify width down (one level per window) before reaching
+        # steady state, so short requests would never benefit. Start mid-block
+        # and let the controller climb back up in predictable regions.
+        if self.adaptive_verify and self.depth_controller is not None:
+            self._adaptive_verify_start = max(
+                1, min(int(adaptive_verify_start), self.max_k)
+            )
+            self.depth_controller.current = self._adaptive_verify_start
+            self.k = self.depth_controller.current
+        else:
+            self._adaptive_verify_start = None
         self.chunk = chunk
         self.eos = set(eos_token_ids)
         self.debug = debug
@@ -766,6 +780,10 @@ class Scheduler:
         if self.depth_controller is None:
             return
         self.depth_controller.reset(restart_at_max=restart_at_max)
+        # Adaptive-verify restarts at its warm-start width, not the full block,
+        # so a batch composition change doesn't reintroduce the slow descent.
+        if restart_at_max and self._adaptive_verify_start is not None:
+            self.depth_controller.current = self._adaptive_verify_start
         self.k = self.depth_controller.current
 
     def _keep(self, keep: list[int]) -> None:

@@ -105,7 +105,11 @@ python try_dflash.py \
   full trained block (`block_size-1` masks in one parallel forward), but the
   scheduler's depth controller now picks how many of those drafts the trunk
   actually *verifies* (`self.k <= block_size-1`), stepping the verify width down
-  in low-acceptance regions and back up when acceptance recovers. This is sound
+  in low-acceptance regions and back up when acceptance recovers. It **warms up
+  mid-block** (`adaptive_verify_start`, default 7) rather than at the full block:
+  starting at 15 would spend a whole short generation stepping the width down
+  one level per window before reaching steady state, so short requests would
+  never benefit. This is sound
   with no draft-cache rollback because the draft cache only ever stores
   committed context — the drafted block is never written to it (see
   `DFlashAttention`: `update_and_fetch` takes only the ctx K/V). It trims the
