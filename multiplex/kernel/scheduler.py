@@ -534,14 +534,16 @@ class Scheduler:
             h = vhidden[:, -1:, :]
         elif snap is not None and any(s is not None for s in snap):
             # Hybrid SSM+attention trunk: SSM recurrent state can't be partially
-            # trimmed, so roll it back to before the round and replay the
-            # committed prefix (primary + m accepted). Attention keeps only the
-            # committed KV via the trim; the replay rebuilds SSM and gives h.
-            eng.restore_ssm(state, snap)
+            # trimmed. Trim the attention KV to the committed prefix (positional,
+            # exact), then roll the SSM state back and re-advance it by replaying
+            # ONLY the committed prefix through the GDN layers — not the whole
+            # trunk. h comes straight from the verify hidden. Re-forwarding the
+            # whole trunk here would both cost an extra full pass and wrongly
+            # re-append the committed attention KV (offset drifting past length).
             eng.trim_attention(state, k - m)
-            state.lengths = list(lengths_before)
-            commit_in = mx.array([[int(verify_in[i, 0])] + draft_ids[i][:m] for i in range(B)])
-            h = eng.forward(state, commit_in)[:, -1:, :]
+            eng.rollback_ssm_replay(state, snap, m)
+            state.lengths = [n + m + 1 for n in lengths_before]
+            h = vhidden[:, m:m + 1, :]
         elif eng.has_rotating_cache(state):
             # Sliding-window (rotating) attention trunk (e.g. Gemma): a rotating
             # KV cache CANNOT be rolled back by a pointer trim. Its

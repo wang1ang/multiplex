@@ -148,6 +148,28 @@ class _TapLayer:
         return getattr(self._layer, name)
 
 
+class _GDNMixerProxy:
+    """Transparent proxy around a GatedDeltaNet (SSM) mixer that records its
+    input (the post-layernorm hidden and mask) into the engine on every call
+    when capture is armed. A speculative rollback uses the captured input to
+    rebuild the recurrent state by replaying ONLY the committed prefix through
+    this mixer, instead of re-running the whole trunk. Delegates everything
+    else to the real mixer."""
+
+    def __init__(self, mixer, engine, idx: int):
+        self._mixer = mixer
+        self._eng = engine
+        self._idx = idx
+
+    def __call__(self, inputs, mask=None, cache=None):
+        if self._eng._gdn_capture_on:
+            self._eng._gdn_inputs[self._idx] = (inputs, mask)
+        return self._mixer(inputs, mask, cache)
+
+    def __getattr__(self, name):
+        return getattr(self._mixer, name)
+
+
 class Engine:
     """Loads a model. Runs correct batched forwards. Nothing else."""
 
@@ -187,6 +209,17 @@ class Engine:
         self._hidden_tap_ids = None
         self._hidden_tap_store = None
         self.last_hidden_taps = None
+        # GDN (SSM) input capture, for cheap speculative rollback. The SSM
+        # recurrent state can't be trimmed like positional KV, so after a
+        # partial-accept round it must be rolled back and re-advanced to the
+        # committed position. Rather than re-forward the whole trunk (which also
+        # wrongly re-appends attention KV), we capture each GDN mixer's input on
+        # the verify forward and replay ONLY the GDN layers over the committed
+        # prefix. Default idle: capture is armed only inside ``forward``.
+        self._gdn_capture_on = False
+        self._gdn_inputs: dict = {}
+        self._gdn_layers: list = []
+        self._setup_gdn_capture()
 
     def enable_hidden_taps(self, layer_ids) -> None:
         """Capture the outputs of trunk decoder layers ``layer_ids`` on every
@@ -256,7 +289,9 @@ class Engine:
         not slice or sample. Advances the cache by k.
         """
         k = int(tokens.shape[1])
+        self._gdn_capture_on = bool(self._gdn_layers)
         h = self.model.language_model.model(tokens, cache=state.cache)
+        self._gdn_capture_on = False
         state.lengths = [n + k for n in state.lengths]
         self.last_trunk_cache = state.cache
         self.last_hidden_taps = self._collect_taps()
@@ -283,6 +318,45 @@ class Engine:
         for c, s in zip(state.cache, snap):
             if s is not None:
                 c.cache = [None if v is None else v + 0 for v in s]
+
+    def _setup_gdn_capture(self) -> None:
+        """Wrap every GatedDeltaNet (SSM) mixer so its input can be captured on
+        the verify forward, enabling GDN-only speculative rollback. No-op for
+        models without GDN layers (their rollback needs no SSM replay)."""
+        try:
+            layers = self.model.language_model.model.layers
+        except AttributeError:
+            return
+        for i, layer in enumerate(layers):
+            mixer = getattr(layer, "linear_attn", None)
+            if mixer is not None and type(mixer).__name__ == "GatedDeltaNet":
+                proxy = _GDNMixerProxy(mixer, self, i)
+                layer.linear_attn = proxy
+                self._gdn_layers.append((i, proxy))
+
+    def rollback_ssm_replay(self, state: BatchState, snap: list, m: int) -> None:
+        """Roll the GDN (SSM) recurrent state back to the committed position
+        after a partial-accept round, by replaying ONLY the committed prefix
+        (m+1 tokens) through each GDN mixer — not the whole trunk.
+
+        Restores the pre-round snapshot, then re-runs each ``linear_attn`` over
+        its captured verify input sliced to the committed length. Attention KV
+        is handled separately by ``trim_attention``; this touches only the
+        ArraysCache layers, so it neither re-appends attention KV (the bug the
+        whole-trunk re-forward caused) nor pays for attention/MLP compute.
+        Requires a prior ``forward`` (verify) to have captured the inputs.
+        """
+        self.restore_ssm(state, snap)
+        self._gdn_capture_on = False
+        n = m + 1
+        for idx, mixer in self._gdn_layers:
+            inp, mask = self._gdn_inputs[idx]
+            inp = inp[:, :n, :]
+            if mask is not None and mask.shape[-1] >= n:
+                mask = mask[..., :n]
+            mixer(inp, mask, state.cache[idx])
+        mx.eval(*[v for idx, _ in self._gdn_layers
+                  for v in state.cache[idx].cache if v is not None])
 
     def has_rotating_cache(self, state: BatchState) -> bool:
         """True if any attention layer uses a sliding-window (rotating) KV cache.

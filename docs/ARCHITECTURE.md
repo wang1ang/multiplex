@@ -7,7 +7,7 @@ L3  kernel/scheduler.py     prefill, merge, decode step, cancel, prefix cache
 L2  kernel/mtp.py           drafter contract + MTP impl (sidecar, norm/quant)
     kernel/dflash.py        DFlash drafter impl (block-diffusion, hidden taps)
 L1  kernel/engine.py        batched forward, logits, cache clone/filter/restore,
-                            optional intermediate-hidden taps
+                            GDN-only SSM rollback, optional intermediate-hidden taps
     kernel/prefixcache/     L3 prefix-cache policy, state adapter, disk store
 ```
 
@@ -49,7 +49,12 @@ Each layer owns one job; the lines between them are what keep the kernel boring.
   decide batch lifecycle events.
 - **L1 `engine.py`** — correct forward passes and the mechanics of the trunk
   cache (clone / filter / restore / trim, optional hidden taps). It never
-  samples or schedules.
+  samples or schedules. A hybrid SSM+attention trunk (e.g. qwen3_5 GatedDelta)
+  rolls a rejected speculative tail back by trimming the positional attention KV
+  and re-advancing the non-trimmable recurrent state via `rollback_ssm_replay`,
+  which replays only the committed prefix through the GDN mixers (inputs
+  captured on the verify forward) — never a full-trunk re-forward, which would
+  both cost an extra pass and re-append the committed attention KV.
 
 ### The cache rule (subtle, easy to miss)
 
