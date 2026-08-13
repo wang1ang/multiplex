@@ -178,7 +178,7 @@ class PrefillGroup:
     cached_h: object = None
     dcache: object = None
     mtp_prev_h: object = None
-    dflash_ctx: object = None
+    drafter_ctx: object = None
     started: bool = False
 
 
@@ -310,8 +310,10 @@ class Scheduler:
                 f"{(end - start) / dt:.0f} tok/s"
             )
             self._append_prefill_mtp_history(group, ids, start, end, h)
-            if self.dr is not None and getattr(self.dr, "wants_taps", False):
-                self._accumulate_taps(group, self.eng.last_hidden_taps)
+            if self.dr is not None:
+                group.drafter_ctx = self.dr.update_prefill_context(
+                    self.eng, h, group.drafter_ctx
+                )
             self.prefix_cache.store_prompt_block(req, group, ids, start, end, h)
             if cancelled and cancelled(req.rid):
                 self._log(f"PREFILL CANCELLED rid={req.rid}")
@@ -320,6 +322,8 @@ class Scheduler:
             if group.pos < len(ids):
                 return False
 
+        if self.dr is not None and group.drafter_ctx is None:
+            group.drafter_ctx = self.dr.update_prefill_context(eng, h, None)
         h = h[:, -1:, :]
         first = int(mx.argmax(eng.logits(h)[0, -1]))
 
@@ -356,13 +360,17 @@ class Scheduler:
         self._log(f"prefill(embeds) {len(ids)} tok {len(ids) / dt:.0f} tok/s")
         # Seed MTP history over the whole prompt (start=0, end=len(ids)).
         self._append_prefill_mtp_history(group, ids, 0, len(ids), h)
-        if self.dr is not None and getattr(self.dr, "wants_taps", False):
-            self._accumulate_taps(group, self.eng.last_hidden_taps)
+        if self.dr is not None:
+            group.drafter_ctx = self.dr.update_prefill_context(
+                self.eng, h, group.drafter_ctx
+            )
 
         if cancelled and cancelled(req.rid):
             self._log(f"PREFILL CANCELLED rid={req.rid}")
             return None
 
+        if self.dr is not None and group.drafter_ctx is None:
+            group.drafter_ctx = self.dr.update_prefill_context(eng, h, None)
         h = h[:, -1:, :]
         first = int(mx.argmax(eng.logits(h)[0, -1]))
         req.out.append(first)
@@ -385,15 +393,11 @@ class Scheduler:
             self.rows = [r]
             if self.dr is not None:
                 self.dcache = group.dcache or self.dr.make_cache()
-                if getattr(self.dr, "wants_taps", False):
-                    # DFlash: the accumulated prompt taps are the first draft's
-                    # context; the draft cache starts empty and the first draft
-                    # records them.
-                    self.ctx = group.dflash_ctx
+                self.ctx = group.drafter_ctx
             self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
             return joined
 
-        singles, hs, prims, reqs, dcaches = [], [], [], [], []
+        singles, hs, prims, reqs, dcaches, ctxs = [], [], [], [], [], []
         for i, req in enumerate(self.rows):        # existing rows -> singles
             singles.append(self.eng.extract_row(self.state, i))
             hs.append(self.h[i:i + 1])
@@ -401,18 +405,28 @@ class Scheduler:
             reqs.append(req)
             if self.dr is not None:
                 dcaches.append(self.dr.extract_cache_row(self.dcache, i))
+                if self.ctx is not None:
+                    ctxs.append(self.ctx[i:i + 1])
         singles.append(group.single)
         hs.append(group.last_h)
         prims.append(mx.array([group.first]))
         reqs.append(r)
         if self.dr is not None:
             dcaches.append(group.dcache or self.dr.make_cache())
+            if self.ctx is not None:
+                ctxs.append(group.drafter_ctx)
         self.state = self.eng.merge_states(singles)
         self.h = mx.concatenate(hs, axis=0)
         self.primary = mx.concatenate(prims, axis=0)
         self.rows = reqs
         if self.dr is not None:
             self.dcache = self.dr.merge_caches(dcaches)
+            # self.ctx is the drafter's opaque per-row context (MTP: final
+            # hidden; DFlash is single-stream so this multi-row path is never
+            # taken for it). Rebuild it row-aligned with self.h so the next
+            # draft() sees a matching batch dimension.
+            if self.ctx is not None:
+                self.ctx = mx.concatenate(ctxs, axis=0)
         self._reset_dynamic_depth(restart_at_max=False)
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
@@ -430,8 +444,7 @@ class Scheduler:
         if k == 0:                                  # no head -> no draft
             draft_ids = [[] for _ in range(B)]
         else:
-            draft_ctx = self.ctx if getattr(dr, "wants_taps", False) else h
-            drafts = dr.draft(draft_ctx, primary, k, self.dcache)
+            drafts = dr.draft(self.ctx, primary, k, self.dcache)
             draft_ids = [[int(x) for x in drafts[i]] for i in range(B)]
 
         snap = eng.snapshot_ssm(state) if k else None
@@ -440,11 +453,6 @@ class Scheduler:
         vhidden = eng.forward(state, verify_in)
         trunk_logits = eng.logits(vhidden)
         trunk_pred = mx.argmax(trunk_logits, axis=-1)
-        # DFlash conditions on the trunk's tapped hiddens for this verify; the
-        # committed slice becomes the next draft's context (see below).
-        wants_taps = dr is not None and getattr(dr, "wants_taps", False)
-        vctx = dr.make_context(eng, vhidden) if wants_taps else None
-        next_ctx = None
 
         accs = []
         for i in range(B):
@@ -481,7 +489,7 @@ class Scheduler:
             and min(accs) != max(accs)
             and not eng.has_rotating_cache(state)
             and not (snap is not None and any(s is not None for s in snap))
-            and not wants_taps
+            and getattr(dr, "supports_batching", True)
         )
         if self.per_row_commit and not use_per_row and not self._per_row_fallback_logged and B > 1:
             self._per_row_fallback_logged = True
@@ -510,6 +518,7 @@ class Scheduler:
                 state, vhidden, trunk_pred, draft_ids, accs,
                 lengths_before, k)
             self.state, self.h, self.primary = state, h, primary
+            self.ctx = dr.update_context_after_commit(eng, h, m)
             self._finish_step(state, h, primary, rows, emitted, finished,
                               accs, m, k, trunk_logits, trunk_pred, t0)
             return emitted
@@ -521,10 +530,6 @@ class Scheduler:
             # a no-op, since it never wrote the block to its cache). L3 only
             # signals the commit event; it does not know 'base+1' or 'append'.
             dr.commit(self.dcache, m, draft_ids, vhidden)
-            if wants_taps:
-                # DFlash: the committed positions' taps become the next draft's
-                # cross-attention context (recorded inside the next draft()).
-                next_ctx = vctx[:, :m + 1, :]
         if m == k:
             h = vhidden[:, -1:, :]
         elif snap is not None and any(s is not None for s in snap):
@@ -562,8 +567,8 @@ class Scheduler:
             state.lengths = [n + m + 1 for n in lengths_before]
             h = vhidden[:, m:m + 1, :]
         self.state, self.h, self.primary = state, h, primary
-        if wants_taps:
-            self.ctx = next_ctx
+        if k:
+            self.ctx = dr.update_context_after_commit(eng, h, m)
         self._finish_step(state, h, primary, rows, emitted, finished,
                           accs, m, k, trunk_logits, trunk_pred, t0)
         return emitted
@@ -666,16 +671,6 @@ class Scheduler:
             self.dr.append_history(group.dcache, hidden, token_parts)
         group.mtp_prev_h = h[:, -1:, :]
 
-    def _accumulate_taps(self, group: PrefillGroup, taps) -> None:
-        """Accumulate a prefill chunk's tapped hiddens on the group (DFlash). The
-        concatenated prompt taps become the first draft's context at merge."""
-        if taps is None:
-            return
-        group.dflash_ctx = (
-            taps if group.dflash_ctx is None
-            else mx.concatenate([group.dflash_ctx, taps], axis=1)
-        )
-
     def _bonus_probs(self, logits, pred, pos: int) -> list[float]:
         probs = mx.softmax(logits[:, pos, :], axis=-1)
         return [
@@ -763,6 +758,8 @@ class Scheduler:
                 self.dr.filter_cache(self.dcache, keep)
             self.primary = self.primary[mx.array(keep)]
             self.h = self.h[mx.array(keep)]
+            if self.ctx is not None:
+                self.ctx = self.ctx[mx.array(keep)]
             self.rows = [self.rows[i] for i in keep]
             self._reset_dynamic_depth(restart_at_max=False)
         else:

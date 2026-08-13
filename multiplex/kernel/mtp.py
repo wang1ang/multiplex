@@ -486,6 +486,12 @@ class Drafter:
         DFlash overrides this to return the trunk's tapped hiddens."""
         return hidden_full
 
+    def update_prefill_context(self, engine, hidden, previous):
+        return hidden[:, -1:, :]
+
+    def update_context_after_commit(self, engine, hidden, accepted):
+        return hidden
+
     @staticmethod
     def trim_cache_to(cache: list, size: int) -> None:
         target = max(0, int(size))

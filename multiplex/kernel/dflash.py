@@ -669,6 +669,14 @@ class DFlashDrafter:
                 "engine.enable_hidden_taps(tap_layer_ids) before serving.")
         return taps
 
+    def update_prefill_context(self, engine, hidden, previous):
+        taps = self.make_context(engine, hidden)
+        return taps if previous is None else mx.concatenate([previous, taps], axis=1)
+
+    def update_context_after_commit(self, engine, hidden, accepted):
+        taps = self.make_context(engine, hidden)
+        return taps[:, :int(accepted) + 1, :]
+
     def draft(self, ctx, primary, k, cache) -> mx.array:
         if k == 0:
             return mx.zeros((primary.shape[0], 0), dtype=primary.dtype)
