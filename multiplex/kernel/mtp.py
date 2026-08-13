@@ -626,6 +626,9 @@ class Drafter:
         Chains the head: each step feeds the head's own previous hidden and the
         token it just drafted.
         """
+        # Remember the committed length before the speculative chain so commit()
+        # can trim back to it without L3 tracking a 'base'.
+        self._base = int(cache[0].size())
         if k == 0:                                  # no draft -> pure AR
             return mx.zeros((tokens.shape[0], 0), dtype=tokens.dtype)
         # Shared-KV heads track a query position that advances across this block;
@@ -641,6 +644,20 @@ class Drafter:
             drafts.append(tok)
             h = post
         return mx.concatenate(drafts, axis=1)
+
+    def commit(self, cache: list, m: int, draft_ids, hidden) -> None:
+        """Fold this round's committed draft(s) into the draft cache.
+
+        L3 signals the commit event; the mechanism is MTP's own: trim the
+        speculative tail written during draft() back to the committed length
+        (``base`` captured in draft), then append the ``m`` accepted transitions
+        as MTP history. ``draft_ids`` is a list of per-row draft-token lists and
+        ``hidden`` the verify hidden ``[rows, k+1, H]`` for those rows.
+        """
+        self.trim_cache_to(cache, self._base + 1)
+        if m:
+            accepted = mx.array([row[:m] for row in draft_ids], dtype=mx.int32)
+            self.append_history(cache, hidden[:, :m, :], accepted)
 
 
 def find_drafter(engine, mtp_path: str | None = None):

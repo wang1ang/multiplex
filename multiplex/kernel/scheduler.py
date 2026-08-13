@@ -430,7 +430,6 @@ class Scheduler:
         if k == 0:                                  # no head -> no draft
             draft_ids = [[] for _ in range(B)]
         else:
-            dcache_base = dr.cache_size(self.dcache)
             draft_ctx = self.ctx if getattr(dr, "wants_taps", False) else h
             drafts = dr.draft(draft_ctx, primary, k, self.dcache)
             draft_ids = [[int(x) for x in drafts[i]] for i in range(B)]
@@ -509,7 +508,7 @@ class Scheduler:
         if use_per_row:
             state, h, primary = self._commit_per_row(
                 state, vhidden, trunk_pred, draft_ids, accs,
-                lengths_before, dcache_base, k)
+                lengths_before, k)
             self.state, self.h, self.primary = state, h, primary
             self._finish_step(state, h, primary, rows, emitted, finished,
                               accs, m, k, trunk_logits, trunk_pred, t0)
@@ -517,18 +516,15 @@ class Scheduler:
 
         primary = trunk_pred[:, m]
         if k != 0:
+            # Post-verify draft-cache update is the drafter's own mechanism
+            # (MTP: trim the speculative tail + append committed history; DFlash:
+            # a no-op, since it never wrote the block to its cache). L3 only
+            # signals the commit event; it does not know 'base+1' or 'append'.
+            dr.commit(self.dcache, m, draft_ids, vhidden)
             if wants_taps:
-                # DFlash: the committed positions' taps (m accepted + the bonus'
-                # predecessor) are the next draft's cross-attention context.
-                # Feeding them into draft() records committed history, so no
-                # separate append/trim is needed on this path.
+                # DFlash: the committed positions' taps become the next draft's
+                # cross-attention context (recorded inside the next draft()).
                 next_ctx = vctx[:, :m + 1, :]
-            else:
-                dr.trim_cache_to(self.dcache, dcache_base + 1)
-                if m:
-                    accepted = mx.array([draft_ids[i][:m] for i in range(B)],
-                                        dtype=mx.int32)
-                    dr.append_history(self.dcache, vhidden[:, :m, :], accepted)
         if m == k:
             h = vhidden[:, -1:, :]
         elif snap is not None and any(s is not None for s in snap):
@@ -573,7 +569,7 @@ class Scheduler:
         return emitted
 
     def _commit_per_row(self, state, vhidden, trunk_pred, draft_ids, accs,
-                        lengths_before, dcache_base, k):
+                        lengths_before, k):
         """Ragged commit: row i keeps its OWN accepted depth ``accs[i]`` instead
         of the batch minimum. Decomposes the batch into single-row states (the
         same primitive ``merge_ready`` uses), trims each row's committed KV to
@@ -592,12 +588,7 @@ class Scheduler:
             prims.append(trunk_pred[i:i + 1, a])        # row i's bonus token
             if dr is not None:
                 drow = dr.extract_cache_row(self.dcache, i)
-                dr.trim_cache_to(drow, dcache_base + 1)
-                if a:
-                    dr.append_history(
-                        drow, vhidden[i:i + 1, :a, :],
-                        mx.array([draft_ids[i][:a]], dtype=mx.int32),
-                    )
+                dr.commit(drow, a, [draft_ids[i]], vhidden[i:i + 1])
                 dcaches.append(drow)
         state = eng.merge_states(singles)
         h = mx.concatenate(hs, axis=0)

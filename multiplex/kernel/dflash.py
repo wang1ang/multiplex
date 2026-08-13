@@ -678,6 +678,12 @@ class DFlashDrafter:
         logits = self.model(block, ctx, cache, logits_start=1)      # [B, k, vocab]
         return mx.argmax(logits, axis=-1)
 
+    def commit(self, cache, m, draft_ids, hidden) -> None:
+        # No-op: DFlash records committed context inside the NEXT draft() (it
+        # feeds the committed taps as cross-attention context) and never writes
+        # the drafted block to its cache, so there is nothing to trim or append.
+        pass
+
     # --- batch lifecycle: single-stream in v1 --------------------------------
     def extract_cache_row(self, cache, i):
         if i != 0:
