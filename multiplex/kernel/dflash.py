@@ -261,6 +261,10 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
     )
     weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
     model = DFlashDraftModel(config)
+    q = cfg.get("quantization")
+    if q:
+        nn.quantize(model, group_size=q["group_size"], bits=q["bits"],
+                    class_predicate=lambda _p, m: isinstance(m, nn.Linear))
     model.load_weights(list(weights.items()))
     return model
 
