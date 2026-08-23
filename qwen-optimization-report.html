@@ -1,0 +1,163 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Qwen 3.8 MTP 优化借鉴报告</title>
+  <style>
+    body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;line-height:1.7;max-width:1100px;margin:0 auto;padding:32px;color:#222}
+    h1,h2,h3{line-height:1.3} table{border-collapse:collapse;width:100%;margin:16px 0} th,td{border:1px solid #ccc;padding:8px;vertical-align:top;text-align:left} th{background:#f3f3f3}
+    code{background:#f4f4f4;padding:2px 5px;border-radius:3px} pre{background:#f6f8fa;padding:14px;overflow:auto;border-radius:6px}
+    blockquote{border-left:4px solid #bbb;margin:16px 0;padding:4px 16px;color:#555}
+  </style>
+</head>
+<body>
+<article>
+<h1>目前 multiplex 已经具备的优化</h1>
+<table><thead><tr><th>challenge 中的思路</th><th>multiplex 对应实现</th></tr></thead><tbody>
+<tr><td>MTP speculative decoding</td><td><code>multiplex/kernel/mtp.py</code></td></tr>
+<tr><td>DFlash 并行 block draft</td><td><code>multiplex/kernel/dflash.py</code></td></tr>
+<tr><td>动态 draft depth</td><td><code>scheduler.py::DynamicDepthController</code></td></tr>
+<tr><td>批量 verify</td><td><code>Scheduler.step()</code> 中一次 <code>eng.forward()</code></td></tr>
+<tr><td>KV rollback</td><td><code>Engine.trim_attention()</code>、SSM snapshot/replay</td></tr>
+<tr><td>多请求动态 batching</td><td><code>prefill_chunk()</code>、<code>merge_ready()</code></td></tr>
+<tr><td>Prefix cache</td><td><code>kernel/prefixcache/</code></td></tr>
+<tr><td>多行独立提交</td><td><code>MULTIPLEX_PER_ROW_COMMIT</code></td></tr>
+</tbody></table>
+<p>所以不是从零移植，主要是把 challenge 中更成熟的细节补进来。</p>
+
+<h1>最值得借鉴的优化</h1>
+<h2>1. 输入无关的 shape warm / JIT 预热 —— 优先级最高</h2>
+<p>challenge 的 <code>Qwen36MTPBlockSession.warmAllDepthShapes()</code> 做得非常彻底：</p>
+<ul><li>预热所有合法 verify 宽度：<code>1 ... maxDepth + 1</code></li><li>预热 MTP head 的每个单 token draft step</li><li>预热不同 draft 拼接宽度</li><li>预热 top-2 / argmax reduction</li><li>预热长 KV 上下文的 SDPA</li><li>预热 rollback/replay 路径</li><li>预热真正运行时使用的 concat 表达式，而不是“看起来相似”的表达式</li></ul>
+<p>这对 Python/MLX 版本尤其有价值，因为首次遇到新 shape 时，Metal JIT 编译可能直接落在用户请求延迟中。</p>
+<p>建议在 <code>Engine</code> 初始化后增加：</p>
+<pre><code>engine.warmup(
+    prompt_length=512,
+    max_depth=depth,
+    kv_lengths=(512, 1024, 2048),
+)</code></pre>
+<p>并且必须使用<strong>与真实 decode 完全相同的调用表达式</strong>，例如：</p>
+<ul><li><code>mx.concatenate([primary, draft_ids], axis=1)</code></li><li>真实的 <code>eng.forward()</code></li><li>真实的 <code>dr.draft()</code></li><li>真实的 <code>eng.logits()</code></li><li>真实的 rollback 分支</li></ul>
+<p>不要只调用一个近似 shape 的 <code>mx.zeros()</code> 运算。</p>
+<p>挑战代码中特别强调了：即使 logits warm 过了，只要实际 <code>draftTokenID</code> 或 verify concat 表达式没 warm，第一次计时仍可能产生明显停顿。</p>
+
+<h2>2. 让 prefill 只计算最后一个 token 的 logits</h2>
+<p>challenge 的 <code>begin()</code> 明确避免了对整个 seed 计算 lm_head：</p>
+<pre><code>seedLogits = model.callWithHidden(...)
+_ = seedLogits
+lastLogits = model.applyLMHead(lastHidden)</code></pre>
+<p>因为 prefill 期间只有最后一个 hidden 需要投影到 vocab。</p>
+<p><strong>已完成（2025-08）：</strong>multiplex 新增 <code>Engine.last_logits()</code>，并在普通文本和多模态 prefill 路径中统一使用：</p>
+<pre><code>first = int(mx.argmax(eng.last_logits(h)[0, -1]))</code></pre>
+<p>该方法在 lm-head 投影前先截取最后一个 hidden，避免产生完整的 <code>[B, L, vocab]</code> logits；旧的全序列路径和 A/B 开关已移除。</p>
+<p>固定模型 <code>Qwen3.6-27B-Q4-MTPLX-v2-Q2Mix11-L29UpQ4-Q3KO16</code> 实测（脚本：<code>benchmark_inference.py</code>）：</p>
+<table><tr><th>Prompt</th><th>Legacy prefill</th><th>Optimized prefill</th><th>提升</th></tr>
+<tr><td>你是什么模型？</td><td>84.1 tok/s</td><td>86.8 tok/s</td><td>1.03x</td></tr>
+<tr><td>Python 二叉树前序遍历</td><td>121.5 tok/s</td><td>123.5 tok/s</td><td>1.02x</td></tr></table>
+<p>短 prompt 的端到端 prefill 提升约 2–3%；lm-head 子阶段本身从约 43 ms 降至约 2.3 ms（约 95% 降幅），长 prompt 会获得更明显收益。</p>
+
+<h2>3. MTP head persistent history</h2>
+<p>challenge 中非常重视 MTP head 的历史 KV：</p>
+<blockquote>fresh empty head cache → draft 质量较差<br>persistent head KV cache + committed history → acceptance 明显提高</blockquote>
+<p>multiplex 的 <code>Drafter.append_history()</code> 和 <code>Drafter.commit()</code> 已经实现了类似机制：</p>
+<pre><code>self.trim_cache_to(cache, self._base + 1)
+self.append_history(cache, hidden[:, :m, :], accepted)</code></pre>
+<p>但建议进一步核对三个细节：</p>
+<ol><li>prefill 的每个 token transition 是否都正确加入 head history；</li><li>partial acceptance 时是否只保留 committed prefix；</li><li>cache trim 后的位置 offset 是否和 trunk committed length 一致。</li></ol>
+<p>尤其是 <code>Scheduler._append_prefill_mtp_history()</code>，这是最容易出现 off-by-one 的地方。challenge 的布局约定是：</p>
+<pre><code>head position p = fused(embed(token[p+1]), hidden[p])</code></pre>
+<p>建议为 Qwen MTP 增加一个长 prompt + 多轮 partial reject 的 parity 测试。</p>
+
+<h2>4. 用 cost model 替代简单的动态 depth</h2>
+<p>multiplex 当前的 <code>DynamicDepthController</code> 主要基于：</p>
+<ul><li>full acceptance &gt; 0.8：增加深度</li><li>full acceptance &lt; 0.5：降低深度</li><li>cooldown 防止震荡</li></ul>
+<p>这是合理的第一版，但 challenge 中使用了更完整的经济模型：</p>
+<pre><code>T(d) = verify_cost(d) + d * draft_step_cost
+E(tokens | d) = 1 + p1 + p1*p2 + ...</code></pre>
+<p>也就是说，最优深度不只由 acceptance 决定，还取决于：</p>
+<ul><li>MTP head 每步成本</li><li>verify 宽度变化带来的 kernel 成本</li><li>rollback 成本</li><li>每个位置的条件 acceptance，而不是整体 full acceptance</li></ul>
+<p>建议改成记录：</p>
+<pre><code>accept_position[i] / trial_position[i]</code></pre>
+<p>估计：</p>
+<pre><code>p_i = P(draft_i accepted | previous drafts accepted)</code></pre>
+<p>然后计算每个候选深度的预期收益：</p>
+<pre><code>expected_tokens(d) = 1 + sum(prod(p[:i]) for i in range(1, d + 1))
+expected_cost(d) = verify_cost[d] + d * draft_cost
+score(d) = expected_tokens(d) / expected_cost(d)</code></pre>
+<h3>注意</h3>
+<p>不要直接照搬 challenge 中固定的 cost ratio。它是在特定 M5、特定 Qwen3.8 kernel、特定 head 上测出的。multiplex 应该通过本机 warmup/短基准估计：</p>
+<ul><li><code>draft_cost</code></li><li><code>verify_cost[k]</code></li><li>partial rollback cost</li></ul>
+
+<h2>5. 进一步优化 partial acceptance 的回滚</h2>
+<p>multiplex 当前已经比普通实现先进：</p>
+<ul><li>纯 attention：直接 trim KV</li><li>hybrid SSM：snapshot + GDN replay</li><li>rotating KV：重新 replay committed prefix</li><li>per-row commit：可选 ragged commit</li></ul>
+<p>这是 challenge 中最有价值的算法细节之一。</p>
+<p>但当前 <code>Engine.snapshot_ssm()</code>：</p>
+<pre><code>v + 0</code></pre>
+<p>会复制所有 SSM state，可能产生较大的内存和 GPU 开销。</p>
+<p>建议借鉴 challenge 的方向：</p>
+<ul><li>只保存必要的 recurrent state；</li><li>在 forward 中捕获 GDN 中间输入；</li><li>partial reject 时只 replay GDN，而不是完整 trunk；</li><li>对不同 reject depth 建立 shape warm；</li><li>对 <code>m == k</code> 的 full acceptance 完全跳过 snapshot/rollback 准备。</li></ul>
+<p>当前 scheduler 已经有：</p>
+<pre><code>snap = eng.snapshot_ssm(state) if k else None</code></pre>
+<p>但可以进一步做到：根据 drafter/模型能力，在确认一定不会 partial rollback 时不创建 snapshot。</p>
+
+<h2>6. 真正利用 per-row commit</h2>
+<p><code>Scheduler._commit_per_row()</code> 是很有潜力的优化，但当前有明显代价：</p>
+<pre><code>eng.extract_row(...)
+eng.merge_states(...)</code></pre>
+<p>这会把每个 row 拆出来再重新合并，可能抵消收益。</p>
+<p>challenge 的设计是单请求 MTP，因此没有 multiplex 的多行对齐问题。对 multiplex 来说建议：</p>
+<ul><li>B=1：始终使用普通路径；</li><li>B&gt;1 且 acceptance 差异较小时：继续 take-min；</li><li>只有当某行比 batch-min 多接受至少 2 个 token 时，才使用 per-row；</li><li>对纯 attention cache 尽量直接 batch trim，而不是 extract/merge；</li><li>为 B=2、4、8 分别基准测试。</li></ul>
+<p>目前的 <code>MULTIPLEX_PER_ROW_COMMIT=1</code> 应该保持实验性开关，不建议默认开启。</p>
+
+<h2>7. MLX allocator / command buffer 管理</h2>
+<p>challenge 的 <code>RuntimeStartupMemoryPolicy.swift</code> 值得移植其思想：</p>
+<ul><li>大内存机器：更大的 allocator cache 和 command buffer</li><li>小内存机器：限制 allocator cache，缩短 command buffer</li><li>warmup 后清理 free buffers</li><li>不因为内存小而关闭 compiled decode</li></ul>
+<p>multiplex 当前没有看到同等级别的启动策略。建议加入：</p>
+<pre><code>mx.set_memory_limit(...)</code></pre>
+<p>或通过环境变量设置：</p>
+<ul><li>allocator cache 上限</li><li>command buffer referenced-byte 上限</li><li>warmup 后 <code>mx.clear_cache()</code></li></ul>
+<p>重要原则：</p>
+<blockquote>内存 profile 只改变内存管理，不改变推理算法或 kernel 路径。</blockquote>
+<p>不要像旧版本 challenge 那样在低内存模式下关闭 compiled decode，否则本地测试路径和生产机器不一致。</p>
+
+<h2>8. 长上下文 SDPA 预热</h2>
+<p>challenge 特别针对：</p>
+<ul><li>seed 长度 512</li><li>decode 到 KV 长度 1024</li><li>qL = 1、2、3、4、5</li><li>不同 block/tile family</li></ul>
+<p>进行 SDPA warmup。</p>
+<p>multiplex 如果主要测试短上下文，容易误以为没有问题；但 coding agent 的上下文经常从 512 增长到几千甚至几万。建议至少预热：</p>
+<pre><code>KV length: 512, 1024, 2048
+query length: 1, 2, 4, 8
+batch: 1, 2, 4</code></pre>
+<p>只 warm 与模型实际 attention cache 类型匹配的路径，避免无意义的巨大内存占用。</p>
+
+<h1>不建议直接搬过来的东西</h1>
+<h2>1. Challenge 专用 Metal kernel</h2>
+<p>challenge 中的：</p>
+<ul><li>NVFP4 quantized matmul</li><li>MoE gather GEMM</li><li>Qwen3.8 特化 SDPA</li><li>Qwen3.8 GDN kernel</li><li>M5 <code>_nax</code> variant</li></ul>
+<p>不能直接用于 multiplex，因为：</p>
+<ul><li>multiplex 依赖 Python <code>mlx-lm</code></li><li>模型结构可能是 Qwen3.5/3.6、Gemma、其他模型</li><li>vendored MLX 版本和 challenge 的 Swift MLX fork 不一定一致</li><li>kernel shape/quantization contract 不同</li></ul>
+<p>只有在你准备 fork MLX 并针对单一模型做专用优化时，才值得移植。</p>
+
+<h2>2. Wired resident memory</h2>
+<p>challenge 的 <code>WiredMemoryTicket</code> / resident weights 方案是 M5 专用优化，风险较高：</p>
+<ul><li>需要 Swift/Metal API</li><li>可能影响系统稳定性</li><li>对 Python multiplex 的收益不确定</li></ul>
+<p>建议先做普通 allocator 和 warmup，再考虑 wired memory。</p>
+
+<h2>3. Challenge 的 benchmark-specific 常数</h2>
+<p>例如固定的：</p>
+<ul><li><code>headStepCostRatio = 0.18</code></li><li>特定 depth price table</li><li>M5 专用 command buffer 大小</li><li>固定 512/1024 shape</li></ul>
+<p>不要原样复制，应改为运行时校准或配置项。</p>
+
+<h1>推荐实施顺序</h1>
+<h3>第一阶段：低风险</h3>
+<ol><li>增加完整 shape/JIT warmup；</li><li>确认 prefill 不计算全序列 lm_head；</li><li>增加长上下文 SDPA warmup；</li><li>warmup 后清理 allocator cache；</li><li>为 MTP cache 增加长 prompt / partial reject parity 测试。</li></ol>
+<h3>第二阶段：中等风险</h3>
+<ol start="6"><li>将动态 depth 改为 per-position acceptance + cost model；</li><li>优化 SSM snapshot/replay，仅保存必要 state；</li><li>benchmark 后再决定是否默认启用 per-row commit；</li><li>对 draft 和 verify 使用异步 eval，尽量重叠 head 与 trunk graph 构建。</li></ol>
+<h3>第三阶段：高风险</h3>
+<ol start="10"><li>针对当前主力模型 fork MLX kernel；</li><li>特化 quantized matmul / attention；</li><li>研究 wired resident weights。</li></ol>
+<p>总体判断：<strong>对 multiplex 最值得借鉴的是 challenge 的“预热 + 精确 rollback + 成本驱动调度”三件套，而不是直接复制 Swift/Metal 代码。</strong></p>
+</article>
+</body>
+</html>

@@ -248,11 +248,29 @@ class Engine:
     def logits(self, hidden: mx.array) -> mx.array:
         """Trunk head over hidden -> logits ``[..., vocab]``. Mirrors mlx-lm's
         own tie handling: tied models project through the embedding, untied use
-        a separate lm_head."""
+        a separate lm_head.
+
+        This projects every sequence position.  Call :meth:`last_logits` when
+        only the final position is needed (for example after prefill).
+        """
         lm = self.model.language_model
         if lm.args.tie_word_embeddings:
             return lm.model.embed_tokens.as_linear(hidden)
         return lm.lm_head(hidden)
+
+    def last_logits(self, hidden: mx.array) -> mx.array:
+        """Project only the final hidden position to vocabulary logits.
+
+        Prefill produces hidden states for the complete prompt, but generation
+        only needs the logits for its last token.  Slicing before the lm-head
+        avoids materializing an otherwise very large ``[B, L, vocab]`` tensor.
+        The returned shape remains ``[B, 1, vocab]`` so callers can use the
+        same indexing as :meth:`logits`.
+        """
+        if hidden.ndim != 3 or int(hidden.shape[1]) < 1:
+            raise ValueError("hidden must have shape [batch, sequence, hidden]")
+        last = hidden[:, -1:, :]
+        return self.logits(last)
 
     def _make_empty_cache(self) -> list:
         """A fresh single-row cache (all layers) to prefill into from scratch."""

@@ -352,8 +352,10 @@ class Scheduler:
 
         if self.dr is not None and group.drafter_ctx is None:
             group.drafter_ctx = self.dr.update_prefill_context(eng, h, None)
+        # Only the final prefill position can produce the first token. Avoid
+        # projecting the whole prompt through the vocabulary head.
+        first = int(mx.argmax(eng.last_logits(h)[0, -1]))
         h = h[:, -1:, :]
-        first = int(mx.argmax(eng.logits(h)[0, -1]))
 
         req.out.append(first)
         self._log_output(req, [first])
@@ -399,8 +401,10 @@ class Scheduler:
 
         if self.dr is not None and group.drafter_ctx is None:
             group.drafter_ctx = self.dr.update_prefill_context(eng, h, None)
+        # Only the final prefill position can produce the first token. Avoid
+        # projecting the whole prompt through the vocabulary head.
+        first = int(mx.argmax(eng.last_logits(h)[0, -1]))
         h = h[:, -1:, :]
-        first = int(mx.argmax(eng.logits(h)[0, -1]))
         req.out.append(first)
         self._log_output(req, [first])
         group.single = group.state
