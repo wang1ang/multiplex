@@ -30,6 +30,10 @@ from .mtp import Drafter
 from .prefixcache.runtime import PrefixCacheRuntime
 
 
+# Shared prefill chunk geometry used by scheduling and startup warmup.
+DEFAULT_PREFILL_CHUNK = 512
+
+
 @dataclass
 class Req:
     rid: int
@@ -184,7 +188,7 @@ class PrefillGroup:
 
 class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *,
-                 eos_token_ids, k=3, chunk=512, prefix_cache="4GiB",
+                 eos_token_ids, k=3, chunk=DEFAULT_PREFILL_CHUNK, prefix_cache="4GiB",
                  prefix_cache_dir=None, output_log_dir=None,
                  output_decode=None, debug=False, log=None,
                  dynamic_depth=True, dynamic_depth_window=16,
@@ -265,6 +269,9 @@ class Scheduler:
         self._t = 0
         self.output_log_dir = Path(output_log_dir) if output_log_dir else None
         self.output_decode = output_decode
+        # Online cost observations for replacing threshold-only depth control:
+        # each depth records round wall time, committed tokens, and acceptance.
+        self.cost_stats: dict[int, dict[str, float | int]] = {}
         self.prefix_cache = PrefixCacheRuntime(
             engine, drafter=drafter, budget=prefix_cache, disk_dir=prefix_cache_dir,
             chunk=chunk, log=self._log,
@@ -291,6 +298,19 @@ class Scheduler:
 
     def has_rows(self):
         return bool(self.rows)
+
+    def cost_snapshot(self) -> dict[int, dict[str, float | int]]:
+        """Return immutable-ish per-depth timing/acceptance observations."""
+        out = {}
+        for depth, stat in self.cost_stats.items():
+            row = dict(stat)
+            rounds = max(int(row["rounds"]), 1)
+            trials = max(int(row["draft_trials"]), 1)
+            row["seconds_per_round"] = float(row["seconds"]) / rounds
+            row["tokens_per_second"] = int(row["committed_tokens"]) / max(float(row["seconds"]), 1e-9)
+            row["acceptance"] = int(row["accepted_drafts"]) / trials
+            out[int(depth)] = row
+        return out
 
     def live_rids(self) -> set[int]:
         return {r.rid for r in self.rows}
@@ -649,6 +669,15 @@ class Scheduler:
         B = len(rows)
         mx.eval(h, primary)
         dt = max(time.perf_counter() - t0, 1e-9)
+        stat = self.cost_stats.setdefault(k, {
+            "rounds": 0, "seconds": 0.0, "committed_tokens": 0,
+            "accepted_drafts": 0, "draft_trials": 0,
+        })
+        stat["rounds"] += 1
+        stat["seconds"] += dt
+        stat["committed_tokens"] += sum(len(toks) for _, toks in emitted)
+        stat["accepted_drafts"] += sum(accs)
+        stat["draft_trials"] += k * B
         emitted_by_rid = {rid: toks for rid, toks in emitted}
         for req in rows:
             req.advance_tokens += len(emitted_by_rid.get(req.rid, ()))

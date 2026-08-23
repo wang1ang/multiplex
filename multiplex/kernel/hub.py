@@ -25,7 +25,12 @@ import time
 from ..bridge import ThinkingParser, normalize_messages_for_template
 from .engine import Engine
 from .mtp import find_drafter
-from .scheduler import Scheduler, Req, PrefillGroup
+from .scheduler import (
+    DEFAULT_PREFILL_CHUNK,
+    Scheduler,
+    Req,
+    PrefillGroup,
+)
 
 
 _DONE = object()   # sentinel pushed to a request's queue when it finishes
@@ -114,7 +119,8 @@ class RequestManager:
 
 
 class Hub:
-    def __init__(self, model_path, mtp_path, *, k=3, chunk=512, debug=False,
+    def __init__(self, model_path, mtp_path, *, k=3,
+                 chunk=DEFAULT_PREFILL_CHUNK, debug=False,
                  prefix_cache_dir="auto", prefix_cache="4GiB",
                  dynamic_depth=True, dflash_path=None):
         self.model_id = model_path.rstrip("/").split("/")[-1]
@@ -308,6 +314,7 @@ class Hub:
             c["prefix_cache"] = 0
         else:
             self.drafter = find_drafter(self.eng, c["mtp_path"])
+        self.eng.warmup(prompt_length=c["chunk"])
         self._sched = Scheduler(self.eng, self.drafter,
                                 eos_token_ids=self.tokenizer.eos_token_ids,
                                 k=c["k"], chunk=c["chunk"], debug=c["debug"],

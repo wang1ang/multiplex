@@ -31,7 +31,12 @@ from prompt_toolkit.document import Document
 from multiplex import registry
 from multiplex.kernel.engine import Engine
 from multiplex.kernel.mtp import find_drafter
-from multiplex.kernel.scheduler import Scheduler, Req, PrefillGroup
+from multiplex.kernel.scheduler import (
+    DEFAULT_PREFILL_CHUNK,
+    Scheduler,
+    Req,
+    PrefillGroup,
+)
 
 
 def to_ids(tokenizer, text, raw, think=None):
@@ -133,7 +138,7 @@ def main() -> int:
 
     sch = Scheduler(
         eng, drafter, eos_token_ids=tokenizer.eos_token_ids,
-        k=args.depth, chunk=512, debug=args.debug,
+        k=args.depth, chunk=DEFAULT_PREFILL_CHUNK, debug=args.debug,
         dynamic_depth=args.dynamic_depth,
         output_decode=lambda ids: decode(tokenizer, ids, skip_special_tokens=False),
         log=append_debug if args.debug else None,

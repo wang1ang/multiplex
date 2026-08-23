@@ -19,7 +19,12 @@ from pathlib import Path
 
 from multiplex.kernel.engine import Engine
 from multiplex.kernel.mtp import find_drafter
-from multiplex.kernel.scheduler import PrefillGroup, Req, Scheduler
+from multiplex.kernel.scheduler import (
+    DEFAULT_PREFILL_CHUNK,
+    PrefillGroup,
+    Req,
+    Scheduler,
+)
 
 MODEL = "Qwen3.6-27B-Q4-MTPLX-v2-Q2Mix11-L29UpQ4-Q3KO16"
 MODEL_PATH = Path.home() / ".mtplx" / "models" / MODEL
@@ -37,8 +42,7 @@ def prompt_ids(tokenizer, text: str) -> list[int]:
     )
 
 
-def run_once(engine: Engine, text: str, max_tokens: int, *,
-             prefill_last_logits: bool = True) -> dict[str, float | int]:
+def run_once(engine: Engine, text: str, max_tokens: int) -> dict[str, float | int]:
     ids = prompt_ids(engine.tokenizer, text)
     drafter = find_drafter(engine)
     req = Req(rid=0, prompt=ids, max_tokens=max_tokens)
@@ -50,7 +54,6 @@ def run_once(engine: Engine, text: str, max_tokens: int, *,
         chunk=512,
         debug=False,
         dynamic_depth=True,
-        prefill_last_logits=prefill_last_logits,
     )
     group = PrefillGroup(req=req)
 
@@ -78,16 +81,13 @@ def run_once(engine: Engine, text: str, max_tokens: int, *,
         "decode_seconds": decode_seconds,
         "prefill_tok_s": len(ids) / max(prefill_seconds, 1e-9),
         "decode_tok_s": max(generated - 1, 0) / max(decode_seconds, 1e-9),
+        "cost_stats": scheduler.cost_snapshot(),
     }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("-n", "--max-tokens", type=int, default=64)
-    parser.add_argument(
-        "--no-warmup", action="store_true",
-        help="do not run one short unmeasured generation per prompt",
-    )
     args = parser.parse_args()
 
     if not MODEL_PATH.is_dir():
@@ -97,19 +97,20 @@ def main() -> int:
     print(f"[loaded] {engine.load_seconds:.1f}s")
     print(f"[mtp] {'yes' if find_drafter(engine) else 'no'}")
 
+    # Warm only the prefill path; decode/MTP warmup is intentionally omitted.
+    engine.warmup(prompt_length=DEFAULT_PREFILL_CHUNK)
     for text in PROMPTS:
-        if not args.no_warmup:
-            run_once(engine, text, min(8, args.max_tokens), prefill_last_logits=False)
-            run_once(engine, text, min(8, args.max_tokens), prefill_last_logits=True)
-        legacy = run_once(engine, text, args.max_tokens, prefill_last_logits=False)
-        result = run_once(engine, text, args.max_tokens, prefill_last_logits=True)
-        speedup = legacy["prefill_seconds"] / max(result["prefill_seconds"], 1e-9)
+        result = run_once(engine, text, args.max_tokens)
         print(f"\n[prompt] {text}")
         print("prompt={prompt_tokens} tok, generated={generated_tokens} tok".format(**result))
-        print("prefill (legacy):  {prefill_tok_s:.1f} tok/s ({prefill_seconds:.3f}s)".format(**legacy))
-        print("prefill (optimized): {prefill_tok_s:.1f} tok/s ({prefill_seconds:.3f}s)".format(**result))
-        print(f"prefill speedup: {speedup:.2f}x")
+        print("prefill:  {prefill_tok_s:.1f} tok/s ({prefill_seconds:.3f}s)".format(**result))
         print("generation: {decode_tok_s:.1f} tok/s ({decode_seconds:.3f}s)".format(**result))
+        for depth, stat in sorted(result["cost_stats"].items()):
+            print(
+                f"cost D{depth}: {stat['seconds_per_round'] * 1000:.1f} ms/round, "
+                f"{stat['tokens_per_second']:.1f} committed tok/s, "
+                f"acceptance={stat['acceptance']:.2f}"
+            )
     return 0
 
 

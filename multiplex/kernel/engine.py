@@ -276,6 +276,20 @@ class Engine:
         """A fresh single-row cache (all layers) to prefill into from scratch."""
         return _make_cache(self.model, [0], None)
 
+    def warmup(self, *, prompt_length: int = 512) -> None:
+        """Compile the common prefill shape before serving requests.
+
+        Warmup is input-independent: one zero-token prompt is fully evaluated,
+        including the final-position vocabulary projection. Decode/MTP shapes
+        are deliberately not warmed here because measurements showed no stable
+        generation benefit.
+        """
+        prompt_length = max(1, int(prompt_length))
+        state = BatchState(cache=self._make_empty_cache(), lengths=[0])
+        hidden = self.prefill(state, [0] * prompt_length)
+        mx.eval(self.last_logits(hidden), *(c.state for c in state.cache))
+        mx.clear_cache()
+
     def prefill(self, state: BatchState, ids: list[int]) -> mx.array:
         """Feed one prefill piece into a single-row state."""
         piece = mx.array([ids], dtype=mx.int32)
