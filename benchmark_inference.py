@@ -14,6 +14,8 @@ Run from this directory:
 from __future__ import annotations
 
 import argparse
+import json
+import statistics
 import time
 from pathlib import Path
 
@@ -28,29 +30,33 @@ from multiplex.kernel.scheduler import (
 
 MODEL = "Qwen3.6-27B-Q4-MTPLX-v2-Q2Mix11-L29UpQ4-Q3KO16"
 MODEL_PATH = Path.home() / ".mtplx" / "models" / MODEL
-PROMPTS = (
-    "你是什么模型？",
-    "用python帮我写一个最简单的二叉树前序遍历",
-)
+DATASET_PATH = Path(__file__).with_name("benchmarks") / "prompts.json"
 
 
-def prompt_ids(tokenizer, text: str) -> list[int]:
-    return tokenizer.apply_chat_template(
+def prompt_ids(tokenizer, text: str, target_length: int = 512) -> list[int]:
+    ids = tokenizer.apply_chat_template(
         [{"role": "user", "content": text}],
         add_generation_prompt=True,
         enable_thinking=False,
     )
+    # Keep the benchmark input length fixed, as in the challenge. Repeating
+    # the deterministic domain seed avoids model/tokenizer-specific token IDs.
+    if len(ids) < target_length:
+        ids = (ids * ((target_length + len(ids) - 1) // len(ids)))[:target_length]
+    return ids[:target_length]
 
 
-def run_once(engine: Engine, text: str, max_tokens: int) -> dict[str, float | int]:
+def run_once(engine: Engine, text: str, max_tokens: int, *, k: int) -> dict[str, float | int]:
     ids = prompt_ids(engine.tokenizer, text)
     drafter = find_drafter(engine)
     req = Req(rid=0, prompt=ids, max_tokens=max_tokens)
     scheduler = Scheduler(
         engine,
         drafter,
-        eos_token_ids=engine.tokenizer.eos_token_ids,
-        k=3,
+        # Fixed decode window, matching the challenge timing contract: do not
+        # stop the timed leg early on EOS.
+        eos_token_ids=set(),
+        k=k,
         chunk=512,
         debug=False,
         dynamic_depth=True,
@@ -74,11 +80,13 @@ def run_once(engine: Engine, text: str, max_tokens: int) -> dict[str, float | in
         emitted = scheduler.step()
         generated += sum(len(tokens) for _, tokens in emitted)
     decode_seconds = time.perf_counter() - t1
+    window_seconds = time.perf_counter() - t0
     return {
         "prompt_tokens": len(ids),
         "generated_tokens": generated,
         "prefill_seconds": prefill_seconds,
         "decode_seconds": decode_seconds,
+        "window_seconds": window_seconds,
         "prefill_tok_s": len(ids) / max(prefill_seconds, 1e-9),
         "decode_tok_s": max(generated - 1, 0) / max(decode_seconds, 1e-9),
         "cost_stats": scheduler.cost_snapshot(),
@@ -87,7 +95,13 @@ def run_once(engine: Engine, text: str, max_tokens: int) -> dict[str, float | in
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("-n", "--max-tokens", type=int, default=64)
+    parser.add_argument(
+        "-n", "--max-tokens", type=int, default=512,
+        help="decode window (default: 512; use -n 128 only for a quick smoke test)",
+    )
+    parser.add_argument("--dataset", default=str(DATASET_PATH))
+    parser.add_argument("--limit", type=int, default=2,
+                        help="only run the first N prompts (default: 2; 0 = all 8)")
     args = parser.parse_args()
 
     if not MODEL_PATH.is_dir():
@@ -99,18 +113,30 @@ def main() -> int:
 
     # Warm only the prefill path; decode/MTP warmup is intentionally omitted.
     engine.warmup(prompt_length=DEFAULT_PREFILL_CHUNK)
-    for text in PROMPTS:
-        result = run_once(engine, text, args.max_tokens)
-        print(f"\n[prompt] {text}")
-        print("prompt={prompt_tokens} tok, generated={generated_tokens} tok".format(**result))
-        print("prefill:  {prefill_tok_s:.1f} tok/s ({prefill_seconds:.3f}s)".format(**result))
-        print("generation: {decode_tok_s:.1f} tok/s ({decode_seconds:.3f}s)".format(**result))
-        for depth, stat in sorted(result["cost_stats"].items()):
+    entries = json.loads(Path(args.dataset).read_text(encoding="utf-8"))
+    if args.limit > 0:
+        entries = entries[:args.limit]
+    speedups = []
+    for entry in entries:
+        name, text = entry["id"], entry["prompt"]
+        serial = run_once(engine, text, args.max_tokens, k=0)
+        candidate = run_once(engine, text, args.max_tokens, k=3)
+        # Challenge-equivalent score: seed prefill is charged inside the
+        # measured decode window; there is no hand-picked prefill weight.
+        speedup = serial["window_seconds"] / max(candidate["window_seconds"], 1e-9)
+        speedups.append(speedup)
+        print(f"\n[prompt] {name}")
+        print(f"prompt={candidate['prompt_tokens']} tok, generated={candidate['generated_tokens']} tok")
+        print(f"serial window: {serial['window_seconds']:.3f}s (prefill {serial['prefill_tok_s']:.1f}, generation {serial['decode_tok_s']:.1f} tok/s)")
+        print(f"MTP window: {candidate['window_seconds']:.3f}s (prefill {candidate['prefill_tok_s']:.1f}, generation {candidate['decode_tok_s']:.1f} tok/s)")
+        print(f"raw speedup: {speedup:.3f}x")
+        for depth, stat in sorted(candidate["cost_stats"].items()):
             print(
                 f"cost D{depth}: {stat['seconds_per_round'] * 1000:.1f} ms/round, "
                 f"{stat['tokens_per_second']:.1f} committed tok/s, "
                 f"acceptance={stat['acceptance']:.2f}"
             )
+    print(f"\n[median raw speedup] {statistics.median(speedups):.3f}x")
     return 0
 
 

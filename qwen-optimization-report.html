@@ -150,6 +150,19 @@ batch: 1, 2, 4</code></pre>
 <ul><li><code>headStepCostRatio = 0.18</code></li><li>特定 depth price table</li><li>M5 专用 command buffer 大小</li><li>固定 512/1024 shape</li></ul>
 <p>不要原样复制，应改为运行时校准或配置项。</p>
 
+<h1>Challenge 等价测速结果（2025-08）</h1>
+<p>使用 multiplex 自有 8 领域 prompt pool，固定 512-token prompt 和 512-token decode window；Serial 使用 <code>k=0</code>，MTP 使用最大深度 3 并启用动态深度。窗口 speedup 按 challenge 规则计算：<code>(prefill + generation) serial / (prefill + generation) MTP</code>，不使用人为加权。</p>
+<table><tr><th>Prompt</th><th>Serial Prefill</th><th>MTP Prefill</th><th>Serial Generation</th><th>MTP Generation</th><th>Window Speedup</th></tr>
+<tr><td>science</td><td>209.6</td><td>208.5</td><td>21.7</td><td>36.0</td><td>1.558x</td></tr>
+<tr><td>botany</td><td>189.9</td><td>178.1</td><td>21.3</td><td>29.8</td><td>1.330x</td></tr>
+<tr><td>medicine</td><td>174.9</td><td>182.2</td><td>21.0</td><td>30.9</td><td>1.405x</td></tr>
+<tr><td>travel</td><td>193.1</td><td>176.7</td><td>20.3</td><td>23.9</td><td>1.146x</td></tr>
+<tr><td>biography</td><td>159.4</td><td>156.8</td><td>17.3</td><td>21.6</td><td>1.218x</td></tr>
+<tr><td>philosophy</td><td>166.0</td><td>172.3</td><td>18.8</td><td>25.4</td><td>1.311x</td></tr>
+<tr><td>drama</td><td>178.0</td><td>179.8</td><td>19.7</td><td>25.6</td><td>1.265x</td></tr>
+<tr><td>essay</td><td>182.5</td><td>184.9</td><td>20.2</td><td>25.0</td><td>1.212x</td></tr></table>
+<p>单位为 tok/s；最终 8 个 prompt 的 median raw window speedup 为 <strong>1.288x</strong>。测速脚本：<code>benchmark_inference.py</code>。</p>
+
 <h1>推荐实施顺序</h1>
 <h3>第一阶段：低风险</h3>
 <ol><li>增加完整 shape/JIT warmup；</li><li>确认 prefill 不计算全序列 lm_head；</li><li>增加长上下文 SDPA warmup；</li><li>warmup 后清理 allocator cache；</li><li>为 MTP cache 增加长 prompt / partial reject parity 测试。</li></ol>
