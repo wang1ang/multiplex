@@ -5,9 +5,10 @@
 
 A fixed input box sits at the bottom (like most CLIs); generated text scrolls
 above it. Type a prompt + Enter to start; type another while it runs to add it
-to the live batch. ``--prompt`` and ``--prompt-file`` submit an initial request
-automatically. JSON/JSONL prompt files use the first object's ``prompt`` field.
-:q or Ctrl-C quits.
+to the live batch. A later prompt includes all earlier *completed* turns as
+user/assistant messages in the chat template. ``--prompt`` and ``--prompt-file``
+submit an initial request automatically. JSON/JSONL prompt files use the first
+object's ``prompt`` field. :q or Ctrl-C quits.
 
 Drives multiplex.kernel.scheduler.Scheduler: new requests are chunk-prefilled and
 merged into the running batch. Dynamic D1..D3 is the default. ``-d`` changes
@@ -39,14 +40,28 @@ from multiplex.kernel.scheduler import (
 )
 
 
-def to_ids(tokenizer, text, raw, think=None):
+def to_ids(tokenizer, text, raw, think=None, history=()):
+    """Format ``text`` with completed user/assistant turns before it.
+
+    ``history`` is ordered as ``(user_prompt, assistant_response)`` pairs. Raw
+    mode deliberately remains a literal single prompt, without a chat template.
+    """
     if raw:
         return tokenizer.encode(text)
     kwargs = {}
     if think is not None:
         kwargs["enable_thinking"] = think
+    messages = [
+        message
+        for prompt, response in history
+        for message in (
+            {"role": "user", "content": prompt},
+            {"role": "assistant", "content": response},
+        )
+    ]
+    messages.append({"role": "user", "content": text})
     return tokenizer.apply_chat_template(
-        [{"role": "user", "content": text}], add_generation_prompt=True, **kwargs
+        messages, add_generation_prompt=True, **kwargs
     )
 
 
@@ -146,6 +161,8 @@ def main() -> int:
 
     prompts = {}         # rid -> prompt text
     produced_text = {}   # rid -> decoded output so far
+    produced_ids = {}    # rid -> generated token ids, for lossless history
+    completed = set()    # rids no longer in the scheduler's live batch
 
     # Buffers are read-only panes; putting the cursor at the end makes each
     # window auto-scroll to the bottom (follow latest output).
@@ -191,10 +208,20 @@ def main() -> int:
         next_rid[0] += 1
         prompts[rid] = text
         produced_text[rid] = ""
+        produced_ids[rid] = []
+        # Keep the original request order, but include only turns that have
+        # completed by the time this prompt is submitted.  Concurrent requests
+        # are intentionally not part of one another's conversation.
+        history = [
+            (prompts[old_rid], decode(tokenizer, produced_ids[old_rid]))
+            for old_rid in sorted(completed)
+        ]
         # Prefill the new request and merge it into the live batch. The
         # merge returns each joined request's FIRST token — show it now (it is
         # not part of the next step()'s output).
-        group = PrefillGroup(req=Req(rid, to_ids(tokenizer, text, args.raw, args.think), args.max_tokens))
+        group = PrefillGroup(req=Req(
+            rid, to_ids(tokenizer, text, args.raw, args.think, history), args.max_tokens
+        ))
         while True:
             done = sch.prefill_chunk(group)
             if done is None:
@@ -202,6 +229,7 @@ def main() -> int:
             if done:
                 break
         for r, first in sch.merge_ready(group):
+            produced_ids[r].append(first)
             produced_text[r] += decode(tokenizer, [first])
         render()
 
@@ -232,8 +260,11 @@ def main() -> int:
         # one scheduler step per loop iteration; yield to the UI between steps
         while True:
             if sch.has_rows():
+                live_before = sch.live_rids()
                 for rid, toks in sch.step():
+                    produced_ids[rid].extend(toks)
                     produced_text[rid] = produced_text.get(rid, "") + decode(tokenizer, toks)
+                completed.update(live_before - sch.live_rids())
                 render()
                 app.invalidate()
             await asyncio.sleep(0.001)

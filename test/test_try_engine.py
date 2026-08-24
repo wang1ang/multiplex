@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from try_engine import load_prompt_file, parse_args
+from try_engine import load_prompt_file, parse_args, to_ids
 
 
 # The other entry points' depth defaults are asserted together in
@@ -20,6 +20,36 @@ def test_dynamic_depth_can_be_disabled():
 
     assert args.depth == 3
     assert args.dynamic_depth is False
+
+
+class _Tokenizer:
+    def apply_chat_template(self, messages, **kwargs):
+        self.messages = messages
+        self.kwargs = kwargs
+        return [1]
+
+    def encode(self, text):
+        self.encoded = text
+        return [2]
+
+
+def test_to_ids_includes_completed_turns_in_chat_template():
+    tokenizer = _Tokenizer()
+
+    assert to_ids(tokenizer, "next", False, history=[("first", "answer")]) == [1]
+    assert tokenizer.messages == [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "answer"},
+        {"role": "user", "content": "next"},
+    ]
+    assert tokenizer.kwargs == {"add_generation_prompt": True}
+
+
+def test_to_ids_raw_mode_does_not_apply_chat_template_or_history():
+    tokenizer = _Tokenizer()
+
+    assert to_ids(tokenizer, "next", True, history=[("first", "answer")]) == [2]
+    assert tokenizer.encoded == "next"
 
 
 def test_load_prompt_file_reads_plain_text(tmp_path):
