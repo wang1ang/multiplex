@@ -17,6 +17,10 @@ way, fully offline.
 
 See `docs/ARCHITECTURE.md` for how the code is layered.
 
+For maintaining the project-local MLX fork, baseline/custom builds, and
+incremental Metal-kernel porting from the Qwen challenge, see
+[`docs/MLX_KERNEL_MAINTENANCE.md`](docs/MLX_KERNEL_MAINTENANCE.md).
+
 ## Install
 
 ```bash
