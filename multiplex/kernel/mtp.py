@@ -36,6 +36,19 @@ def find_mtp(model_path: str) -> str | None:
     model_dir = os.path.expanduser(model_path)
     candidates = []
 
+    # Accept a portable config-level sidecar declaration before consulting
+    # MTPLX-specific runtime metadata.
+    config_path = os.path.join(model_dir, "config.json")
+    try:
+        with open(config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        extra = cfg.get("mlx_lm_extra_tensors", {})
+        for value in (cfg.get("mtp_file"), extra.get("mtp_file") if isinstance(extra, dict) else None):
+            if isinstance(value, str) and value:
+                candidates.append(os.path.join(model_dir, value))
+    except Exception:
+        pass
+
     runtime = os.path.join(model_dir, "mtplx_runtime.json")
     if os.path.exists(runtime):
         try:
@@ -94,6 +107,13 @@ def _quant_config(model_path: str) -> dict:
 
 
 def _mtp_norms_are_delta_encoded(model_path: str) -> bool:
+    """Detect the MTP norm encoding from metadata, with a safe fallback.
+
+    MTPLX artifacts historically used a delta-coded RMSNorm convention but
+    some packages omitted the private metadata flag.  Prefer explicit fields;
+    when absent, inspect the MTP sidecar's norm statistics so Multiplex can
+    load a portable artifact without requiring MTPLX-only config keys.
+    """
     with open(os.path.join(model_path, "config.json")) as f:
         cfg = json.load(f)
     mtp_quant = cfg.get("mtplx_mtp_quantization")
@@ -106,11 +126,30 @@ def _mtp_norms_are_delta_encoded(model_path: str) -> bool:
             mtp_quant.get("norm_encoding"),
             mtp_quant.get("norm_weight_encoding"),
         ])
-    return any(
+    if any(
         str(value).strip().lower() in {"delta", "delta_plus_one", "mlx_delta"}
         for value in values
         if value is not None
-    )
+    ):
+        return True
+    # Portable fallback: delta-coded norms have values around zero (and often
+    # negative entries), while ordinary RMSNorm weights are centered near 1.
+    sidecar = find_mtp(model_path)
+    if sidecar is None:
+        return False
+    try:
+        raw = mx.load(sidecar)
+        probes = [v for k, v in raw.items()
+                  if k.endswith("norm.weight") or k.endswith("q_norm.weight")
+                  or k.endswith("k_norm.weight")]
+        if not probes:
+            return False
+        mx.eval(*probes)
+        means = [float(mx.mean(v)) for v in probes]
+        minima = [float(mx.min(v)) for v in probes]
+        return sum(means) / len(means) < 0.9 or min(minima) < -0.05
+    except Exception:
+        return False
 
 
 def _num_mtp_layers(model_path: str) -> int:
