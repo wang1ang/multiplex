@@ -1,8 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${MULTIPLEX_PYTHON:-$HERE/.venv/bin/python}"
-if [ ! -x "$PYTHON" ]; then
-  PYTHON="${MULTIPLEX_PYTHON:-python3}"
-fi
+source "$HERE/scripts/common.sh"
+PYTHON="$(multiplex_ensure_mlx "$HERE")"
 exec "$PYTHON" "$HERE/try_engine.py" "$@"

@@ -19,10 +19,8 @@ fi
 
 # 1. multiplex server (background), using the project-local custom MLX build.
 cd "$DIR"
-PYTHON="${MULTIPLEX_PYTHON:-$DIR/.venv/bin/python}"
-if [ ! -x "$PYTHON" ]; then
-  PYTHON="${MULTIPLEX_PYTHON:-python3}"
-fi
+source "$DIR/scripts/common.sh"
+PYTHON="$(multiplex_ensure_mlx "$DIR")"
 echo "Starting multiplex server -> http://127.0.0.1:$SERVE_PORT/v1"
 "$PYTHON" -m multiplex.server --model "$MODEL" --port "$SERVE_PORT" --debug &
 

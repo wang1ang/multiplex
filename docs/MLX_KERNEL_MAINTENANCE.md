@@ -42,9 +42,10 @@ multiplex-qwen38-kernels
 ./try_engine.sh
 ```
 
-这些脚本可用 `MULTIPLEX_PYTHON=/path/to/python` 显式覆盖。直接调用 Python
-时也应使用 `.venv/bin/python`；不要用系统 `python3`，否则可能加载 PyPI 的
-旧版 MLX。
+这些脚本会先检查 `.venv` 中的 MLX；如果不存在，会自动调用
+`scripts/build-local-mlx.sh` 构建。可用 `MULTIPLEX_PYTHON=/path/to/python`
+显式覆盖。直接调用 Python 时也应使用 `.venv/bin/python`；不要用系统
+`python3`，否则可能加载 PyPI 的旧版 MLX。
 
 ## baseline/custom 双版本
 

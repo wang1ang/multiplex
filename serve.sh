@@ -8,11 +8,9 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-DEFAULT_PYTHON="$HERE/.venv/bin/python"
-PYTHON="${MULTIPLEX_PYTHON:-$DEFAULT_PYTHON}"
-if [ ! -x "$PYTHON" ]; then
-  PYTHON="${MULTIPLEX_PYTHON:-python3}"
-fi
+# Ensure launchers never silently fall back to a system MLX.
+source "$HERE/scripts/common.sh"
+PYTHON="$(multiplex_ensure_mlx "$HERE")"
 
 # --- pi ----------------------------------------------------------------------
 # pi discovers models through its extension API only, so it gets an extension
