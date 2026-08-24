@@ -122,7 +122,7 @@ class DynamicDepthTests(unittest.TestCase):
         self.assertEqual(decision.current, 3)
         self.assertIsNone(decision.reason)
 
-    def test_reset_can_restart_at_max(self):
+    def test_reset_can_restart_at_initial_depth(self):
         controller = DynamicDepthController(
             3,
             window=2,
@@ -133,14 +133,25 @@ class DynamicDepthTests(unittest.TestCase):
         feed(controller, [0, 0])
         self.assertEqual(controller.current, 2)
 
-        controller.reset(restart_at_max=False)
+        controller.reset(restart_at_initial=False)
         self.assertEqual(controller.current, 2)
         self.assertEqual(controller.samples, 0)
 
-        controller.reset(restart_at_max=True)
+        controller.reset(restart_at_initial=True)
         self.assertEqual(controller.current, 3)
         self.assertEqual(controller.samples, 0)
         self.assertEqual(controller.cooldown, 0)
+
+    def test_starts_at_configured_depth_and_grows_without_ceiling(self):
+        controller = DynamicDepthController(
+            None, initial_depth=3, window=2, min_samples=2,
+            down_threshold=0.5, up_threshold=0.8,
+        )
+        self.assertEqual(controller.current, 3)
+        decision = feed(controller, [3, 3])
+        self.assertEqual((decision.previous, decision.current), (3, 4))
+        decision = feed(controller, [4, 4])
+        self.assertEqual((decision.previous, decision.current), (4, 5))
 
     def test_acceptance_rates_use_per_depth_trial_counts(self):
         req = Req(0, [1], 10)

@@ -88,7 +88,7 @@ class DFlashAdaptiveVerifyWiringTests(unittest.TestCase):
     def test_reset_restarts_at_warm_start_not_full_block(self):
         sch = self._sched(_FakeDrafter(), dynamic_depth=False)
         sch.depth_controller.current = 3
-        sch._reset_dynamic_depth(restart_at_max=True)
+        sch._reset_dynamic_depth(restart_at_initial=True)
         self.assertEqual(sch.k, 7)
 
     def test_verify_width_narrows_on_low_acceptance(self):

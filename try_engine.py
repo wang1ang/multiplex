@@ -11,9 +11,9 @@ submit an initial request automatically. JSON/JSONL prompt files use the first
 object's ``prompt`` field. :q or Ctrl-C quits.
 
 Drives multiplex.kernel.scheduler.Scheduler: new requests are chunk-prefilled and
-merged into the running batch. Dynamic D1..D3 is the default. ``-d`` changes
-the maximum, ``--no-dynamic-depth`` makes it fixed, and ``-d 0`` selects pure
-AR.
+merged into the running batch. Dynamic decoding starts at D3 and has no
+artificial ceiling. ``-d`` changes the starting depth, ``--no-dynamic-depth``
+makes it fixed, and ``-d 0`` selects pure AR.
 """
 
 import argparse
@@ -110,7 +110,7 @@ def parse_args(argv=None):
         "--depth",
         type=int,
         default=3,
-        help="maximum dynamic MTP depth (default: 3); fixed with "
+        help="initial dynamic MTP depth (default: 3); fixed with "
              "--no-dynamic-depth; 0 = pure AR",
     )
     ap.add_argument(

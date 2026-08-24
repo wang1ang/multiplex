@@ -74,9 +74,10 @@ class DepthDecision:
 
 
 class DynamicDepthController:
-    """Select Dmin..Dmax from recent full-depth acceptance.
+    """Select Dmin upward from recent full-depth acceptance.
 
-    The scheduler commits the minimum accepted prefix across a live batch, so
+    ``max_depth=None`` deliberately leaves native MTP unbounded. The scheduler
+    commits the minimum accepted prefix across a live batch, so
     observations use that effective batch acceptance rather than averaging
     independent rows. A low full-depth rate steps down. A high rate may step up
     after a cooldown; the asymmetric thresholds and cooldown prevent a prompt
@@ -85,7 +86,7 @@ class DynamicDepthController:
 
     def __init__(
         self,
-        max_depth: int,
+        max_depth: int | None,
         *,
         min_depth: int = 1,
         window: int = 16,
@@ -93,9 +94,17 @@ class DynamicDepthController:
         up_threshold: float = 0.80,
         down_threshold: float = 0.50,
         retry_cooldown: int = 24,
+        initial_depth: int | None = None,
     ) -> None:
-        max_depth = max(1, int(max_depth))
-        min_depth = max(0, min(int(min_depth), max_depth))
+        max_depth = None if max_depth is None else max(1, int(max_depth))
+        min_depth = max(0, int(min_depth))
+        if max_depth is not None:
+            min_depth = min(min_depth, max_depth)
+        if initial_depth is None:
+            initial_depth = max_depth if max_depth is not None else min_depth
+        initial_depth = max(min_depth, int(initial_depth))
+        if max_depth is not None:
+            initial_depth = min(initial_depth, max_depth)
         window = max(1, int(window))
         min_samples = max(1, min(int(min_samples), window))
         if not 0.0 <= down_threshold < up_threshold <= 1.0:
@@ -110,7 +119,8 @@ class DynamicDepthController:
         self.up_threshold = float(up_threshold)
         self.down_threshold = float(down_threshold)
         self.retry_cooldown = max(0, int(retry_cooldown))
-        self.current = max_depth
+        self.initial_depth = initial_depth
+        self.current = initial_depth
         self._full_hits: deque[int] = deque(maxlen=window)
         self._cooldown = 0
 
@@ -128,11 +138,11 @@ class DynamicDepthController:
     def cooldown(self) -> int:
         return self._cooldown
 
-    def reset(self, *, restart_at_max: bool = False) -> None:
+    def reset(self, *, restart_at_initial: bool = False) -> None:
         """Discard evidence after a live-batch composition change."""
         self._full_hits.clear()
-        if restart_at_max:
-            self.current = self.max_depth
+        if restart_at_initial:
+            self.current = self.initial_depth
             self._cooldown = 0
 
     def observe(self, accepted: int) -> DepthDecision:
@@ -150,7 +160,7 @@ class DynamicDepthController:
                 self._cooldown = self.retry_cooldown
                 reason = "low_acceptance"
             elif (
-                previous < self.max_depth
+                (self.max_depth is None or previous < self.max_depth)
                 and self._cooldown == 0
                 and rate >= self.up_threshold
             ):
@@ -210,8 +220,10 @@ class Scheduler:
         else:
             self.per_row_commit = bool(per_row_commit)
         self._per_row_fallback_logged = False
-        # No MTP head -> no speculation possible; depth is forced to 0 (AR).
-        self.max_k = max(int(k), 0) if drafter is not None else 0
+        # ``k`` is the dynamic controller's starting depth. Native MTP chains
+        # its head autoregressively, so dynamic MTP deliberately has no ceiling.
+        self.initial_k = max(int(k), 0) if drafter is not None else 0
+        self.max_k = self.initial_k
         supports_dyn = (
             getattr(drafter, "supports_dynamic_depth", True)
             if drafter is not None else True
@@ -220,6 +232,7 @@ class Scheduler:
         # and cannot adapt it; honour that over --depth/dynamic-depth.
         if drafter is not None and not supports_dyn:
             self.max_k = int(getattr(drafter, "max_draft_len", self.max_k))
+            self.initial_k = self.max_k
             dynamic_depth = False
         # Adaptive-verify: the draft width stays pinned at the fixed block, but
         # the depth controller picks a (smaller) trunk-verify width. Build the
@@ -236,13 +249,14 @@ class Scheduler:
         self.dynamic_depth = bool(dynamic_depth and self.max_k > 0)
         self.depth_controller = (
             DynamicDepthController(
-                self.max_k,
+                None if self.dynamic_depth and supports_dyn else self.max_k,
                 min_depth=0 if self.dynamic_depth else 1,
                 window=dynamic_depth_window,
                 min_samples=dynamic_depth_min_samples,
                 up_threshold=dynamic_depth_up_threshold,
                 down_threshold=dynamic_depth_down_threshold,
                 retry_cooldown=dynamic_depth_retry_cooldown,
+                initial_depth=self.initial_k,
             )
             if (self.dynamic_depth or self.adaptive_verify)
             else None
@@ -250,7 +264,7 @@ class Scheduler:
         self.k = (
             self.depth_controller.current
             if self.depth_controller is not None
-            else self.max_k
+            else self.initial_k
         )
         # Adaptive-verify warms up near DFlash's typical accepted width, not the
         # full block: starting at max_k would spend a whole short generation
@@ -482,7 +496,7 @@ class Scheduler:
             # draft() sees a matching batch dimension.
             if self.ctx is not None:
                 self.ctx = self.dr.merge_context(ctxs)
-        self._reset_dynamic_depth(restart_at_max=False)
+        self._reset_dynamic_depth(restart_at_initial=False)
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
 
@@ -812,13 +826,13 @@ class Scheduler:
             for index, count in enumerate(req.accept_counts)
         ]
 
-    def _reset_dynamic_depth(self, *, restart_at_max: bool) -> None:
+    def _reset_dynamic_depth(self, *, restart_at_initial: bool) -> None:
         if self.depth_controller is None:
             return
-        self.depth_controller.reset(restart_at_max=restart_at_max)
+        self.depth_controller.reset(restart_at_initial=restart_at_initial)
         # Adaptive-verify restarts at its warm-start width, not the full block,
         # so a batch composition change doesn't reintroduce the slow descent.
-        if restart_at_max and self._adaptive_verify_start is not None:
+        if restart_at_initial and self._adaptive_verify_start is not None:
             self.depth_controller.current = self._adaptive_verify_start
         self.k = self.depth_controller.current
 
@@ -835,13 +849,13 @@ class Scheduler:
             if self.ctx is not None:
                 self.ctx = self.dr.filter_context(self.ctx, keep)
             self.rows = [self.rows[i] for i in keep]
-            self._reset_dynamic_depth(restart_at_max=False)
+            self._reset_dynamic_depth(restart_at_initial=False)
         else:
             self.state = self.h = self.primary = None
             self.ctx = None
             self.rows = []
             self.dcache = self.dr.make_cache() if self.dr is not None else None
-            self._reset_dynamic_depth(restart_at_max=True)
+            self._reset_dynamic_depth(restart_at_initial=True)
 
     def drop(self, rids) -> None:
         """Remove rows for the given request ids (client disconnected)."""

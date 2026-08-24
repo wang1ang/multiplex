@@ -465,7 +465,7 @@ def parse_args(argv=None):
                          "decoding); pairs with a Qwen3.6-27B target. "
                          "Overrides --mtp.")
     ap.add_argument("-d", "--depth", type=int, default=3,
-                    help="maximum dynamic MTP depth (default: 3); fixed with "
+                    help="initial dynamic MTP depth (default: 3); fixed with "
                          "--no-dynamic-depth; 0 disables speculation")
     ap.add_argument(
         "--dynamic-depth",
