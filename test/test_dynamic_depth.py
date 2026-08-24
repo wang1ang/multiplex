@@ -64,6 +64,29 @@ class DynamicDepthTests(unittest.TestCase):
         self.assertEqual(decision.current, 1)
         self.assertIsNone(decision.reason)
 
+    def test_can_fall_back_to_ar_and_retry_mtp(self):
+        controller = DynamicDepthController(
+            3,
+            min_depth=0,
+            window=2,
+            min_samples=2,
+            down_threshold=0.5,
+            up_threshold=0.8,
+            retry_cooldown=2,
+        )
+
+        # Repeated MTP misses step down through D2/D1 to D0 (pure AR).
+        feed(controller, [0, 0])
+        feed(controller, [0, 0])
+        decision = feed(controller, [0, 0])
+        self.assertEqual((decision.previous, decision.current), (1, 0))
+        self.assertEqual(decision.reason, "low_acceptance")
+
+        # D0 has no draft to reject; after the cooldown it probes D1 again.
+        decision = feed(controller, [0, 0])
+        self.assertEqual((decision.previous, decision.current), (0, 1))
+        self.assertEqual(decision.reason, "high_acceptance")
+
     def test_retries_higher_depth_after_cooldown(self):
         controller = DynamicDepthController(
             3,

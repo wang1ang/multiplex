@@ -74,7 +74,7 @@ class DepthDecision:
 
 
 class DynamicDepthController:
-    """Select D1..Dmax from recent full-depth acceptance.
+    """Select Dmin..Dmax from recent full-depth acceptance.
 
     The scheduler commits the minimum accepted prefix across a live batch, so
     observations use that effective batch acceptance rather than averaging
@@ -95,7 +95,7 @@ class DynamicDepthController:
         retry_cooldown: int = 24,
     ) -> None:
         max_depth = max(1, int(max_depth))
-        min_depth = max(1, min(int(min_depth), max_depth))
+        min_depth = max(0, min(int(min_depth), max_depth))
         window = max(1, int(window))
         min_samples = max(1, min(int(min_samples), window))
         if not 0.0 <= down_threshold < up_threshold <= 1.0:
@@ -231,10 +231,13 @@ class Scheduler:
             and getattr(drafter, "supports_adaptive_verify", False)
             and self.max_k > 1
         )
-        self.dynamic_depth = bool(dynamic_depth and self.max_k > 1)
+        # Native MTP may fall back to D0 (pure AR) when even one draft token
+        # is unprofitable. Keep a controller at max_k == 1 for that case too.
+        self.dynamic_depth = bool(dynamic_depth and self.max_k > 0)
         self.depth_controller = (
             DynamicDepthController(
                 self.max_k,
+                min_depth=0 if self.dynamic_depth else 1,
                 window=dynamic_depth_window,
                 min_samples=dynamic_depth_min_samples,
                 up_threshold=dynamic_depth_up_threshold,
