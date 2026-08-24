@@ -71,17 +71,19 @@ conversation.
 - `--no-debug` — silence scheduler/request logs.
 
 `serve.sh` also points local coding agents (pi, Codex) at the running server
-for the duration, restoring their config on exit. Run the server directly with
-`python -m multiplex.server` (same flags) to skip that.
+for the duration, restoring their config on exit. It uses the project-local
+`.venv` and custom-built MLX by default; override with `MULTIPLEX_PYTHON` only
+for an explicit alternative. Run the server directly with
+`.venv/bin/python -m multiplex.server` (same flags) to skip agent wiring.
 
 ## Chat CLI
 
-`try_engine.py` is a local terminal chat client, useful for quick generation
+`try_engine.sh`/`try_engine.py` is a local terminal chat client, useful for quick generation
 tests and for watching scheduler logs (prefill, JOIN, ADVANCE, MTP acceptance,
 prefix-cache hits):
 
 ```bash
-python try_engine.py --model MODEL_NAME
+./try_engine.sh --model MODEL_NAME
 ```
 
 ## Requirements

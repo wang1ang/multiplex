@@ -8,7 +8,11 @@
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-PYTHON="${MULTIPLEX_PYTHON:-python3}"
+DEFAULT_PYTHON="$HERE/.venv/bin/python"
+PYTHON="${MULTIPLEX_PYTHON:-$DEFAULT_PYTHON}"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="${MULTIPLEX_PYTHON:-python3}"
+fi
 
 # --- pi ----------------------------------------------------------------------
 # pi discovers models through its extension API only, so it gets an extension

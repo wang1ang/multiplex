@@ -32,6 +32,20 @@ multiplex-qwen38-kernels
 `multiplex_qmv_fast_crossrow_affine4_g64` 路径，只在窄条件下启用；其他 shape
 继续走 MLX 原有 `qmv_fast_impl`。
 
+## 入口与默认 MLX
+
+项目入口默认使用 `.venv` 中的 custom MLX：
+
+```text
+./serve.sh
+./serve-webui.sh
+./try_engine.sh
+```
+
+这些脚本可用 `MULTIPLEX_PYTHON=/path/to/python` 显式覆盖。直接调用 Python
+时也应使用 `.venv/bin/python`；不要用系统 `python3`，否则可能加载 PyPI 的
+旧版 MLX。
+
 ## baseline/custom 双版本
 
 始终保留两套本地编译结果：
