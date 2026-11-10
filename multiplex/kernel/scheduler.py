@@ -33,6 +33,7 @@ from .prefixcache.runtime import PrefixCacheRuntime
 
 # Shared prefill chunk geometry used by scheduling and startup warmup.
 DEFAULT_PREFILL_CHUNK = 512
+ADVANCE_WINDOW = 16   # decode rounds behind the ADVANCE log's tok/s
 
 
 @dataclass
@@ -56,8 +57,10 @@ class Req:
     session_cache_pos: set[int] = field(default_factory=set)
     output_log_started: bool = False
     output_log_chars: int = 0
-    advance_tokens: int = 0
-    advance_seconds: float = 0.0
+    # (tokens, seconds) of the last ADVANCE_WINDOW decode rounds, for the log's
+    # tok/s: a window, so one slow round (the first after prefill) fades out.
+    advance_window: deque = field(
+        default_factory=lambda: deque(maxlen=ADVANCE_WINDOW))
     accept_counts: list[int] = field(default_factory=list)
     accept_trials: int = 0
     accept_trials_by_depth: list[int] = field(default_factory=list)
@@ -821,10 +824,9 @@ class Scheduler:
             stat["draft_trials"] += k * B
         emitted_by_rid = {rid: toks for rid, toks in emitted}
         for req in rows:
-            req.advance_tokens += len(emitted_by_rid.get(req.rid, ()))
-            req.advance_seconds += dt
-        total_tokens = sum(req.advance_tokens for req in rows)
-        total_seconds = sum(req.advance_seconds for req in rows)
+            req.advance_window.append((len(emitted_by_rid.get(req.rid, ())), dt))
+        total_tokens = sum(n for req in rows for n, _ in req.advance_window)
+        total_seconds = sum(t for req in rows for _, t in req.advance_window)
         tok_s = total_tokens / max(total_seconds, 1e-9)
         prob = self._bonus_probs(trunk_logits, trunk_pred, m) if self.debug else None
         prob_text = f" prob={prob}" if prob is not None else ""
