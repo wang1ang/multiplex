@@ -20,6 +20,12 @@ from .state import PrefixCacheState
 
 
 PROMPT_CACHE_MIN_TOKENS = 4096
+# Prompt blocks get an SSM snapshot (a resume point, ~150 MB on a 27B hybrid)
+# only every this many blocks, plus the prompt's last full block. Agent turns
+# extend the previous prompt, so they resume from that last block; the sparse
+# ones only serve edits further back, and snapshotting every block mostly
+# copied and wrote out state that LRU then evicted within the same prefill.
+PROMPT_SNAPSHOT_STRIDE = 8
 
 
 class PrefixCacheRuntime:
@@ -28,7 +34,7 @@ class PrefixCacheRuntime:
         engine: Engine,
         *,
         drafter=None,
-        budget: int | str | dict[str, int | str] = "4GiB",
+        budget: int | str | dict[str, int | str] = "8GiB",
         disk_dir=None,
         chunk: int = 512,
         log=None,
@@ -118,9 +124,11 @@ class PrefixCacheRuntime:
         ssm = None
         source = None
         cached_h = None
-        if group.cacheable and end >= PROMPT_CACHE_MIN_TOKENS:
+        block = end // self.chunk
+        last_full = len(ids) // self.chunk
+        if (group.cacheable and end >= PROMPT_CACHE_MIN_TOKENS
+                and (block % PROMPT_SNAPSHOT_STRIDE == 0 or block == last_full)):
             ssm = self.state.clone_ssm(group.state.cache)
-            block = end // self.chunk
             source = f"prompt rid={req.rid} block={block}"
             cached_h = h[:, -1:, :]
             mx.eval(cached_h)
