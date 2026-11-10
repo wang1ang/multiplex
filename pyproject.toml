@@ -1,6 +1,6 @@
 [project]
 name = "multiplex"
-version = "0.0.0"
+version = "0.1.0"
 description = "Local LLM inference on mlx-lm: batched MTP speculative decoding with a dynamic-batch scheduler (concurrent requests join/leave mid-flight)."
 readme = "README.md"
 license = "MIT"
