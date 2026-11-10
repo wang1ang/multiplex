@@ -92,10 +92,15 @@ class RequestManager:
     def finish(self, rid: int, *, notify: bool) -> None:
         with self._lock:
             q = self._queues.pop(rid, None)
-            self._toks.pop(rid, None)
-            self._shown.pop(rid, None)
+            toks = self._toks.pop(rid, None)
+            shown = self._shown.pop(rid, None)
             self._cancelled.discard(rid)
         if notify and q is not None:
+            # emit() holds back a trailing U+FFFD; whatever is still held is
+            # final now (genuinely invalid bytes stay visible as U+FFFD).
+            tail = self._decode(toks)[shown:] if toks else ""
+            if tail:
+                q.put(tail)
             q.put(_DONE)
 
     def emit(self, emitted) -> None:
@@ -108,7 +113,10 @@ class RequestManager:
                 all_toks = list(self._toks[rid])
                 shown = self._shown[rid]
                 q = self._queues.get(rid)
-            text = decode(all_toks)
+            # A character split across tokens decodes as a trailing U+FFFD
+            # until its last byte arrives; sending it early would desync
+            # `shown`, and the completed character would never be sent.
+            text = decode(all_toks).rstrip("\ufffd")
             if q is None or len(text) <= shown:
                 continue
             delta = text[shown:]
