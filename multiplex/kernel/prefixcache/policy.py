@@ -135,7 +135,7 @@ class PrefixCache:
 
     def __init__(
         self,
-        budget: int | str | dict[str, int | str] = "4GiB",
+        budget: int | str | dict[str, int | str] = "8GiB",
         disk_dir: str | os.PathLike | None = None,
         chunk: int = 512,
         log=None,

@@ -424,7 +424,7 @@ def make_handler(backend: Hub):
 
 
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
-          debug=False, prefix_cache_dir="auto", prefix_cache="4GiB", depth=3,
+          debug=False, prefix_cache_dir="auto", prefix_cache="8GiB", depth=3,
           dynamic_depth=True, dflash=None):
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
@@ -481,7 +481,7 @@ def parse_args(argv=None):
     ap.add_argument("--prefix-cache-dir", default="auto",
                     help="prefix cache load dir; default 'auto' reads "
                          "~/.cache/multiplex/prefixcache/<model>.")
-    ap.add_argument("--prefix-cache", default="4GiB",
+    ap.add_argument("--prefix-cache", default="8GiB",
                     help="resident prefix-cache budget per pool, in bytes or "
                          "with a unit (e.g. 512MiB, 4GiB); 0 disables reuse.")
     return ap.parse_args(argv)

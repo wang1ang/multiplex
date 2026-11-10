@@ -203,7 +203,7 @@ class PrefillGroup:
 
 class Scheduler:
     def __init__(self, engine: Engine, drafter: Drafter | None, *,
-                 eos_token_ids, k=3, chunk=DEFAULT_PREFILL_CHUNK, prefix_cache="4GiB",
+                 eos_token_ids, k=3, chunk=DEFAULT_PREFILL_CHUNK, prefix_cache="8GiB",
                  prefix_cache_dir=None, output_log_dir=None,
                  output_decode=None, debug=False, log=None,
                  dynamic_depth=True, dynamic_depth_window=16,
