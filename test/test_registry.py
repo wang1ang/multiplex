@@ -166,3 +166,16 @@ def test_noninteractive_selection_marks_missing_default_models(
     assert "a-model" in message
     assert "b-model" in message
     assert "org/default-model (needs download)" in message
+
+
+def test_default_model_matches_local_dir_by_bare_repo_name(monkeypatch, tmp_path):
+    model_dir = tmp_path / "default-model"
+    model_dir.mkdir()
+    (model_dir / "config.json").write_text("{}")
+    monkeypatch.setattr(registry, "DEFAULT_MODELS", ("org/default-model",))
+
+    models = registry.list_models(str(tmp_path))
+    assert registry._missing_default_models(models) == []
+    # Asking for the HF id resolves to that local dir instead of downloading.
+    monkeypatch.setattr(registry, "download_model", lambda *a, **k: 1 / 0)
+    assert registry.resolve("org/default-model", root=str(tmp_path)).path == str(model_dir)

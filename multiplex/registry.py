@@ -64,6 +64,14 @@ def _hf_names(model: str) -> tuple[str, str]:
     return repo_id, repo_id.replace("/", "--")
 
 
+def _local_names(model: str) -> set[str]:
+    """Local directory names that already hold HF ``model``: the repo id, its
+    ``org--name`` download dir, or the bare repo name (how models placed or
+    linked by hand are usually named)."""
+    repo_id, local_name = _hf_names(model)
+    return {repo_id, local_name, repo_id.rsplit("/", 1)[-1]}
+
+
 def download_model(model: str, root: str = DEFAULT_ROOT) -> ModelEntry:
     """Download an HF repo into the local model root and return its entry."""
     try:
@@ -98,9 +106,9 @@ def resolve(arg: str | None, root: str = DEFAULT_ROOT) -> ModelEntry | list[Mode
         if arg.startswith(("/", "~", "./", "../")):
             path = os.path.expanduser(arg.rstrip("/"))
             return ModelEntry(name=os.path.basename(path), path=path)
-        _, local_name = _hf_names(arg)
+        names = _local_names(arg) | {arg}
         for e in list_models(root):
-            if e.name == arg or e.name == local_name:
+            if e.name in names:
                 return e
         return download_model(arg, root)
 
@@ -112,8 +120,7 @@ def _missing_default_models(models: list[ModelEntry]) -> list[str]:
     local_names = {e.name for e in models}
     missing = []
     for model in DEFAULT_MODELS:
-        repo_id, local_name = _hf_names(model)
-        if repo_id in local_names or local_name in local_names:
+        if _local_names(model) & local_names:
             continue
         missing.append(model)
     return missing
