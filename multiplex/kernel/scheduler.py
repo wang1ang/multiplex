@@ -500,6 +500,25 @@ class Scheduler:
         self._log(f"JOIN {[j[0] for j in joined]} -> {len(self.rows)} rows")
         return joined
 
+    # Long-generation allocator bound (port of MTPLX 2.10 live clear_cache latch).
+    # Once the live context (prompt + generated) of any row passes the threshold,
+    # release MLX's buffer cache every CLEAR_CACHE_EVERY tokens; otherwise the
+    # cache keeps growing inside a single long answer (upstream saw 8.6 GB and
+    # decode falling 86 -> 25 tok/s over 34k tokens). Pure memory housekeeping:
+    # no effect on computed tokens.
+    CLEAR_CACHE_CONTEXT_THRESHOLD = 16384
+    CLEAR_CACHE_EVERY = 1024
+
+    def _maybe_clear_allocator_cache(self, state) -> None:
+        live = max(state.lengths) if state.lengths else 0
+        mark = getattr(self, "_clear_cache_mark", 0)
+        if live < mark:                 # rows changed: restart the cadence
+            mark = 0
+        if live >= self.CLEAR_CACHE_CONTEXT_THRESHOLD and live - mark >= self.CLEAR_CACHE_EVERY:
+            mx.clear_cache()
+            mark = live
+        self._clear_cache_mark = mark
+
     # --- decode mechanism: one speculative round (推 + 出) ------------------
     def step(self) -> list[tuple[int, list[int]]]:
         self._t += 1
@@ -507,6 +526,7 @@ class Scheduler:
             return []
         eng, dr, k, eos = self.eng, self.dr, self.k, self.eos
         state, h, primary, rows = self.state, self.h, self.primary, self.rows
+        self._maybe_clear_allocator_cache(state)
         B = len(rows)
         t0 = time.perf_counter()
 
