@@ -61,6 +61,7 @@ class Req:
     accept_counts: list[int] = field(default_factory=list)
     accept_trials: int = 0
     accept_trials_by_depth: list[int] = field(default_factory=list)
+    context_copy: ContextCopy | None = None       # built lazily by the copy lane
 
 
 @dataclass(frozen=True)
@@ -224,14 +225,12 @@ class Scheduler:
         # Context-copy block speculation (prompt n-gram lookup, see
         # context_copy.py). On by default; MULTIPLEX_CONTEXT_COPY=0 disables.
         # Runs only where the draft-history bookkeeping is known: no drafter
-        # (pure AR) or the native MTP head. DFlash (tapped context) and the
-        # Gemma shared-KV head keep their own lanes.
+        # (pure AR) or the native MTP head; DFlash (not a Drafter) and the
+        # Gemma shared-KV head (begin_draft) keep their own lanes.
         self.context_copy = (
             os.environ.get("MULTIPLEX_CONTEXT_COPY", "1") not in ("0", "", "false", "False")
             and (drafter is None
-                 or (isinstance(drafter, Drafter)
-                     and not getattr(drafter, "wants_taps", False)
-                     and not hasattr(drafter.head, "begin_draft")))
+                 or (isinstance(drafter, Drafter) and not hasattr(drafter.head, "begin_draft")))
         )
         # ``k`` is the dynamic controller's starting depth. Native MTP chains
         # its head autoregressively, so dynamic MTP deliberately has no ceiling.
@@ -546,60 +545,58 @@ class Scheduler:
         req = self.rows[0]
         if req.embeds is not None:
             return None
-        cc = getattr(req, "_context_copy", None)
-        if cc is None:
-            cc = req._context_copy = ContextCopy(req.prompt)
-        block = cc.propose(req.out, req.max_tokens - len(req.out))
+        if req.context_copy is None:
+            req.context_copy = ContextCopy(req.prompt)
+        block = req.context_copy.propose(req.out, req.max_tokens - len(req.out))
         if not block:
             return None
-        eng, dr, eos = self.eng, self.dr, self.eos
-        state, h, primary = self.state, self.h, self.primary
+        eng, dr = self.eng, self.dr
+        state, prev_h, prev_primary = self.state, self.h, int(self.primary[0])
         T = len(block)
         snap = eng.snapshot_ssm(state)
         lengths_before = list(state.lengths)
-        verify_in = mx.array([[int(primary[0])] + block])
+        verify_in = mx.array([[prev_primary] + block])
         vhidden = eng.forward(state, verify_in)
         trunk_logits = eng.logits(vhidden)
         trunk_pred = mx.argmax(trunk_logits, axis=-1)
         a = 0
-        for j in range(T):
-            if self._accept_draft(req, trunk_logits[0, j, :], int(trunk_pred[0, j]), block[j]):
-                a += 1
-            else:
-                break
-        cc.observe(len(req.out), T, a)
+        while a < T and self._accept_draft(req, trunk_logits[0, a, :],
+                                           int(trunk_pred[0, a]), block[a]):
+            a += 1
+        req.context_copy.observe(len(req.out), T, a)
+        toks, done = self._emit(req, block[:a] + [int(trunk_pred[0, a])])
 
-        finished = []
-        toks = block[:a] + [int(trunk_pred[0, a])]
-        for j, t in enumerate(toks):
-            if t in eos or len(req.out) + j + 1 >= req.max_tokens:
-                toks = toks[: j + 1]
-                finished.append(0)
-                break
-        req.out.extend(toks)
-        self._log_output(req, toks)
-        emitted = [(req.rid, toks)]
-
-        if dr is not None:
-            hist_h = mx.concatenate([h, vhidden[:, :a, :]], axis=1) if a else h
-            dr.append_history(self.dcache, hist_h, [int(primary[0])] + block[:a])
         primary = trunk_pred[:, a]
         state, h = self._rollback(state, snap, lengths_before, verify_in,
                                   [block], vhidden, a, T)
         self.state, self.h, self.primary = state, h, primary
         if dr is not None:
+            hist_h = mx.concatenate([prev_h, vhidden[:, :a, :]], axis=1) if a else prev_h
+            dr.append_history(self.dcache, hist_h, [prev_primary] + block[:a])
             self.ctx = dr.update_context_after_commit(eng, h, a)
-        self._finish_step(state, h, primary, self.rows, emitted, finished,
-                          [a], a, self.k, trunk_logits, trunk_pred, t0,
-                          copy_block=T)
-        return emitted
+        self._finish_step(state, h, primary, self.rows, [(req.rid, toks)],
+                          [0] if done else [], [a], a, self.k,
+                          trunk_logits, trunk_pred, t0, copy_block=T)
+        return [(req.rid, toks)]
+
+    def _emit(self, req: Req, toks: list[int]) -> tuple[list[int], bool]:
+        """Append a round's committed tokens to ``req.out``, cut at EOS or
+        max_tokens; returns (tokens kept, request finished)."""
+        done = False
+        for j, t in enumerate(toks):
+            if t in self.eos or len(req.out) + j + 1 >= req.max_tokens:
+                toks, done = toks[: j + 1], True
+                break
+        req.out.extend(toks)
+        self._log_output(req, toks)
+        return toks, done
 
     # --- decode mechanism: one speculative round (推 + 出) ------------------
     def step(self) -> list[tuple[int, list[int]]]:
         self._t += 1
         if not self.rows:
             return []
-        eng, dr, k, eos = self.eng, self.dr, self.k, self.eos
+        eng, dr, k = self.eng, self.dr, self.k
         state, h, primary, rows = self.state, self.h, self.primary, self.rows
         self._maybe_clear_allocator_cache(state)
         B = len(rows)
@@ -675,14 +672,9 @@ class Scheduler:
         emitted, finished = [], []
         for i in range(B):
             c = commit_counts[i]
-            toks = draft_ids[i][:c] + [int(trunk_pred[i, c])]
-            for j, t in enumerate(toks):
-                if t in eos or len(rows[i].out) + j + 1 >= rows[i].max_tokens:
-                    toks = toks[: j + 1]
-                    finished.append(i)
-                    break
-            rows[i].out.extend(toks)
-            self._log_output(rows[i], toks)
+            toks, done = self._emit(rows[i], draft_ids[i][:c] + [int(trunk_pred[i, c])])
+            if done:
+                finished.append(i)
             emitted.append((rows[i].rid, toks))
 
         if use_per_row:
