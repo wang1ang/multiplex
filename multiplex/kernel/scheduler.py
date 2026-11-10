@@ -533,51 +533,67 @@ class Scheduler:
 
     # --- context-copy round: verify a prompt-copied block -----------------
     def _copy_round(self, t0):
-        """One context-copy round for the single live row, or None when the
+        """One context-copy round over all live rows, or None when some row's
         prompt has no match (the caller then runs the normal MTP round).
 
-        Same verify/accept/rollback as an MTP round with the copied block in
+        Same verify/accept/rollback as an MTP round with the copied blocks in
         place of the drafts, so the committed stream follows the same law
-        (greedy: identical tokens). The MTP head did not draft, so its history
-        gets the committed transitions appended directly: (primary, h) plus one
-        per accepted block token.
+        (greedy: identical tokens). Rows share one verify width, so every
+        block is cut to the shortest; commit is take-min like an MTP round, so
+        the cut loses no committed tokens. Each row's own accepted depth still
+        feeds its copy policy. The MTP head did not draft, so its history gets
+        the committed transitions appended directly: (primary, h) plus one per
+        committed block token.
         """
-        req = self.rows[0]
-        if req.embeds is not None:
+        rows = self.rows
+        if any(req.embeds is not None for req in rows):
             return None
-        if req.context_copy is None:
-            req.context_copy = ContextCopy(req.prompt)
-        block = req.context_copy.propose(req.out, req.max_tokens - len(req.out))
-        if not block:
-            return None
-        eng, dr = self.eng, self.dr
-        state, prev_h, prev_primary = self.state, self.h, int(self.primary[0])
-        T = len(block)
+        blocks = []
+        for req in rows:
+            if req.context_copy is None:
+                req.context_copy = ContextCopy(req.prompt)
+            block = req.context_copy.propose(req.out, req.max_tokens - len(req.out))
+            if not block:
+                return None
+            blocks.append(block)
+        T = min(len(b) for b in blocks)
+        blocks = [b[:T] for b in blocks]
+        eng, dr, B = self.eng, self.dr, len(rows)
+        state, prev_h, prev_primary = self.state, self.h, self.primary
         snap = eng.snapshot_ssm(state)
         lengths_before = list(state.lengths)
-        verify_in = mx.array([[prev_primary] + block])
+        verify_in = mx.concatenate([prev_primary[:, None],
+                                    mx.array(blocks, dtype=prev_primary.dtype)], axis=1)
         vhidden = eng.forward(state, verify_in)
         trunk_logits = eng.logits(vhidden)
         trunk_pred = mx.argmax(trunk_logits, axis=-1)
-        a = 0
-        while a < T and self._accept_draft(req, trunk_logits[0, a, :],
-                                           int(trunk_pred[0, a]), block[a]):
-            a += 1
-        req.context_copy.observe(len(req.out), T, a)
-        toks, done = self._emit(req, block[:a] + [int(trunk_pred[0, a])])
+        accs = []
+        for i, req in enumerate(rows):
+            a = 0
+            while a < T and self._accept_draft(req, trunk_logits[i, a, :],
+                                               int(trunk_pred[i, a]), blocks[i][a]):
+                a += 1
+            req.context_copy.observe(len(req.out), T, a)
+            accs.append(a)
+        m = min(accs)
+        emitted, finished = [], []
+        for i, req in enumerate(rows):
+            toks, done = self._emit(req, blocks[i][:m] + [int(trunk_pred[i, m])])
+            if done:
+                finished.append(i)
+            emitted.append((req.rid, toks))
 
-        primary = trunk_pred[:, a]
+        primary = trunk_pred[:, m]
         state, h = self._rollback(state, snap, lengths_before, verify_in,
-                                  [block], vhidden, a, T)
+                                  blocks, vhidden, m, T)
         self.state, self.h, self.primary = state, h, primary
         if dr is not None:
-            hist_h = mx.concatenate([prev_h, vhidden[:, :a, :]], axis=1) if a else prev_h
-            dr.append_history(self.dcache, hist_h, [prev_primary] + block[:a])
-            self.ctx = dr.update_context_after_commit(eng, h, a)
-        self._finish_step(state, h, primary, self.rows, [(req.rid, toks)],
-                          [0] if done else [], [a], a, self.k,
-                          trunk_logits, trunk_pred, t0, copy_block=T)
-        return [(req.rid, toks)]
+            hist_h = mx.concatenate([prev_h, vhidden[:, :m, :]], axis=1) if m else prev_h
+            dr.append_history(self.dcache, hist_h, verify_in[:, :m + 1])
+            self.ctx = dr.update_context_after_commit(eng, h, m)
+        self._finish_step(state, h, primary, rows, emitted, finished, accs, m,
+                          self.k, trunk_logits, trunk_pred, t0, copy_block=T)
+        return emitted
 
     def _emit(self, req: Req, toks: list[int]) -> tuple[list[int], bool]:
         """Append a round's committed tokens to ``req.out``, cut at EOS or
@@ -601,7 +617,7 @@ class Scheduler:
         self._maybe_clear_allocator_cache(state)
         B = len(rows)
         t0 = time.perf_counter()
-        if self.context_copy and B == 1:
+        if self.context_copy:
             emitted = self._copy_round(t0)
             if emitted is not None:
                 return emitted
