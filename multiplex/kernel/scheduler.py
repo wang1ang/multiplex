@@ -26,6 +26,7 @@ from dataclasses import dataclass, field
 import mlx.core as mx
 
 from .engine import Engine, BatchState
+from .context_copy import ContextCopy
 from .mtp import Drafter
 from .prefixcache.runtime import PrefixCacheRuntime
 
@@ -220,6 +221,18 @@ class Scheduler:
         else:
             self.per_row_commit = bool(per_row_commit)
         self._per_row_fallback_logged = False
+        # Context-copy block speculation (prompt n-gram lookup, see
+        # context_copy.py). On by default; MULTIPLEX_CONTEXT_COPY=0 disables.
+        # Runs only where the draft-history bookkeeping is known: no drafter
+        # (pure AR) or the native MTP head. DFlash (tapped context) and the
+        # Gemma shared-KV head keep their own lanes.
+        self.context_copy = (
+            os.environ.get("MULTIPLEX_CONTEXT_COPY", "1") not in ("0", "", "false", "False")
+            and (drafter is None
+                 or (isinstance(drafter, Drafter)
+                     and not getattr(drafter, "wants_taps", False)
+                     and not hasattr(drafter.head, "begin_draft")))
+        )
         # ``k`` is the dynamic controller's starting depth. Native MTP chains
         # its head autoregressively, so dynamic MTP deliberately has no ceiling.
         self.initial_k = max(int(k), 0) if drafter is not None else 0
@@ -519,6 +532,68 @@ class Scheduler:
             mark = live
         self._clear_cache_mark = mark
 
+    # --- context-copy round: verify a prompt-copied block -----------------
+    def _copy_round(self, t0):
+        """One context-copy round for the single live row, or None when the
+        prompt has no match (the caller then runs the normal MTP round).
+
+        Same verify/accept/rollback as an MTP round with the copied block in
+        place of the drafts, so the committed stream follows the same law
+        (greedy: identical tokens). The MTP head did not draft, so its history
+        gets the committed transitions appended directly: (primary, h) plus one
+        per accepted block token.
+        """
+        req = self.rows[0]
+        if req.embeds is not None:
+            return None
+        cc = getattr(req, "_context_copy", None)
+        if cc is None:
+            cc = req._context_copy = ContextCopy(req.prompt)
+        block = cc.propose(req.out, req.max_tokens - len(req.out))
+        if not block:
+            return None
+        eng, dr, eos = self.eng, self.dr, self.eos
+        state, h, primary = self.state, self.h, self.primary
+        T = len(block)
+        snap = eng.snapshot_ssm(state)
+        lengths_before = list(state.lengths)
+        verify_in = mx.array([[int(primary[0])] + block])
+        vhidden = eng.forward(state, verify_in)
+        trunk_logits = eng.logits(vhidden)
+        trunk_pred = mx.argmax(trunk_logits, axis=-1)
+        a = 0
+        for j in range(T):
+            if self._accept_draft(req, trunk_logits[0, j, :], int(trunk_pred[0, j]), block[j]):
+                a += 1
+            else:
+                break
+        cc.observe(len(req.out), T, a)
+
+        finished = []
+        toks = block[:a] + [int(trunk_pred[0, a])]
+        for j, t in enumerate(toks):
+            if t in eos or len(req.out) + j + 1 >= req.max_tokens:
+                toks = toks[: j + 1]
+                finished.append(0)
+                break
+        req.out.extend(toks)
+        self._log_output(req, toks)
+        emitted = [(req.rid, toks)]
+
+        if dr is not None:
+            hist_h = mx.concatenate([h, vhidden[:, :a, :]], axis=1) if a else h
+            dr.append_history(self.dcache, hist_h, [int(primary[0])] + block[:a])
+        primary = trunk_pred[:, a]
+        state, h = self._rollback(state, snap, lengths_before, verify_in,
+                                  [block], vhidden, a, T)
+        self.state, self.h, self.primary = state, h, primary
+        if dr is not None:
+            self.ctx = dr.update_context_after_commit(eng, h, a)
+        self._finish_step(state, h, primary, self.rows, emitted, finished,
+                          [a], a, self.k, trunk_logits, trunk_pred, t0,
+                          copy_block=T)
+        return emitted
+
     # --- decode mechanism: one speculative round (推 + 出) ------------------
     def step(self) -> list[tuple[int, list[int]]]:
         self._t += 1
@@ -529,6 +604,10 @@ class Scheduler:
         self._maybe_clear_allocator_cache(state)
         B = len(rows)
         t0 = time.perf_counter()
+        if self.context_copy and B == 1:
+            emitted = self._copy_round(t0)
+            if emitted is not None:
+                return emitted
 
         if k == 0:                                  # no head -> no draft
             draft_ids = [[] for _ in range(B)]
@@ -623,6 +702,19 @@ class Scheduler:
             # a no-op, since it never wrote the block to its cache). L3 only
             # signals the commit event; it does not know 'base+1' or 'append'.
             dr.commit(self.dcache, m, draft_ids, vhidden)
+        state, h = self._rollback(state, snap, lengths_before, verify_in,
+                                  draft_ids, vhidden, m, k)
+        self.state, self.h, self.primary = state, h, primary
+        if k:
+            self.ctx = dr.update_context_after_commit(eng, h, m)
+        self._finish_step(state, h, primary, rows, emitted, finished,
+                          accs, m, k, trunk_logits, trunk_pred, t0)
+        return emitted
+
+    def _rollback(self, state, snap, lengths_before, verify_in, draft_ids,
+                  vhidden, m, k):
+        """Keep primary + ``m`` of the ``k`` verified tokens; return (state, h)."""
+        eng, B = self.eng, len(lengths_before)
         if m == k:
             h = vhidden[:, -1:, :]
         elif snap is not None and any(s is not None for s in snap):
@@ -661,12 +753,7 @@ class Scheduler:
             eng.trim_attention(state, k - m)
             state.lengths = [n + m + 1 for n in lengths_before]
             h = vhidden[:, m:m + 1, :]
-        self.state, self.h, self.primary = state, h, primary
-        if k:
-            self.ctx = dr.update_context_after_commit(eng, h, m)
-        self._finish_step(state, h, primary, rows, emitted, finished,
-                          accs, m, k, trunk_logits, trunk_pred, t0)
-        return emitted
+        return state, h
 
     def _commit_per_row(self, state, vhidden, trunk_pred, draft_ids, accs,
                         lengths_before, k):
@@ -698,7 +785,7 @@ class Scheduler:
         return state, h, primary
 
     def _finish_step(self, state, h, primary, rows, emitted, finished,
-                     accs, m, k, trunk_logits, trunk_pred, t0):
+                     accs, m, k, trunk_logits, trunk_pred, t0, copy_block=None):
         """Shared step tail: telemetry, dynamic-depth observation, session-block
         capture, and dropping finished rows. Identical for take-min and per-row
         (``m == min(accs)`` is the acceptance signal fed to the depth controller
@@ -706,15 +793,18 @@ class Scheduler:
         B = len(rows)
         mx.eval(h, primary)
         dt = max(time.perf_counter() - t0, 1e-9)
-        stat = self.cost_stats.setdefault(k, {
-            "rounds": 0, "seconds": 0.0, "committed_tokens": 0,
-            "accepted_drafts": 0, "draft_trials": 0,
-        })
-        stat["rounds"] += 1
-        stat["seconds"] += dt
-        stat["committed_tokens"] += sum(len(toks) for _, toks in emitted)
-        stat["accepted_drafts"] += sum(accs)
-        stat["draft_trials"] += k * B
+        # A copy round is not an MTP-depth sample: keep it out of the per-depth
+        # cost stats and the depth controller.
+        if copy_block is None:
+            stat = self.cost_stats.setdefault(k, {
+                "rounds": 0, "seconds": 0.0, "committed_tokens": 0,
+                "accepted_drafts": 0, "draft_trials": 0,
+            })
+            stat["rounds"] += 1
+            stat["seconds"] += dt
+            stat["committed_tokens"] += sum(len(toks) for _, toks in emitted)
+            stat["accepted_drafts"] += sum(accs)
+            stat["draft_trials"] += k * B
         emitted_by_rid = {rid: toks for rid, toks in emitted}
         for req in rows:
             req.advance_tokens += len(emitted_by_rid.get(req.rid, ()))
@@ -724,9 +814,9 @@ class Scheduler:
         tok_s = total_tokens / max(total_seconds, 1e-9)
         prob = self._bonus_probs(trunk_logits, trunk_pred, m) if self.debug else None
         prob_text = f" prob={prob}" if prob is not None else ""
-        depth_text = f" depth=D{k}"
+        depth_text = f" depth=D{k}" if copy_block is None else f" copy={copy_block}"
         decision = None
-        if self.depth_controller is not None:
+        if self.depth_controller is not None and copy_block is None:
             decision = self.depth_controller.observe(m)
             self.k = decision.current
             depth_text += (
