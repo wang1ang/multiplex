@@ -166,13 +166,17 @@ class Hub:
                 yield text
 
     def stream_message_parts(self, messages, max_tokens, tools=None,
-                             add_generation_prompt=True, enable_thinking=None):
+                             add_generation_prompt=True, enable_thinking=None,
+                             temperature=None, top_p=None, top_k=None):
         """Yield L4-normalized assistant deltas as ``(field, text)``.
 
         L3 only streams backend-native decoded text. L4 is the first layer that
         knows both the rendered prompt and the client-facing protocol shape, so
         it owns the Qwen-style ``<think>`` split before L5 formats SSE/JSON.
         The last item is ``("finish_reason", "stop" | "length")``.
+
+        Sampling values the client sent win; the thinking-mode defaults only
+        fill the ones it left out.
         """
         # if self._cfg["debug"]:
         #     print(f"[hub] L4 IN messages={messages!r} tools={tools!r} "
@@ -191,11 +195,14 @@ class Hub:
         )
         starts_in_thinking = self._prompt_opens_thinking(prompt_ids)
         if starts_in_thinking or effective_enable_thinking is True:
-            temperature, top_p, top_k = 0.6, 0.95, 20
+            defaults = (0.6, 0.95, 20)
         elif effective_enable_thinking is False:
-            temperature, top_p, top_k = 0.7, 0.8, 20
+            defaults = (0.7, 0.8, 20)
         else:
-            temperature = top_p = top_k = None
+            defaults = (None, None, None)
+        temperature, top_p, top_k = (
+            d if v is None else v
+            for v, d in zip((temperature, top_p, top_k), defaults))
         thinking = ThinkingParser(starts_in_thinking=starts_in_thinking)
         outcome: dict = {}
         for raw_delta in self._stream_prompt_ids(

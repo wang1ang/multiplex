@@ -10,6 +10,7 @@ from multiplex.server import (
     _enable_thinking_from_body,
     _responses_body,
     _responses_stream,
+    _sampling_from_body,
 )
 
 
@@ -192,6 +193,28 @@ def test_l4_truncated_thinking_stays_reasoning_and_reports_length():
     assert parts[-1] == ("finish_reason", "length")
 
 
+def test_l4_request_sampling_overrides_only_what_it_sets():
+    hub, calls = _hub_recording_decode_params()
+    list(hub.stream_message_parts(
+        [{"role": "user", "content": "hi"}], 8, enable_thinking=True,
+        temperature=0.0,
+    ))
+    assert calls == [{"temperature": 0.0, "top_p": 0.95, "top_k": 20}]
+
+
+def test_l5_sampling_from_body():
+    assert _sampling_from_body({}) == {}
+    assert _sampling_from_body({"temperature": None}) == {}
+    assert _sampling_from_body({"temperature": 0, "top_p": 1, "top_k": 40.0}) == {
+        "temperature": 0.0, "top_p": 1.0, "top_k": 40}
+    for bad in ({"temperature": "0.2"}, {"top_p": True}, {"top_k": 2.5}):
+        try:
+            _sampling_from_body(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+
+
 class _TruncatedBackend:
     model_id = "tiny"
 
@@ -205,12 +228,14 @@ class _TruncatedBackend:
         yield "finish_reason", "length"
 
 
-def test_l5_reports_length():
+def test_l5_passes_sampling_and_reports_length():
     backend = _TruncatedBackend()
     content, reasoning, calls, finish = _collect_parts(
         backend, [{"role": "user", "content": "hi"}], 8, None,
+        sampling={"temperature": 0.0},
     )
     assert (content, reasoning, calls, finish) == ("partial", "plan", [], "length")
+    assert backend.kwargs["temperature"] == 0.0
 
     payloads = [json.loads(e[len("data: "):]) for e in _chat_stream(
         _TruncatedBackend(), [{"role": "user", "content": "hi"}], 8)

@@ -72,6 +72,25 @@ def _enable_thinking_from_body(body):
     return None
 
 
+def _sampling_from_body(body):
+    """The request's temperature/top_p/top_k, passed only when present.
+
+    Absent or null keeps the model's defaults; anything else that is not a
+    number is the client's error, not something to guess around.
+    """
+    out = {}
+    for key, kind in (("temperature", float), ("top_p", float), ("top_k", int)):
+        value = body.get(key)
+        if value is None:
+            continue
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ValueError(f"{key} must be a number, got {value!r}")
+        if kind is int and value != int(value):
+            raise ValueError(f"top_k must be an integer, got {value!r}")
+        out[key] = kind(value)
+    return out
+
+
 def _content_text(content):
     if content is None:
         return ""
@@ -166,7 +185,8 @@ def _sse(data, event=None):
     return f"{head}data: {json.dumps(data)}\n\n"
 
 
-def _stream_visible(backend, messages, max_tokens, tools, *, enable_thinking=None):
+def _stream_visible(backend, messages, max_tokens, tools, *, enable_thinking=None,
+                    sampling=None):
     """Yield (visible_text, reasoning_text, tool_calls, finish_reason); the
     finish reason arrives once, on the last item."""
     filt = ToolCallStreamFilter() if tools else None
@@ -174,6 +194,7 @@ def _stream_visible(backend, messages, max_tokens, tools, *, enable_thinking=Non
     finish = "stop"
     for field, text in backend.stream_message_parts(
         messages, max_tokens, tools, enable_thinking=enable_thinking,
+        **(sampling or {}),
     ):
         if field == "finish_reason":
             finish = text
@@ -195,13 +216,15 @@ def _stream_visible(backend, messages, max_tokens, tools, *, enable_thinking=Non
     yield "", "", calls, finish
 
 
-def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None):
+def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None,
+                   sampling=None):
     content_parts = []
     reasoning_parts = []
     calls = []
     finish = "stop"
     for visible, reasoning, tool_calls, reason in _stream_visible(
         backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
+        sampling=sampling,
     ):
         if visible:
             content_parts.append(visible)
@@ -214,7 +237,8 @@ def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None
     return "".join(content_parts), "".join(reasoning_parts), calls, finish
 
 
-def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=None):
+def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=None,
+                 sampling=None):
     rid, created = _hex("chatcmpl-"), int(time.time())
 
     def chunk(delta, finish=None):
@@ -229,6 +253,7 @@ def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=N
     finish = "stop"
     for visible, reasoning, tool_calls, reason in _stream_visible(
         backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
+        sampling=sampling,
     ):
         if reasoning:
             yield chunk({"reasoning_content": reasoning})
@@ -249,7 +274,7 @@ def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=N
 
 
 def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=None,
-                      *, enable_thinking=None):
+                      *, enable_thinking=None, sampling=None):
     rid, mid = _hex("resp_"), _hex("msg_")
     base = {"id": rid, "object": "response", "model": backend.model_id}
     message_item = {"id": mid, "type": "message", "role": "assistant",
@@ -263,6 +288,7 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
     full, calls, finish = "", [], "stop"
     for visible, _reasoning, tool_calls, reason in _stream_visible(
         backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
+        sampling=sampling,
     ):
         if visible:
             full += visible
@@ -414,17 +440,23 @@ def make_handler(backend: Hub):
 
             tools = body.get("tools")
             enable_thinking = _enable_thinking_from_body(body)
+            try:
+                sampling = _sampling_from_body(body)
+            except ValueError as e:
+                self._json(400, {"error": {"message": str(e),
+                                           "type": "invalid_request_error"}})
+                return
             if path == "/v1/chat/completions":
                 msgs = _messages_from_chat(body)
                 if stream:
                     self._sse_stream(_chat_stream(
                         backend, msgs, max_tokens, tools,
-                        enable_thinking=enable_thinking,
+                        enable_thinking=enable_thinking, sampling=sampling,
                     ))
                 else:
                     clean, reasoning, calls, finish = _collect_parts(
                         backend, msgs, max_tokens, tools,
-                        enable_thinking=enable_thinking,
+                        enable_thinking=enable_thinking, sampling=sampling,
                     )
                     self._json(200, _chat_body(
                         backend, clean, calls, reasoning_content=reasoning,
@@ -436,12 +468,12 @@ def make_handler(backend: Hub):
                     self._sse_stream(_responses_stream(
                         backend, msgs, max_tokens, tools,
                         on_complete=lambda rid, out: remember_response(rid, msgs + out),
-                        enable_thinking=enable_thinking,
+                        enable_thinking=enable_thinking, sampling=sampling,
                     ))
                 else:
                     clean, _reasoning, calls, finish = _collect_parts(
                         backend, msgs, max_tokens, tools,
-                        enable_thinking=enable_thinking,
+                        enable_thinking=enable_thinking, sampling=sampling,
                     )
                     resp = _responses_body(backend, clean, calls, finish)
                     remember_response(resp["id"], msgs + _assistant_messages(clean, calls))
