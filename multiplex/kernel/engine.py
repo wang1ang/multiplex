@@ -201,9 +201,17 @@ class _GDNMixerProxy:
         self._fused = fused
 
     def __call__(self, inputs, mask=None, cache=None):
+        fused = self._fused and gdn_fused.applies(inputs, mask, cache)
         if self._eng._gdn_capture_on:
-            self._eng._gdn_inputs[self._idx] = (inputs, mask)
-        if self._fused and gdn_fused.applies(inputs, mask, cache):
+            # Fused S>=2 calls record their projected recurrence inputs, so
+            # the rollback replays only the recurrence; others keep the raw
+            # mixer input and replay the whole mixer.
+            if fused and inputs.shape[1] > 1:
+                rec = {}
+                self._eng._gdn_inputs[self._idx] = ("fused", rec)
+                return gdn_fused.forward(self._mixer, inputs, cache, rec)
+            self._eng._gdn_inputs[self._idx] = ("mixer", (inputs, mask))
+        if fused:
             return gdn_fused.forward(self._mixer, inputs, cache)
         return self._mixer(inputs, mask, cache)
 
@@ -421,13 +429,19 @@ class Engine:
         is handled separately by ``trim_attention``; this touches only the
         ArraysCache layers, so it neither re-appends attention KV (the bug the
         whole-trunk re-forward caused) nor pays for attention/MLP compute.
+        Layers on the fused path replay only the recurrence from the inputs
+        recorded during verify (``gdn_fused.replay``), skipping in_proj too.
         Requires a prior ``forward`` (verify) to have captured the inputs.
         """
         self.restore_ssm(state, snap)
         self._gdn_capture_on = False
         n = m + 1
         for idx, mixer in self._gdn_layers:
-            inp, mask = self._gdn_inputs[idx]
+            kind, rec = self._gdn_inputs[idx]
+            if kind == "fused":
+                gdn_fused.replay(mixer._mixer, rec, state.cache[idx], n)
+                continue
+            inp, mask = rec
             inp = inp[:, :n, :]
             if mask is not None and mask.shape[-1] >= n:
                 mask = mask[..., :n]

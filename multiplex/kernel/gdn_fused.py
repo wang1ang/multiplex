@@ -284,8 +284,12 @@ def applies(inputs: mx.array, mask, cache) -> bool:
             and cache[1].dtype == mx.float32)
 
 
-def forward(m, inputs: mx.array, cache) -> mx.array:
-    """GatedDeltaNet.__call__ for an ``applies`` call, using the fused kernels."""
+def forward(m, inputs: mx.array, cache, record: dict | None = None) -> mx.array:
+    """GatedDeltaNet.__call__ for an ``applies`` call, using the fused kernels.
+
+    ``record`` (S >= 2 only) receives the projected recurrence inputs so a
+    speculative rollback can ``replay`` a committed prefix without re-running
+    the in_proj GEMVs or the conv/norm kernel."""
     from mlx_lm.models.gated_delta import gated_delta_update
 
     B, S, _ = inputs.shape
@@ -317,9 +321,30 @@ def forward(m, inputs: mx.array, cache) -> mx.array:
         grid=(C, B, 1), threadgroup=(D, 1, 1),
         output_shapes=[(B, S, Hk, D), (B, S, Hk, D), (B, S, Hv, D), (B, CONV_K - 1, C)],
         output_dtypes=[dt] * 4)
+    if record is not None:
+        record.update(qkv=qkv, q=q, k=k, v=v, a=a, b=b)
     cache[0] = conv
     out, state = gated_delta_update(q, k, v, a, b, m.A_log, m.dt_bias, cache[1], None)
     cache[1] = state
     cache.advance(S)
     out = m.norm(out, z.reshape(B, S, Hv, D))
     return m.out_proj(out.reshape(B, S, -1))
+
+
+def replay(m, rec: dict, cache, n: int) -> None:
+    """Advance a restored GDN cache over the first ``n`` tokens of a recorded
+    ``forward``. The result is exactly the state the verify pass itself held
+    after its n-th token: the conv state is the last CONV_K-1 raw qkv rows of
+    the stream, and the recurrence is prefix-causal (same kernel, same
+    per-step inputs). Re-running the mixer instead recomputes in_proj at
+    width n, and the quantized GEMV is width-dependent at n == 1 (M=1 vs M>1
+    kernels round differently), so that path drifts from the verify pass."""
+    from mlx_lm.models.gated_delta import gated_delta_update
+
+    stream = mx.concatenate([cache[0], rec["qkv"][:, :n]], axis=1)
+    cache[0] = stream[:, n:n + CONV_K - 1]
+    _, state = gated_delta_update(
+        rec["q"][:, :n], rec["k"][:, :n], rec["v"][:, :n], rec["a"][:, :n],
+        rec["b"][:, :n], m.A_log, m.dt_bias, cache[1], None)
+    cache[1] = state
+    cache.advance(n)

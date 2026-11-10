@@ -58,3 +58,24 @@ def test_routing_keeps_stock_for_masked_and_prefill_shapes():
     assert not gdn_fused.applies(x, mx.ones((1, 4), dtype=mx.bool_), c)
     assert not gdn_fused.applies(mx.zeros((1, gdn_fused.MAX_ROWS + 1, 256)), None, c)
     assert not gdn_fused.applies(x, None, ArraysCache(2))        # first prefill piece
+
+
+@pytest.mark.parametrize("B", [1, 3])
+@pytest.mark.parametrize("S,n", [(4, 1), (4, 3), (9, 5), (33, 32)])
+def test_replay_matches_mixer_on_prefix_bitwise(B, S, n):
+    """Rollback replay from recorded verify inputs == re-running the stock
+    mixer on the committed prefix (conv state and fp32 delta state)."""
+    m = _mixer()
+    x = (mx.random.normal((B, S, 256)) * 2).astype(mx.bfloat16)
+    start = _cache(m, B)
+    ref, got = ArraysCache(2), ArraysCache(2)
+    ref.cache = [v + 0 for v in start.cache]
+    got.cache = [v + 0 for v in start.cache]
+    m(x[:, :n], None, ref)
+    rec = {}
+    gdn_fused.forward(m, x, got, rec)              # the verify call
+    got.cache = [v + 0 for v in start.cache]       # restore_ssm
+    gdn_fused.replay(m, rec, got, n)
+    for a, b in [(ref[0], got[0]), (ref[1], got[1])]:
+        assert a.dtype == b.dtype and a.shape == b.shape
+        assert mx.array_equal(a, b).item()
