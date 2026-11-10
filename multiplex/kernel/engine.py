@@ -42,6 +42,8 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
 )
 
+from . import gdn_fused
+
 
 def make_batch_cache(model, left_padding: list[int]) -> list:
     """Batch-aware per-layer cache for ``model``.
@@ -55,7 +57,10 @@ def make_batch_cache(model, left_padding: list[int]) -> list:
         if type(c) is KVCache:
             return BatchKVCache(left_padding)
         if isinstance(c, ArraysCache):
-            c.left_padding = mx.array(left_padding)
+            # No padding => no SSM mask (an all-true mask is a no-op, and a
+            # None mask lets the fused GDN kernels take the call).
+            if any(left_padding):
+                c.left_padding = mx.array(left_padding)
             return c
         if isinstance(c, RotatingKVCache):
             if c.keep > 0:
@@ -189,14 +194,17 @@ class _GDNMixerProxy:
     this mixer, instead of re-running the whole trunk. Delegates everything
     else to the real mixer."""
 
-    def __init__(self, mixer, engine, idx: int):
+    def __init__(self, mixer, engine, idx: int, fused: bool):
         self._mixer = mixer
         self._eng = engine
         self._idx = idx
+        self._fused = fused
 
     def __call__(self, inputs, mask=None, cache=None):
         if self._eng._gdn_capture_on:
             self._eng._gdn_inputs[self._idx] = (inputs, mask)
+        if self._fused and gdn_fused.applies(inputs, mask, cache):
+            return gdn_fused.forward(self._mixer, inputs, cache)
         return self._mixer(inputs, mask, cache)
 
     def __getattr__(self, name):
@@ -392,10 +400,14 @@ class Engine:
             layers = self.model.language_model.model.layers
         except AttributeError:
             return
+        want_fused = os.environ.get("MULTIPLEX_GDN_FUSED", "1") not in ("0", "", "false", "False")
         for i, layer in enumerate(layers):
             mixer = getattr(layer, "linear_attn", None)
             if mixer is not None and type(mixer).__name__ == "GatedDeltaNet":
-                proxy = _GDNMixerProxy(mixer, self, i)
+                why = gdn_fused.unsupported_reason(mixer) if want_fused else "MULTIPLEX_GDN_FUSED=0"
+                if why is not None and not self._gdn_layers:
+                    print(f"[multiplex] fused GDN kernels off: {why}", flush=True)
+                proxy = _GDNMixerProxy(mixer, self, i, fused=why is None)
                 layer.linear_attn = proxy
                 self._gdn_layers.append((i, proxy))
 
