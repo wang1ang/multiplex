@@ -624,6 +624,12 @@ class Scheduler:
 
         if k == 0:                                  # no head -> no draft
             draft_ids = [[] for _ in range(B)]
+            if dr is not None:
+                # D0 still commits one token per row. The draft cache must keep
+                # the (hidden, token) transition draft() would have written, or
+                # it falls behind the trunk: later drafts condition on a stale
+                # history and the prefix cache slices past its end.
+                dr.append_history(self.dcache, self.ctx, primary[:, None])
         else:
             # Adaptive-verify drafters (DFlash) always draft the full fixed-width
             # block they were trained on, then we VERIFY only a k-long prefix of
@@ -713,7 +719,7 @@ class Scheduler:
         state, h = self._rollback(state, snap, lengths_before, verify_in,
                                   draft_ids, vhidden, m, k)
         self.state, self.h, self.primary = state, h, primary
-        if k:
+        if dr is not None:
             self.ctx = dr.update_context_after_commit(eng, h, m)
         self._finish_step(state, h, primary, rows, emitted, finished,
                           accs, m, k, trunk_logits, trunk_pred, t0)

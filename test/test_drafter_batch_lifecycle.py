@@ -93,6 +93,36 @@ class DrafterBatchLifecycleTests(unittest.TestCase):
                 break
         self.assertTrue(left, "expected the short request to finish and leave")
 
+    def test_d0_keeps_draft_cache_at_trunk_position(self):
+        """Pure-AR (D0) rounds must still advance the MTP history.
+
+        Regression: D0 skipped the draft cache entirely, so it fell one entry
+        behind the trunk per round and the prefix cache's MTP block capture
+        raised ``invalid MTP block slice`` past the cache's end.
+        """
+        sch = Scheduler(
+            self.eng, self.drafter,
+            eos_token_ids=self.tok.eos_token_ids, k=3, debug=False,
+            dynamic_depth=False,
+        )
+        sch.context_copy = False
+        self._admit(sch, 0, "Count slowly from one to fifty in words.", 200)
+
+        def gap():
+            return int(sch.state.lengths[0]) - int(sch.dcache[0].size())
+
+        for _ in range(3):
+            sch.step()
+        base = gap()
+        sch.k = 0
+        for _ in range(5):
+            sch.step()
+            self.assertEqual(gap(), base)
+        sch.k = 3
+        for _ in range(3):
+            sch.step()
+            self.assertEqual(gap(), base)
+
 
 if __name__ == "__main__":
     unittest.main()
