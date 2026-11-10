@@ -15,7 +15,7 @@ const PORTS = (process.env.MULTIPLEX_PORTS ?? "8000")
 // default here rather than something read off the wire.
 type ServedModel = { id: string };
 
-const CONTEXT_WINDOW = 32768;
+const CONTEXT_WINDOW = 65536;
 
 async function fetchServed(port: string) {
   const baseUrl = `http://127.0.0.1:${port}/v1`;
