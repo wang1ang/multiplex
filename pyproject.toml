@@ -25,6 +25,9 @@ dependencies = [
     "nvidia-cuda-runtime; platform_system == 'Linux'",
 ]
 
+[project.scripts]
+multiplex = "multiplex.server:main"
+
 [project.optional-dependencies]
 cli = ["prompt_toolkit>=3.0"]   # try_engine.py Chat CLI only
 # For a CUDA 12 driver instead of 13. Install as ".[cuda12]"; the cuda13 pin

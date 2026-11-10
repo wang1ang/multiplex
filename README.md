@@ -23,6 +23,25 @@ incremental Metal-kernel porting from the Qwen challenge, see
 
 ## Install
 
+One command, no clone (needs [uv](https://docs.astral.sh/uv/)):
+
+```bash
+uv tool install --python 3.12 git+https://github.com/wang1ang/multiplex
+multiplex --model mlx-community/Qwen3-0.6B-4bit   # downloads on first run
+```
+
+Or try it without installing anything:
+
+```bash
+uvx --python 3.12 --from git+https://github.com/wang1ang/multiplex multiplex
+```
+
+This uses the stock `mlx` wheel from PyPI. The repository's own launchers
+(`./serve.sh` and friends) build a local MLX fork with one extra kernel fast
+path; output is the same either way, the fork is only faster on some shapes.
+
+From a clone:
+
 ```bash
 pip install -e .            # server/runtime only
 pip install -e ".[cli]"     # + the Chat CLI
@@ -41,7 +60,8 @@ print(pathlib.Path(list(nvidia.__path__)[0]) / "cu13")')"
 ## Quick start
 
 ```bash
-./serve.sh --model MODEL_NAME
+multiplex --model MODEL_NAME     # installed CLI
+./serve.sh --model MODEL_NAME    # from a clone; also wires up pi / Codex
 ```
 
 Pass a local path, a discovered model's name, a Hugging Face repo id, or a
