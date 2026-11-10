@@ -447,19 +447,29 @@ def configure_memory(wired_limit="auto", cache_limit="4GiB") -> None:
     """
     import mlx.core as mx
 
-    recommended = int(mx.device_info()["max_recommended_working_set_size"])
-    wired = _memory_bytes(wired_limit, recommended)
-    if wired > recommended:
-        raise ValueError(
-            f"--wired-limit {wired_limit} exceeds this machine's recommended "
-            f"working set ({recommended / 2**30:.1f} GiB)")
-    mx.set_wired_limit(wired)
+    if mx.metal.is_available():
+        recommended = int(mx.device_info()["max_recommended_working_set_size"])
+        wired = _memory_bytes(wired_limit, recommended)
+        if wired > recommended:
+            raise ValueError(
+                f"--wired-limit {wired_limit} exceeds this machine's recommended "
+                f"working set ({recommended / 2**30:.1f} GiB)")
+        mx.set_wired_limit(wired)
+        wired_text = f"{wired / 2**30:.1f} GiB"
+    else:
+        # Wiring is a Metal concept (CUDA device memory is never paged out).
+        # 'auto' means "whatever this backend does"; an explicit size can't be
+        # honored here, so say so instead of ignoring it.
+        if _memory_bytes(wired_limit, 0):
+            raise ValueError(f"--wired-limit {wired_limit} needs Metal; this "
+                             "backend has no wired memory (use auto or 0)")
+        wired_text = "n/a"
     cache_text = "MLX default"
     if str(cache_limit).strip().lower() != "auto":
         cache = _memory_bytes(cache_limit, 0)
         mx.set_cache_limit(cache)
         cache_text = f"{cache / 2**30:.1f} GiB"
-    print(f"[memory: wired limit {wired / 2**30:.1f} GiB, "
+    print(f"[memory: wired limit {wired_text}, "
           f"buffer cache {cache_text}]")
 
 

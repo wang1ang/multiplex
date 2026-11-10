@@ -258,6 +258,8 @@ def unsupported_reason(mixer) -> str | None:
     """Why ``mixer`` (an mlx-lm qwen3_5/qwen3_next GatedDeltaNet) can't use
     these kernels, or None if it can."""
     from mlx_lm.models.qwen3_next import Qwen3NextRMSNormGated
+    if not mx.metal.is_available():
+        return "the kernels are Metal shaders; this backend is not Metal"
     checks = [
         (mixer.head_k_dim == D and mixer.head_v_dim == D,
          f"head dims {mixer.head_k_dim}/{mixer.head_v_dim} != {D}"),
