@@ -16,9 +16,9 @@ DEFAULT_MODELS = (
     "mlx-community/Qwen3-0.6B-4bit",
     "mlx-community/Qwen3-1.7B-4bit",
     "mlx-community/Qwen3-4B-4bit",
-    "Youssofal/Qwen3.6-35B-A3B-MTPLX-Optimized-Balance",
-    "wang-yang/Qwen3.6-27B-Q4-MTPLX",
-    "wang-yang/Ornith-1.0-35B-MTPLX",
+    "Youssofal/Qwen3.8-27B-MTPLX-Optimized-Speed",
+    "wang-yang/Qwen3.8-27B-MTPLX-4bit",
+    "wang-yang/Ornith-1.5-35B-A3B-MTPLX-4bit",
 )
 
 
