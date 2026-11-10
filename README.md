@@ -81,6 +81,9 @@ curl http://127.0.0.1:8000/v1/chat/completions \
 `/v1/responses` is also supported, with `previous_response_id` to continue a
 conversation.
 
+To use it from aider, Open WebUI, Continue, Cline, the OpenAI SDK and other
+clients, see [`docs/CLIENTS.md`](docs/CLIENTS.md).
+
 ## Useful server flags
 
 - `-d, --depth N` — initial MTP speculation depth (default `3`); `0` disables it.
