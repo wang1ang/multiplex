@@ -423,9 +423,50 @@ def make_handler(backend: Hub):
     return Handler
 
 
+def _memory_bytes(value: str, auto: int) -> int:
+    """``auto`` -> the given default, ``0``/``off`` -> 0, else a byte size."""
+    from .kernel.prefixcache.policy import parse_bytes
+
+    text = str(value).strip().lower()
+    if text == "auto":
+        return auto
+    if text in ("0", "off", "none"):
+        return 0
+    return parse_bytes(value)
+
+
+def configure_memory(wired_limit="auto", cache_limit="4GiB") -> None:
+    """Keep the model resident and bound MLX's free-buffer cache.
+
+    Unwired GPU buffers are fair game for macOS's compressor and swap: an idle
+    server came back with gigabytes of weights/KV compressed out, and decoding
+    then stalls on page-ins. Wiring (as mlx_lm does while generating) pins
+    MLX's allocations up to the limit. The cap is not a reservation, but the
+    free-buffer cache counts toward it, so the cache gets a bound too; MLX
+    otherwise keeps freed buffers up to its whole memory limit.
+    """
+    import mlx.core as mx
+
+    recommended = int(mx.device_info()["max_recommended_working_set_size"])
+    wired = _memory_bytes(wired_limit, recommended)
+    if wired > recommended:
+        raise ValueError(
+            f"--wired-limit {wired_limit} exceeds this machine's recommended "
+            f"working set ({recommended / 2**30:.1f} GiB)")
+    mx.set_wired_limit(wired)
+    cache_text = "MLX default"
+    if str(cache_limit).strip().lower() != "auto":
+        cache = _memory_bytes(cache_limit, 0)
+        mx.set_cache_limit(cache)
+        cache_text = f"{cache / 2**30:.1f} GiB"
+    print(f"[memory: wired limit {wired / 2**30:.1f} GiB, "
+          f"buffer cache {cache_text}]")
+
+
 def serve(model_path: str, mtp_path: str | None, host="127.0.0.1", port=8000,
           debug=False, prefix_cache_dir="auto", prefix_cache="8GiB", depth=3,
-          dynamic_depth=True, dflash=None):
+          dynamic_depth=True, dflash=None, wired_limit="auto", cache_limit="4GiB"):
+    configure_memory(wired_limit, cache_limit)
     # mtp_path None -> auto-detect <model>/mtp.safetensors; a given path that is
     # absent (or "" to force it) -> headless (pure AR).
     if dflash is None:
@@ -484,6 +525,14 @@ def parse_args(argv=None):
     ap.add_argument("--prefix-cache", default="8GiB",
                     help="resident prefix-cache budget per pool, in bytes or "
                          "with a unit (e.g. 512MiB, 4GiB); 0 disables reuse.")
+    ap.add_argument("--wired-limit", default="auto",
+                    help="pin MLX buffers in RAM up to this size so macOS cannot "
+                         "compress or swap the model out; 'auto' = the GPU's "
+                         "recommended working set, 0 disables.")
+    ap.add_argument("--cache-limit", default="4GiB",
+                    help="cap on MLX's cache of freed buffers (counts toward the "
+                         "wired limit); 'auto' keeps MLX's default, 0 disables "
+                         "the cache.")
     return ap.parse_args(argv)
 
 
@@ -503,7 +552,8 @@ def main():
     serve(entry.path, args.mtp, host=args.host, port=args.port, debug=args.debug,
           prefix_cache_dir=args.prefix_cache_dir,
           prefix_cache=args.prefix_cache, depth=max(args.depth, 0),
-          dynamic_depth=args.dynamic_depth, dflash=args.dflash)
+          dynamic_depth=args.dynamic_depth, dflash=args.dflash,
+          wired_limit=args.wired_limit, cache_limit=args.cache_limit)
 
 
 if __name__ == "__main__":

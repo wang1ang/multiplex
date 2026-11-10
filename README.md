@@ -66,6 +66,8 @@ conversation.
 - `-d, --depth N` — initial MTP speculation depth (default `3`); `0` disables it.
 - Dynamic MTP has no artificial ceiling; `--no-dynamic-depth` uses the initial depth as fixed.
 - `--prefix-cache 8GiB` — resident prefix-cache budget; `0` disables reuse.
+- `--wired-limit auto` — pin MLX buffers in RAM up to the GPU's recommended working set so macOS cannot compress or swap the model out; `0` disables.
+- `--cache-limit 4GiB` — cap on MLX's cache of freed buffers (it counts toward the wired limit); `auto` keeps MLX's default.
 - `--prefix-cache-dir none` — disable SSD-backed prefix cache persistence.
 - `--mtp /path/to/sidecar.safetensors` — override automatic MTP discovery.
 - `--no-debug` — silence scheduler/request logs.
