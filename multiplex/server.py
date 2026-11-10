@@ -167,34 +167,41 @@ def _sse(data, event=None):
 
 
 def _stream_visible(backend, messages, max_tokens, tools, *, enable_thinking=None):
-    """Yield (visible_text, reasoning_text, tool_calls)."""
+    """Yield (visible_text, reasoning_text, tool_calls, finish_reason); the
+    finish reason arrives once, on the last item."""
     filt = ToolCallStreamFilter() if tools else None
     full = ""
+    finish = "stop"
     for field, text in backend.stream_message_parts(
-        messages, max_tokens, tools, enable_thinking=enable_thinking
+        messages, max_tokens, tools, enable_thinking=enable_thinking,
     ):
+        if field == "finish_reason":
+            finish = text
+            continue
         if field == "reasoning_content":
             if text:
-                yield "", text, None
+                yield "", text, None, None
             continue
         full += text
         visible = filt.feed(text) if filt else text
         if visible:
-            yield visible, "", None
+            yield visible, "", None, None
+    calls = None
     if filt:
         tail = filt.finish()
         if tail:
-            yield tail, "", None
+            yield tail, "", None, None
         _, calls = _split_tool_calls(full, tools)
-        yield "", "", calls
+    yield "", "", calls, finish
 
 
 def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None):
     content_parts = []
     reasoning_parts = []
     calls = []
-    for visible, reasoning, tool_calls in _stream_visible(
-        backend, messages, max_tokens, tools, enable_thinking=enable_thinking
+    finish = "stop"
+    for visible, reasoning, tool_calls, reason in _stream_visible(
+        backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
     ):
         if visible:
             content_parts.append(visible)
@@ -202,7 +209,9 @@ def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None
             reasoning_parts.append(reasoning)
         if tool_calls:
             calls = tool_calls
-    return "".join(content_parts), "".join(reasoning_parts), calls
+        if reason:
+            finish = reason
+    return "".join(content_parts), "".join(reasoning_parts), calls, finish
 
 
 def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=None):
@@ -217,8 +226,9 @@ def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=N
 
     yield chunk({"role": "assistant"})
     calls = []
-    for visible, reasoning, tool_calls in _stream_visible(
-        backend, messages, max_tokens, tools, enable_thinking=enable_thinking
+    finish = "stop"
+    for visible, reasoning, tool_calls, reason in _stream_visible(
+        backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
     ):
         if reasoning:
             yield chunk({"reasoning_content": reasoning})
@@ -226,13 +236,15 @@ def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=N
             yield chunk({"content": visible})
         if tool_calls:
             calls = tool_calls
+        if reason:
+            finish = reason
     if calls:
         yield chunk({"tool_calls": [
             {"index": i, "id": c.get("id"), "type": "function",
              "function": c.get("function")} for i, c in enumerate(calls)]})
         yield chunk({}, finish="tool_calls")
     else:
-        yield chunk({}, finish="stop")
+        yield chunk({}, finish=finish)
     yield "data: [DONE]\n\n"
 
 
@@ -248,9 +260,9 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
     yield _sse({"type": "response.output_item.added", "item": message_item},
                "response.output_item.added")
 
-    full, calls = "", []
-    for visible, _reasoning, tool_calls in _stream_visible(
-        backend, messages, max_tokens, tools, enable_thinking=enable_thinking
+    full, calls, finish = "", [], "stop"
+    for visible, _reasoning, tool_calls, reason in _stream_visible(
+        backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
     ):
         if visible:
             full += visible
@@ -258,6 +270,8 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
                        "response.output_text.delta")
         if tool_calls:
             calls = tool_calls
+        if reason:
+            finish = reason
     yield _sse({"type": "response.output_text.done", "item_id": mid, "text": full},
                "response.output_text.done")
     message_item = {**message_item, "status": "completed",
@@ -283,15 +297,28 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
                    "response.output_item.done")
         output.append({**item, "status": "completed"})
 
-    yield _sse({"type": "response.completed", "response": {
-        **base, "status": "completed", "created_at": int(time.time()), "output": output,
-    }}, "response.completed")
+    if finish == "length":
+        yield _sse({"type": "response.incomplete", "response": {
+            **base, **_RESPONSE_TRUNCATED, "created_at": int(time.time()),
+            "output": output,
+        }}, "response.incomplete")
+    else:
+        yield _sse({"type": "response.completed", "response": {
+            **base, "status": "completed", "created_at": int(time.time()),
+            "output": output,
+        }}, "response.completed")
     if on_complete is not None:
         on_complete(rid, _assistant_messages(full, calls))
 
 
 # --- non-stream bodies --------------------------------------------------------
-def _chat_body(backend, text, tool_calls=None, reasoning_content=None):
+# A Responses generation cut off by max_output_tokens.
+_RESPONSE_TRUNCATED = {"status": "incomplete",
+                       "incomplete_details": {"reason": "max_output_tokens"}}
+
+
+def _chat_body(backend, text, tool_calls=None, reasoning_content=None,
+               finish="stop"):
     message = {"role": "assistant", "content": text or None}
     if reasoning_content:
         message["reasoning_content"] = reasoning_content
@@ -301,12 +328,12 @@ def _chat_body(backend, text, tool_calls=None, reasoning_content=None):
         "id": _hex("chatcmpl-"), "object": "chat.completion",
         "created": int(time.time()), "model": backend.model_id,
         "choices": [{"index": 0,
-                     "finish_reason": "tool_calls" if tool_calls else "stop",
+                     "finish_reason": "tool_calls" if tool_calls else finish,
                      "message": message}],
     }
 
 
-def _responses_body(backend, text, tool_calls=None):
+def _responses_body(backend, text, tool_calls=None, finish="stop"):
     # Responses uses separate output items: a message for text, a function_call
     # item per tool call (call_id/name/arguments), mirroring llama.cpp's mapping.
     output = []
@@ -323,6 +350,7 @@ def _responses_body(backend, text, tool_calls=None):
     return {
         "id": _hex("resp_"), "object": "response", "created_at": int(time.time()),
         "status": "completed", "model": backend.model_id, "output": output,
+        **(_RESPONSE_TRUNCATED if finish == "length" else {}),
     }
 
 
@@ -394,12 +422,13 @@ def make_handler(backend: Hub):
                         enable_thinking=enable_thinking,
                     ))
                 else:
-                    clean, reasoning, calls = _collect_parts(
+                    clean, reasoning, calls, finish = _collect_parts(
                         backend, msgs, max_tokens, tools,
                         enable_thinking=enable_thinking,
                     )
                     self._json(200, _chat_body(
-                        backend, clean, calls, reasoning_content=reasoning
+                        backend, clean, calls, reasoning_content=reasoning,
+                        finish=finish,
                     ))
             elif path == "/v1/responses":
                 msgs = response_messages(body)
@@ -410,11 +439,11 @@ def make_handler(backend: Hub):
                         enable_thinking=enable_thinking,
                     ))
                 else:
-                    clean, _reasoning, calls = _collect_parts(
+                    clean, _reasoning, calls, finish = _collect_parts(
                         backend, msgs, max_tokens, tools,
                         enable_thinking=enable_thinking,
                     )
-                    resp = _responses_body(backend, clean, calls)
+                    resp = _responses_body(backend, clean, calls, finish)
                     remember_response(resp["id"], msgs + _assistant_messages(clean, calls))
                     self._json(200, resp)
             else:

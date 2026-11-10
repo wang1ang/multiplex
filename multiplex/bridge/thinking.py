@@ -2,8 +2,9 @@
 """Thinking parser adapted from oMLX.
 
 Source inspiration: oMLX ``omlx/api/thinking.py`` on origin/main, Apache-2.0.
-The key UX choice is recovery: an unclosed thinking block must not produce an
-empty assistant answer or trigger a hidden second model generation.
+An unclosed thinking block stays reasoning. Re-sending it as content (oMLX's
+recovery) duplicates everything a streaming client already received; a
+generation cut off while thinking is reported as finish_reason "length".
 """
 
 from __future__ import annotations
@@ -37,20 +38,16 @@ def extract_thinking(text: str) -> tuple[str, str]:
             return match.group(1).strip(), text[match.end() :].strip()
     if THINK_OPEN in text and THINK_CLOSE not in text:
         index = text.index(THINK_OPEN)
-        recovered = (text[:index] + text[index + _OPEN_LEN :]).strip()
-        return recovered, recovered
+        return (text[:index] + text[index + _OPEN_LEN :]).strip(), ""
     return "", text
 
 
 class ThinkingParser:
-    """Streaming ``<think>`` parser with oMLX-style malformed recovery."""
+    """Streaming ``<think>`` splitter: text inside the block is reasoning."""
 
     def __init__(self, *, starts_in_thinking: bool = False) -> None:
         self._in_thinking = starts_in_thinking
         self._buffer = ""
-        self._close_seen = False
-        self._thinking_accumulated: list[str] = []
-        self._content_emitted = False
 
     def feed(self, text: str) -> tuple[str, str]:
         if not text:
@@ -69,7 +66,6 @@ class ThinkingParser:
                     continue
                 if remaining.startswith(THINK_CLOSE):
                     self._in_thinking = False
-                    self._close_seen = True
                     i += _CLOSE_LEN
                     continue
                 if self._could_be_tag(remaining):
@@ -80,33 +76,11 @@ class ThinkingParser:
             else:
                 content_out.append(text[i])
             i += 1
-        thinking = "".join(thinking_out)
-        content = "".join(content_out)
-        if thinking:
-            self._thinking_accumulated.append(thinking)
-        if content:
-            self._content_emitted = True
-        return thinking, content
+        return "".join(thinking_out), "".join(content_out)
 
     def finish(self) -> tuple[str, str]:
-        partial = self._buffer
-        self._buffer = ""
-        if (
-            self._in_thinking
-            and not self._close_seen
-            and not self._content_emitted
-            and self._thinking_accumulated
-        ):
-            recovered = "".join(self._thinking_accumulated) + partial
-            self._content_emitted = True
-            return "", recovered
-        if not partial:
-            return "", ""
-        if self._in_thinking:
-            self._thinking_accumulated.append(partial)
-            return partial, ""
-        self._content_emitted = True
-        return "", partial
+        partial, self._buffer = self._buffer, ""
+        return (partial, "") if self._in_thinking else ("", partial)
 
     @staticmethod
     def _could_be_tag(text: str) -> bool:

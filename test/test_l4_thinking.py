@@ -6,7 +6,10 @@ from multiplex.kernel.hub import Hub
 from multiplex.kernel.scheduler import Req, Scheduler
 from multiplex.server import (
     _chat_stream,
+    _collect_parts,
     _enable_thinking_from_body,
+    _responses_body,
+    _responses_stream,
 )
 
 
@@ -43,7 +46,7 @@ def _hub_recording_decode_params():
     calls = []
     hub = _hub_with_raw_chunks(["ok"])
 
-    def stream(_prompt_ids, _max_tokens, **kwargs):
+    def stream(_prompt_ids, _max_tokens, *, outcome, **kwargs):
         calls.append(kwargs)
         return iter(["ok"])
 
@@ -81,7 +84,7 @@ def test_l4_reasoning_off_strips_orphan_close_marker():
         )
     )
 
-    assert parts == [("content", "Visible answer")]
+    assert parts == [("content", "Visible answer"), ("finish_reason", "stop")]
 
 
 def test_l5_chat_stream_maps_l4_reasoning_to_reasoning_content_delta():
@@ -162,3 +165,83 @@ def test_l3_accept_draft_top_k_and_top_p_are_hard_filters(monkeypatch):
     assert scheduler._accept_draft(
         Req(0, [], 1, temperature=1.0, top_p=0.5), logits, best=0, draft=1
     ) is False
+
+
+def _hub_truncated(chunks):
+    """A hub whose generation hits max_tokens after ``chunks``."""
+    hub = _hub_with_raw_chunks(chunks)
+
+    def stream(_prompt_ids, _max_tokens, *, outcome, **_kw):
+        yield from chunks
+        outcome["finish_reason"] = "length"
+
+    hub._stream_prompt_ids = stream
+    return hub
+
+
+def test_l4_truncated_thinking_stays_reasoning_and_reports_length():
+    hub = _hub_truncated(["still ", "planning"])
+
+    parts = list(hub.stream_message_parts(
+        [{"role": "user", "content": "hi"}], 8, enable_thinking=True,
+    ))
+
+    reasoning = "".join(t for f, t in parts if f == "reasoning_content")
+    assert reasoning == "still planning"
+    assert [t for f, t in parts if f == "content"] == []
+    assert parts[-1] == ("finish_reason", "length")
+
+
+class _TruncatedBackend:
+    model_id = "tiny"
+
+    def __init__(self):
+        self.kwargs = None
+
+    def stream_message_parts(self, *_args, **kwargs):
+        self.kwargs = kwargs
+        yield "reasoning_content", "plan"
+        yield "content", "partial"
+        yield "finish_reason", "length"
+
+
+def test_l5_reports_length():
+    backend = _TruncatedBackend()
+    content, reasoning, calls, finish = _collect_parts(
+        backend, [{"role": "user", "content": "hi"}], 8, None,
+    )
+    assert (content, reasoning, calls, finish) == ("partial", "plan", [], "length")
+
+    payloads = [json.loads(e[len("data: "):]) for e in _chat_stream(
+        _TruncatedBackend(), [{"role": "user", "content": "hi"}], 8)
+        if e.startswith("data: ") and e.strip() != "data: [DONE]"]
+    assert payloads[-1]["choices"][0]["finish_reason"] == "length"
+    contents = [p["choices"][0]["delta"].get("content") for p in payloads]
+    assert contents.count("partial") == 1
+
+
+def test_l5_responses_marks_truncation_incomplete():
+    body = _responses_body(_TruncatedBackend(), "partial", None, "length")
+    assert body["status"] == "incomplete"
+    assert body["incomplete_details"] == {"reason": "max_output_tokens"}
+    assert _responses_body(_TruncatedBackend(), "done")["status"] == "completed"
+
+    events = "".join(_responses_stream(
+        _TruncatedBackend(), [{"role": "user", "content": "hi"}], 8))
+    assert "response.incomplete" in events
+    assert "response.completed" not in events
+
+
+def test_scheduler_emit_records_finish_reason():
+    sched = Scheduler.__new__(Scheduler)
+    sched.eos = {0}
+    sched._log_output = lambda *_a: None
+
+    req = Req(rid=1, prompt=[5], max_tokens=10)
+    assert sched._emit(req, [7, 0, 8]) == ([7, 0], True)
+    assert req.finish_reason == "stop"
+
+    req = Req(rid=2, prompt=[5], max_tokens=3)
+    req.out = [7]
+    assert sched._emit(req, [8, 9, 10]) == ([8, 9], True)
+    assert req.finish_reason == "length"

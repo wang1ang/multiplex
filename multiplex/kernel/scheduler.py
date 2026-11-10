@@ -65,6 +65,7 @@ class Req:
     accept_trials: int = 0
     accept_trials_by_depth: list[int] = field(default_factory=list)
     context_copy: ContextCopy | None = None       # built lazily by the copy lane
+    finish_reason: str | None = None   # "stop" (EOS) or "length" (max_tokens)
 
 
 @dataclass(frozen=True)
@@ -605,6 +606,7 @@ class Scheduler:
         for j, t in enumerate(toks):
             if t in self.eos or len(req.out) + j + 1 >= req.max_tokens:
                 toks, done = toks[: j + 1], True
+                req.finish_reason = "stop" if t in self.eos else "length"
                 break
         req.out.extend(toks)
         self._log_output(req, toks)

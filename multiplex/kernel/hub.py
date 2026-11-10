@@ -172,6 +172,7 @@ class Hub:
         L3 only streams backend-native decoded text. L4 is the first layer that
         knows both the rendered prompt and the client-facing protocol shape, so
         it owns the Qwen-style ``<think>`` split before L5 formats SSE/JSON.
+        The last item is ``("finish_reason", "stop" | "length")``.
         """
         # if self._cfg["debug"]:
         #     print(f"[hub] L4 IN messages={messages!r} tools={tools!r} "
@@ -196,9 +197,10 @@ class Hub:
         else:
             temperature = top_p = top_k = None
         thinking = ThinkingParser(starts_in_thinking=starts_in_thinking)
+        outcome: dict = {}
         for raw_delta in self._stream_prompt_ids(
             prompt_ids, max_tokens,
-            temperature=temperature, top_p=top_p, top_k=top_k,
+            temperature=temperature, top_p=top_p, top_k=top_k, outcome=outcome,
         ):
             reasoning_delta, content_delta = thinking.feed(raw_delta)
             if reasoning_delta:
@@ -210,6 +212,7 @@ class Hub:
             yield "reasoning_content", reasoning_delta
         if content_delta:
             yield "content", content_delta
+        yield "finish_reason", outcome.get("finish_reason") or "stop"
 
     def _prompt_ids(self, messages, tools=None, *, add_generation_prompt=True,
                     enable_thinking=None):
@@ -259,11 +262,13 @@ class Hub:
         return close_index < open_index
 
     def _stream_prompt_ids(self, prompt_ids, max_tokens, *,
-                           temperature=None, top_p=None, top_k=None):
+                           temperature=None, top_p=None, top_k=None,
+                           outcome=None):
         """Yield decoded text deltas for one request until it finishes. If the
         consumer stops early (client disconnects -> the SSE handler stops
         iterating -> this generator is closed), mark the request cancelled so the
-        engine thread drops it instead of finishing generation for no one."""
+        engine thread drops it instead of finishing generation for no one.
+        ``outcome["finish_reason"]`` is set once the request completes."""
         r, q = self._requests.submit(
             prompt_ids, max_tokens,
             temperature=temperature, top_p=top_p, top_k=top_k,
@@ -275,6 +280,10 @@ class Hub:
                 item = q.get()
                 if item is _DONE:
                     completed = True
+                    if outcome is not None:
+                        # The engine thread is done with ``r``: _DONE is
+                        # queued after its last write.
+                        outcome["finish_reason"] = r.finish_reason
                     return
                 yield item
         finally:
