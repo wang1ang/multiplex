@@ -110,6 +110,8 @@ main() {
     esac
   done
 
+  replace_running "$port"
+
   # Backgrounded so traps run on arrival (bash defers them while waiting on a
   # foreground child); `<&0` keeps the tty the model picker needs.
   "$PYTHON" -m multiplex.server "$@" <&0 &
@@ -119,6 +121,31 @@ main() {
   trap "cleanup $server $!" EXIT INT TERM HUP
 
   wait "$server"
+}
+
+replace_running() {  # port
+  # A multiplex server already on this port is an earlier run of ours: stop it
+  # (its own serve.sh, if any, restores Codex on the way out). Anything else
+  # holding the port is not ours to kill.
+  local pids pid cmd
+  pids="$(lsof -t -nP -iTCP:"$1" -sTCP:LISTEN 2>/dev/null || true)"
+  [ -n "$pids" ] || return 0
+  for pid in $pids; do
+    cmd="$(ps -o command= -p "$pid" 2>/dev/null || true)"
+    if [[ "$cmd" != *multiplex.server* ]]; then
+      echo "port $1 is held by pid $pid, not multiplex: $cmd" >&2
+      exit 1
+    fi
+  done
+  echo "[stopping multiplex already on port $1: pid $(echo $pids)]"
+  kill $pids
+  local i
+  for ((i = 0; i < 100; i++)); do
+    lsof -t -nP -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1 || return 0
+    sleep 0.1
+  done
+  echo "multiplex on port $1 did not exit within 10s (pid $(echo $pids))" >&2
+  exit 1
 }
 
 cleanup() {  # server_pid attacher_pid
