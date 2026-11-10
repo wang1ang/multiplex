@@ -233,6 +233,34 @@ class MTPHead(nn.Module):
         return self.norm(x)
 
 
+def _require_all_weights_consumed(head: nn.Module, weights: dict, mtp_path: str) -> None:
+    """Raise if any sidecar tensor has no matching parameter in ``head``."""
+    from mlx.utils import tree_flatten
+
+    params = {k for k, _ in tree_flatten(head.parameters())}
+    unused = sorted(k for k in weights if k not in params)
+    if not unused:
+        return
+    hint = ""
+    if any("gate_up_proj" in k for k in unused):
+        hint = (
+            "\nLikely cause: this sidecar stores MoE experts in the FUSED layout "
+            "(mlp.experts.gate_up_proj = gate_proj and up_proj concatenated, one "
+            "tensor for all experts; MTPLX #574 / newer HF Qwen3.5-MoE exports). "
+            "_stack_experts only understands NUMBERED experts "
+            "(mlp.experts.<N>.{gate,up,down}_proj). Fix: in _stack_experts, split "
+            "gate_up_proj in half along its output axis into "
+            "switch_mlp.gate_proj / switch_mlp.up_proj (and map experts.down_proj "
+            "to switch_mlp.down_proj), including the .scales/.biases of a "
+            "prequantized head."
+        )
+    raise ValueError(
+        f"MTP sidecar {mtp_path}: {len(unused)} tensor(s) have no matching "
+        f"parameter in the MTP head and would be silently dropped "
+        f"(head left at random init). First unmatched: {unused[:8]}{hint}"
+    )
+
+
 def build_qwen_head(engine, mtp_path: str):
     """Build the Qwen native-MTP head from a ``mtp.safetensors`` sidecar.
 
@@ -273,8 +301,11 @@ def build_qwen_head(engine, mtp_path: str):
 
         nn.quantize(head, class_predicate=is_quantized)
 
-    # strict=False: heads vary by architecture (dense vs MoE, quantized or
-    # not); load what matches and let the module keep its untouched norms.
+    # strict=False only lets the module keep parameters the checkpoint does not
+    # ship (it varies by architecture). The reverse — a checkpoint tensor with no
+    # matching parameter — would be dropped silently and leave that module at
+    # random init (garbage drafts, ~0 acceptance), so refuse it loudly.
+    _require_all_weights_consumed(head, weights, mtp_path)
     head.load_weights(list(weights.items()), strict=False)
     if _mtp_norms_are_delta_encoded(engine.model_path):
         for _, m in head.named_modules():
