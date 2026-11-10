@@ -12,10 +12,9 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
 import mlx.core as mx
-from mlx_lm.generate import _make_cache
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
-from ..engine import BatchState
+from ..engine import BatchState, make_batch_cache
 
 if TYPE_CHECKING:
     from ..engine import Engine
@@ -121,7 +120,7 @@ class PrefixCacheState:
 
     def restore_blocks(self, blocks: list[Any], ssm_snapshot, pos: int) -> BatchState:
         """Rebuild state by concatenating attention block deltas and applying SSM."""
-        cache = _make_cache(self.engine.model, [0], None)
+        cache = make_batch_cache(self.engine.model, [0])
         for layer_idx, c in enumerate(cache):
             if isinstance(c, ArraysCache):
                 layer_ssm = ssm_snapshot[layer_idx]

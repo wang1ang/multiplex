@@ -33,8 +33,41 @@ from typing import Any
 
 import mlx.core as mx
 from mlx_lm import load
-from mlx_lm.generate import _make_cache
-from mlx_lm.models.cache import ArraysCache, BatchKVCache
+from mlx_lm.models.cache import (
+    ArraysCache,
+    BatchKVCache,
+    BatchRotatingKVCache,
+    CacheList,
+    KVCache,
+    RotatingKVCache,
+)
+
+
+def make_batch_cache(model, left_padding: list[int]) -> list:
+    """Batch-aware per-layer cache for ``model``.
+
+    Same contract as mlx-lm's private ``generate._make_cache(model, lp, None)``,
+    which mlx-lm 0.32 removed; built only from the public cache classes so it
+    works across mlx-lm versions.
+    """
+
+    def to_batch(c):
+        if type(c) is KVCache:
+            return BatchKVCache(left_padding)
+        if isinstance(c, ArraysCache):
+            c.left_padding = mx.array(left_padding)
+            return c
+        if isinstance(c, RotatingKVCache):
+            if c.keep > 0:
+                raise ValueError("RotatingKVCache with keep tokens is not supported.")
+            return BatchRotatingKVCache(c.max_size, left_padding)
+        if isinstance(c, CacheList):
+            return CacheList(*(to_batch(sub) for sub in c.caches))
+        raise ValueError(f"{type(c)} does not yet support batching")
+
+    if hasattr(model, "make_cache"):
+        return [to_batch(c) for c in model.make_cache()]
+    return [BatchKVCache(left_padding) for _ in model.layers]
 
 
 # A fresh model_type string whose weights follow a schema mlx-lm already ships
@@ -274,7 +307,7 @@ class Engine:
 
     def _make_empty_cache(self) -> list:
         """A fresh single-row cache (all layers) to prefill into from scratch."""
-        return _make_cache(self.model, [0], None)
+        return make_batch_cache(self.model, [0])
 
     def warmup(self, *, prompt_length: int = 512) -> None:
         """Compile the common prefill shape before serving requests.
