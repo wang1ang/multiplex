@@ -16,13 +16,10 @@ dependencies = [
     # nothing is needed here. On Linux it pulls no GPU backend at all — the CUDA
     # one is an extra. `mlx[cuda13]`'s own markers are already Linux-only, so the
     # marker below is redundant for correctness and kept for legibility.
-    "mlx[cuda13]>=0.32; platform_system == 'Linux'",
-    # The CUDA backend JIT-compiles kernels at runtime and needs CUDA headers;
-    # the mlx-cuda wheel bundles the runtime libs but not the headers. Without
-    # this, the first mx.eval() dies with "Can not find locations of CUDA
-    # headers". Note the name has no -cu13 suffix (that spelling has no wheel).
-    # Point CUDA_HOME at it: see README "Linux / CUDA".
-    "nvidia-cuda-runtime; platform_system == 'Linux'",
+    # mlx-cuda 0.32.4 pulls the CUDA headers and finds them in site-packages;
+    # 0.32.0 fails the first JIT compile unless CUDA_HOME is set. macOS keeps
+    # the plain >=0.32 floor so a local 0.32.0 fork build is not replaced.
+    "mlx[cuda13]>=0.32.4; platform_system == 'Linux'",
 ]
 
 [project.scripts]
@@ -30,9 +27,13 @@ multiplex = "multiplex.server:main"
 
 [project.optional-dependencies]
 cli = ["prompt_toolkit>=3.0"]   # try_engine.py Chat CLI only
-# For a CUDA 12 driver instead of 13. Install as ".[cuda12]"; the cuda13 pin
-# above still resolves, so uninstall mlx-cuda-13 if both being present matters.
-cuda12 = ["mlx[cuda12]>=0.32; platform_system == 'Linux'"]
+# For a CUDA 12 driver instead of 13. The cuda13 pin above still installs, so
+# swap it out afterwards as the README "Linux / CUDA" shows. mlx-cuda-12 does
+# not pull the CUDA headers, so add them here.
+cuda12 = [
+    "mlx[cuda12]>=0.32.4; platform_system == 'Linux'",
+    "nvidia-cuda-runtime-cu12; platform_system == 'Linux'",
+]
 
 [build-system]
 requires = ["setuptools>=68"]

@@ -49,12 +49,19 @@ pip install -e ".[cli]"     # + the Chat CLI
 
 ### Linux / CUDA
 
-Set `CUDA_HOME` before the first run — MLX's CUDA backend JIT-compiles
-kernels and fails without it (use `-e ".[cuda12]"` for a CUDA 12 driver):
+The same install works on Linux with an NVIDIA GPU and needs no `CUDA_HOME`.
+It pulls the CUDA 13 MLX backend and the CUDA headers it compiles kernels
+against. The first requests after a fresh install are slow while MLX
+compiles its kernels. It caches them for later runs (`MLX_PTX_CACHE_DIR`).
+
+For a CUDA 12 driver, install the `cuda12` extra and swap out the CUDA 13
+backend. Both backends write the same `libmlx.so`, so reinstall `mlx-cuda-12`
+after the uninstall:
 
 ```bash
-export CUDA_HOME="$(python -c 'import nvidia, pathlib
-print(pathlib.Path(list(nvidia.__path__)[0]) / "cu13")')"
+uv pip install -e ".[cuda12]"
+uv pip uninstall mlx-cuda-13
+uv pip install --reinstall mlx-cuda-12
 ```
 
 On NVIDIA GPUs a CUDA-native engine is currently faster. See

@@ -1,7 +1,7 @@
 # Running on NVIDIA GPUs
 
 multiplex runs on Linux through MLX's CUDA backend (see the README for
-`CUDA_HOME`). It works, but it is not fast there yet. On NVIDIA hardware, a
+install). It works, but it is not fast there yet. On NVIDIA hardware, a
 CUDA-native engine is currently the better choice. This page records what we
 measured and what the alternatives reach on the same card, as a reference.
 
