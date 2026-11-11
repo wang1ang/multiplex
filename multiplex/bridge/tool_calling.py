@@ -12,28 +12,21 @@ from __future__ import annotations
 import json
 import re
 import uuid
-from dataclasses import dataclass
 from typing import Any
 
-
-@dataclass(frozen=True)
-class ToolCallExtraction:
-    cleaned_text: str
-    tool_calls: list[dict[str, Any]] | None
-    cleaned_thinking: str
-    parser_source: str = "none"
-    status: str = "no_tool"
-    malformed_reason: str | None = None
-    raw_tool_markup_suppressed: bool = False
+_INVOKE = r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>'
+_PARAM_EQ = r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>"
+_PARAM_NAMED = r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>'
+_NAMESPACED = r"<([A-Za-z_][\w.-]*):tool_call>\s*(.*?)\s*</\1:tool_call>"
+_NAMESPACED_OPEN = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
+_BRACKET = r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]"
+_BRACKET_PREFIXES = ("[Calling tool:", "[Tool call:")
+_OPEN, _CLOSE = "<tool_call>", "</tool_call>"
 
 
 def _serialize_tool_call_arguments(arguments: Any) -> str:
     if isinstance(arguments, dict):
-        return json.dumps(
-            _order_tool_arguments_for_client_display("", arguments),
-            ensure_ascii=False,
-            separators=(",", ":"),
-        )
+        return json.dumps(arguments, ensure_ascii=False, separators=(",", ":"))
     if isinstance(arguments, str):
         try:
             parsed = json.loads(arguments)
@@ -154,9 +147,20 @@ def _parse_bare_tool_payload(content: str) -> dict[str, Any] | None:
     return _tool_call(name, arguments)
 
 
-def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, str | None]:
+def _xml_params(body: str, patterns: tuple[str, ...]) -> dict[str, Any]:
+    params: dict[str, Any] = {}
+    for pattern in patterns:
+        for param in re.finditer(pattern, body, re.DOTALL):
+            value = param.group(2).strip()
+            try:
+                params[param.group(1)] = json.loads(value)
+            except (TypeError, ValueError):
+                params[param.group(1)] = value
+    return params
+
+
+def _parse_xml_tool_calls(text: str) -> list[dict[str, Any]] | None:
     calls: list[dict[str, Any]] = []
-    malformed_reason: str | None = None
     for match in re.findall(r"<tool_call>\s*(.*?)\s*</tool_call>", text, re.DOTALL):
         content = match.strip()
         if parsed := _parse_json_tool_payload(content):
@@ -177,81 +181,27 @@ def _parse_xml_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None, 
                 re.DOTALL,
             )
         if func_match:
-            name = func_match.group(1)
-            params = {}
-            param_patterns = (
-                r"<parameter=([^>\s]+)>\s*(.*?)\s*</parameter>",
-                r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
-            )
-            for pattern in param_patterns:
-                for param in re.finditer(pattern, func_match.group(2), re.DOTALL):
-                    key = param.group(1)
-                    value = param.group(2).strip()
-                    try:
-                        params[key] = json.loads(value)
-                    except (TypeError, ValueError):
-                        params[key] = value
-            calls.append(_tool_call(name, params))
+            params = _xml_params(func_match.group(2), (_PARAM_EQ, _PARAM_NAMED))
+            calls.append(_tool_call(func_match.group(1), params))
             continue
-        invoke_match = re.match(
-            r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>',
-            content,
-            re.DOTALL,
-        )
-        if invoke_match:
-            name = invoke_match.group(1)
-            params = {}
-            for param in re.finditer(
-                r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
-                invoke_match.group(2),
-                re.DOTALL,
-            ):
-                key = param.group(1)
-                value = param.group(2).strip()
-                try:
-                    params[key] = json.loads(value)
-                except (TypeError, ValueError):
-                    params[key] = value
-            calls.append(_tool_call(name, params))
-            continue
-        malformed_reason = "unrecognized <tool_call> payload"
-    if not calls:
-        return text, None, malformed_reason
-    cleaned = re.sub(r"<tool_call>.*?</tool_call>", "", text, flags=re.DOTALL).strip()
-    return cleaned, calls, None
+        if invoke_match := re.match(_INVOKE, content, re.DOTALL):
+            params = _xml_params(invoke_match.group(2), (_PARAM_NAMED,))
+            calls.append(_tool_call(invoke_match.group(1), params))
+    return calls or None
 
 
-def _parse_namespaced_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None]:
+def _parse_namespaced_tool_calls(text: str) -> list[dict[str, Any]] | None:
+    calls = [
+        _tool_call(invoke.group(1), _xml_params(invoke.group(2), (_PARAM_NAMED,)))
+        for _namespace, content in re.findall(_NAMESPACED, text, re.DOTALL)
+        for invoke in re.finditer(_INVOKE, content, re.DOTALL)
+    ]
+    return calls or None
+
+
+def _parse_bracket_tool_calls(text: str) -> list[dict[str, Any]] | None:
     calls: list[dict[str, Any]] = []
-    pattern = r"<([A-Za-z_][\w.-]*):tool_call>\s*(.*?)\s*</\1:tool_call>"
-    for _namespace, content in re.findall(pattern, text, re.DOTALL):
-        for invoke in re.finditer(
-            r'<invoke\s+name="([^"]+)">\s*(.*?)\s*</invoke>',
-            content,
-            re.DOTALL,
-        ):
-            params = {}
-            for param in re.finditer(
-                r'<parameter\s+name="([^"]+)">\s*(.*?)\s*</parameter>',
-                invoke.group(2),
-                re.DOTALL,
-            ):
-                value = param.group(2).strip()
-                try:
-                    params[param.group(1)] = json.loads(value)
-                except (TypeError, ValueError):
-                    params[param.group(1)] = value
-            calls.append(_tool_call(invoke.group(1), params))
-    if not calls:
-        return text, None
-    cleaned = re.sub(pattern, "", text, flags=re.DOTALL).strip()
-    return cleaned, calls
-
-
-def _parse_bracket_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | None]:
-    calls: list[dict[str, Any]] = []
-    pattern = r"\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]"
-    for name, args_text in re.findall(pattern, text, re.DOTALL):
+    for name, args_text in re.findall(_BRACKET, text, re.DOTALL):
         arguments: Any = {}
         if args_text:
             try:
@@ -259,9 +209,7 @@ def _parse_bracket_tool_calls(text: str) -> tuple[str, list[dict[str, Any]] | No
             except (TypeError, ValueError):
                 arguments = {}
         calls.append(_tool_call(name, arguments))
-    if not calls:
-        return text, None
-    return re.sub(pattern, "", text, flags=re.DOTALL).strip(), calls
+    return calls or None
 
 
 def _allowed_tool_names(tools: list[dict[str, Any]] | None) -> set[str]:
@@ -292,215 +240,45 @@ def _filter_known_tools(
 
 def parse_tool_calls(
     text: str,
-    tokenizer: Any | None,
     tools: list[dict[str, Any]] | None = None,
-) -> ToolCallExtraction:
-    cleaned_text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
-    raw_markup = any(
-        marker in (text or "")
-        for marker in ("<tool_call", "</tool_call>", "[Calling tool:", "[Tool call:")
-    )
-
-    if tokenizer is not None and getattr(tokenizer, "has_tool_calling", False):
-        start = getattr(tokenizer, "tool_call_start", None)
-        end = getattr(tokenizer, "tool_call_end", None)
-        parser = getattr(tokenizer, "tool_parser", None)
-        if start and parser:
-            matches: list[str] = []
-            if end:
-                matches = re.findall(
-                    rf"{re.escape(start)}(.*?){re.escape(end)}",
-                    text or "",
-                    flags=re.DOTALL,
-                )
-            elif start in (text or ""):
-                matches = [
-                    part
-                    for part in re.split(re.escape(start), text or "")[1:]
-                    if part.strip()
-                ]
-            calls: list[dict[str, Any]] = []
-            for match in matches:
-                try:
-                    parsed = parser(match.strip(), tools)
-                except Exception:
-                    parsed = None
-                items = parsed if isinstance(parsed, list) else [parsed]
-                for item in items:
-                    if not isinstance(item, dict):
-                        continue
-                    name = item.get("name")
-                    if not name:
-                        continue
-                    calls.append(_tool_call(str(name), item.get("arguments", {})))
-            calls = _filter_known_tools(calls, tools) or []
-            if calls:
-                if end:
-                    cleaned = re.sub(
-                        rf"{re.escape(start)}.*?{re.escape(end)}",
-                        "",
-                        cleaned_text,
-                        flags=re.DOTALL,
-                    ).strip()
-                else:
-                    cleaned = cleaned_text.split(start, 1)[0].strip()
-                return ToolCallExtraction(
-                    cleaned_text=cleaned,
-                    tool_calls=calls,
-                    cleaned_thinking="",
-                    parser_source="native",
-                    status="parsed",
-                    raw_tool_markup_suppressed=raw_markup,
-                )
-
-    if "<tool_call" in cleaned_text:
-        cleaned, calls, malformed = _parse_xml_tool_calls(cleaned_text)
-        filtered_calls = _filter_known_tools(calls, tools)
-        if calls and not filtered_calls and tools:
-            first_name = calls[0].get("function", {}).get("name", "unknown")
-            malformed = f"unknown tool '{first_name}'"
-        if filtered_calls:
-            return ToolCallExtraction(
-                cleaned_text=cleaned,
-                tool_calls=filtered_calls,
-                cleaned_thinking="",
-                parser_source="qwen_xml",
-                status="parsed",
-                raw_tool_markup_suppressed=True,
-            )
-        return ToolCallExtraction(
-            cleaned_text=cleaned_text,
-            tool_calls=None,
-            cleaned_thinking="",
-            parser_source="qwen_xml",
-            status="malformed_as_content",
-            malformed_reason=malformed or "unclosed or invalid tool_call markup",
-            raw_tool_markup_suppressed=False,
-        )
-
-    if re.search(r"<[A-Za-z_][\w.-]*:tool_call>", cleaned_text):
-        cleaned, calls = _parse_namespaced_tool_calls(cleaned_text)
-        calls = _filter_known_tools(calls, tools)
-        if calls:
-            return ToolCallExtraction(
-                cleaned_text=cleaned,
-                tool_calls=calls,
-                cleaned_thinking="",
-                parser_source="namespaced",
-                status="parsed",
-                raw_tool_markup_suppressed=True,
-            )
-
-    if "[Calling tool:" in cleaned_text or "[Tool call:" in cleaned_text:
-        cleaned, calls = _parse_bracket_tool_calls(cleaned_text)
-        calls = _filter_known_tools(calls, tools)
-        if calls:
-            return ToolCallExtraction(
-                cleaned_text=cleaned,
-                tool_calls=calls,
-                cleaned_thinking="",
-                parser_source="bracket",
-                status="parsed",
-                raw_tool_markup_suppressed=True,
-            )
-
-    return ToolCallExtraction(
-        cleaned_text=cleaned_text,
-        tool_calls=None,
-        cleaned_thinking="",
-        parser_source="none",
-        status="no_tool",
-        raw_tool_markup_suppressed=raw_markup,
-    )
-
-
-def sanitize_tool_call_markup(text: str, tokenizer: Any | None = None) -> str:
-    if not text:
-        return ""
-    filtered = ToolCallStreamFilter(tokenizer)
-    return filtered.feed(text) + filtered.finish()
-
-
-def extract_tool_calls_with_thinking(
-    thinking_content: str,
-    regular_content: str,
-    tokenizer: Any | None,
-    tools: list[dict[str, Any]] | None = None,
-) -> ToolCallExtraction:
-    result = parse_tool_calls(regular_content, tokenizer, tools)
-    cleaned_thinking = sanitize_tool_call_markup(thinking_content, tokenizer)
-    calls = result.tool_calls
-    status = result.status
-    source = result.parser_source
-    malformed = result.malformed_reason
-    if not calls and thinking_content:
-        thinking_result = parse_tool_calls(thinking_content, tokenizer, tools)
-        if thinking_result.tool_calls and not regular_content.strip():
-            calls = thinking_result.tool_calls
-            source = thinking_result.parser_source
-            status = thinking_result.status
-        elif thinking_result.status == "malformed_as_content" and status == "no_tool":
-            status = thinking_result.status
-            malformed = thinking_result.malformed_reason
-            source = thinking_result.parser_source
-    return ToolCallExtraction(
-        cleaned_text=result.cleaned_text,
-        tool_calls=calls,
-        cleaned_thinking=cleaned_thinking,
-        parser_source=source,
-        status=status,
-        malformed_reason=malformed,
-        raw_tool_markup_suppressed=(
-            result.raw_tool_markup_suppressed or cleaned_thinking != thinking_content
-        ),
-    )
+) -> list[dict[str, Any]] | None:
+    """Return the tool calls in a finished completion, or None. Calls to tools
+    not offered in ``tools`` are dropped."""
+    text = re.sub(r"<think>.*?</think>", "", text or "", flags=re.DOTALL)
+    if "<tool_call" in text:
+        # Qwen XML is authoritative: when it has no valid call, the text stays
+        # content rather than falling through to the looser formats.
+        return _filter_known_tools(_parse_xml_tool_calls(text), tools)
+    if _NAMESPACED_OPEN.search(text):
+        if calls := _filter_known_tools(_parse_namespaced_tool_calls(text), tools):
+            return calls
+    if any(prefix in text for prefix in _BRACKET_PREFIXES):
+        if calls := _filter_known_tools(_parse_bracket_tool_calls(text), tools):
+            return calls
+    return None
 
 
 class ToolCallStreamFilter:
     """Suppress tool-control markup while preserving normal streamed text."""
 
-    def __init__(self, tokenizer: Any | None = None) -> None:
-        start = getattr(tokenizer, "tool_call_start", None) if tokenizer is not None else None
-        end = getattr(tokenizer, "tool_call_end", None) if tokenizer is not None else None
-        self._marker_pairs: list[tuple[str, str]] = [("<tool_call>", "</tool_call>")]
-        self._suppress_after_markers: list[str] = []
-        if start:
-            if end:
-                self._marker_pairs.insert(0, (str(start), str(end)))
-            else:
-                self._suppress_after_markers.append(str(start))
-        self._namespaced_open_re = re.compile(r"<([A-Za-z_][\w.-]*):tool_call>")
-        self._bracket_prefixes = ["[Calling tool:", "[Tool call:"]
-        self._bracket_call_re = re.compile(
-            r"^\[(?:Calling tool|Tool call):\s*([A-Za-z_][\w.-]*)(?:\(({.*?})\))?\]",
-            re.DOTALL,
-        )
+    def __init__(self) -> None:
+        self._bracket_call_re = re.compile("^" + _BRACKET, re.DOTALL)
         self._buffer = ""
         self._suppressing_until: str | None = None
-        self._suppressing = False
-        self.suppressed_markup = False
 
     def _find_start_envelope(self, text: str) -> tuple[int, int, str | None] | None:
         starts: list[tuple[int, int, str | None]] = []
-        for marker, close in self._marker_pairs:
-            index = text.find(marker)
-            if index >= 0:
-                starts.append((index, len(marker), close))
-        if match := self._namespaced_open_re.search(text):
+        if (index := text.find(_OPEN)) >= 0:
+            starts.append((index, len(_OPEN), _CLOSE))
+        if match := _NAMESPACED_OPEN.search(text):
             namespace = match.group(1)
             starts.append((match.start(), len(match.group(0)), f"</{namespace}:tool_call>"))
-        for prefix in self._bracket_prefixes:
+        for prefix in _BRACKET_PREFIXES:
             index = text.find(prefix)
             while index >= 0:
-                candidate = text[index:]
-                bracket = self._bracket_call_re.match(candidate)
-                if bracket:
+                if bracket := self._bracket_call_re.match(text[index:]):
                     starts.append((index, bracket.end(), None))
                 index = text.find(prefix, index + 1)
-        for marker in self._suppress_after_markers:
-            index = text.find(marker)
-            if index >= 0:
-                starts.append((index, len(text) - index, "__suppress_permanently__"))
         return min(starts, key=lambda item: item[0]) if starts else None
 
     @staticmethod
@@ -527,51 +305,37 @@ class ToolCallStreamFilter:
         )
 
     def _partial_suffix_len(self, text: str) -> int:
-        keep = 0
-        for marker, _close in self._marker_pairs:
-            keep = max(keep, self._partial_prefix_len(text, marker))
-        for marker in self._suppress_after_markers:
-            keep = max(keep, self._partial_prefix_len(text, marker))
+        keep = self._partial_prefix_len(text, _OPEN)
         if (last_lt := text.rfind("<")) >= 0:
             candidate = text[last_lt:]
             if self._could_be_partial_namespaced_open(candidate):
                 keep = max(keep, len(candidate))
-        for prefix in self._bracket_prefixes:
+        for prefix in _BRACKET_PREFIXES:
             keep = max(keep, self._partial_prefix_len(text, prefix))
             if (index := text.rfind(prefix)) >= 0 and "]" not in text[index:]:
                 return max(keep, len(text[index:]))
         return min(keep, 128)
 
-    def _should_drop_tail_at_finish(self, tail: str) -> bool:
+    @staticmethod
+    def _should_drop_tail_at_finish(tail: str) -> bool:
         if not tail:
             return False
-        for marker, _close in self._marker_pairs:
-            if marker.startswith(tail):
-                return True
-        for prefix in self._bracket_prefixes:
-            if tail.startswith(prefix):
-                return True
+        if _OPEN.startswith(tail) or tail.startswith(_BRACKET_PREFIXES):
+            return True
         return tail.startswith("<") and ">" not in tail and ":" in tail
 
     def feed(self, text: str) -> str:
-        if self._suppressing or not text:
+        if not text:
             return ""
         self._buffer += text
         out: list[str] = []
         while self._buffer:
-            if self._suppressing_until == "__suppress_permanently__":
-                self.suppressed_markup = True
-                self._suppressing = True
-                self._suppressing_until = None
-                self._buffer = ""
-                break
             if self._suppressing_until is not None:
                 end_index = self._buffer.find(self._suppressing_until)
                 if end_index < 0:
                     keep = self._partial_prefix_len(self._buffer, self._suppressing_until)
                     self._buffer = self._buffer[-keep:] if keep else ""
                     break
-                self.suppressed_markup = True
                 self._buffer = self._buffer[end_index + len(self._suppressing_until) :]
                 self._suppressing_until = None
                 continue
@@ -580,7 +344,6 @@ class ToolCallStreamFilter:
                 index, consume_len, close_marker = start
                 if index > 0:
                     out.append(self._buffer[:index])
-                self.suppressed_markup = True
                 self._buffer = self._buffer[index + consume_len :]
                 if close_marker is not None:
                     self._suppressing_until = close_marker
@@ -597,8 +360,7 @@ class ToolCallStreamFilter:
         return "".join(out)
 
     def finish(self) -> str:
-        if self._suppressing or self._suppressing_until is not None:
-            self.suppressed_markup = True
+        if self._suppressing_until is not None:
             self._buffer = ""
             self._suppressing_until = None
             return ""
@@ -606,10 +368,7 @@ class ToolCallStreamFilter:
         if keep >= len(self._buffer):
             tail = self._buffer
             self._buffer = ""
-            if self._should_drop_tail_at_finish(tail):
-                self.suppressed_markup = True
-                return ""
-            return tail
+            return "" if self._should_drop_tail_at_finish(tail) else tail
         text = self._buffer[:-keep] if keep else self._buffer
         self._buffer = ""
         return text

@@ -23,18 +23,9 @@ import threading
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from .bridge import ToolCallStreamFilter, extract_tool_calls_with_thinking
+from .bridge import ToolCallStreamFilter, parse_tool_calls
 from .kernel.hub import Hub
 from .kernel.mtp import find_mtp
-
-
-def _split_tool_calls(text, tools):
-    """Parse the model's generated text into (visible_text, tool_calls). Only
-    attempts parsing when tools were offered; returns [] calls otherwise."""
-    if not tools:
-        return text, []
-    res = extract_tool_calls_with_thinking("", text, None, tools)
-    return res.cleaned_text, res.tool_calls or []
 
 
 # The backend is the L4 Hub: it runs the scheduler on one engine thread and lets
@@ -179,6 +170,14 @@ def _assistant_messages(text, tool_calls=None):
     return []
 
 
+def _function_call_item(call, **status):
+    """A Responses function_call output item for one parsed tool call."""
+    fn = call.get("function") or {}
+    return {"id": _hex("fc_"), "type": "function_call", **status,
+            "call_id": str(call.get("id") or _hex("call_")),
+            "name": fn.get("name") or "", "arguments": fn.get("arguments") or ""}
+
+
 # --- SSE encoders -------------------------------------------------------------
 def _sse(data, event=None):
     head = f"event: {event}\n" if event else ""
@@ -212,7 +211,7 @@ def _stream_visible(backend, messages, max_tokens, tools, *, enable_thinking=Non
         tail = filt.finish()
         if tail:
             yield tail, "", None, None
-        _, calls = _split_tool_calls(full, tools)
+        calls = parse_tool_calls(full, tools) or []
     yield "", "", calls, finish
 
 
@@ -220,8 +219,6 @@ def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None
                    sampling=None):
     content_parts = []
     reasoning_parts = []
-    calls = []
-    finish = "stop"
     for visible, reasoning, tool_calls, reason in _stream_visible(
         backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
         sampling=sampling,
@@ -230,11 +227,9 @@ def _collect_parts(backend, messages, max_tokens, tools, *, enable_thinking=None
             content_parts.append(visible)
         if reasoning:
             reasoning_parts.append(reasoning)
-        if tool_calls:
-            calls = tool_calls
-        if reason:
-            finish = reason
-    return "".join(content_parts), "".join(reasoning_parts), calls, finish
+    # The last item always carries the tool calls and finish reason.
+    return ("".join(content_parts), "".join(reasoning_parts), tool_calls or [],
+            reason)
 
 
 def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=None,
@@ -249,8 +244,6 @@ def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=N
         })
 
     yield chunk({"role": "assistant"})
-    calls = []
-    finish = "stop"
     for visible, reasoning, tool_calls, reason in _stream_visible(
         backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
         sampling=sampling,
@@ -259,17 +252,14 @@ def _chat_stream(backend, messages, max_tokens, tools=None, *, enable_thinking=N
             yield chunk({"reasoning_content": reasoning})
         if visible:
             yield chunk({"content": visible})
-        if tool_calls:
-            calls = tool_calls
-        if reason:
-            finish = reason
+    calls = tool_calls
     if calls:
         yield chunk({"tool_calls": [
             {"index": i, "id": c.get("id"), "type": "function",
              "function": c.get("function")} for i, c in enumerate(calls)]})
         yield chunk({}, finish="tool_calls")
     else:
-        yield chunk({}, finish=finish)
+        yield chunk({}, finish=reason)
     yield "data: [DONE]\n\n"
 
 
@@ -285,7 +275,7 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
     yield _sse({"type": "response.output_item.added", "item": message_item},
                "response.output_item.added")
 
-    full, calls, finish = "", [], "stop"
+    full = ""
     for visible, _reasoning, tool_calls, reason in _stream_visible(
         backend, messages, max_tokens, tools, enable_thinking=enable_thinking,
         sampling=sampling,
@@ -294,10 +284,7 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
             full += visible
             yield _sse({"type": "response.output_text.delta", "item_id": mid, "delta": visible},
                        "response.output_text.delta")
-        if tool_calls:
-            calls = tool_calls
-        if reason:
-            finish = reason
+    calls = tool_calls or []
     yield _sse({"type": "response.output_text.done", "item_id": mid, "text": full},
                "response.output_text.done")
     message_item = {**message_item, "status": "completed",
@@ -308,11 +295,7 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
     output = [message_item]
     # A function_call output item per parsed tool call (added -> args delta -> done).
     for c in calls:
-        fn = c.get("function") or {}
-        item_id = _hex("fc_")
-        call_id = str(c.get("id") or _hex("call_"))
-        item = {"id": item_id, "type": "function_call", "call_id": call_id,
-                "name": fn.get("name") or "", "arguments": fn.get("arguments") or ""}
+        item = _function_call_item(c)
         yield _sse({"type": "response.output_item.added",
                     "item": {**item, "status": "in_progress", "arguments": ""}},
                    "response.output_item.added")
@@ -323,7 +306,7 @@ def _responses_stream(backend, messages, max_tokens, tools=None, on_complete=Non
                    "response.output_item.done")
         output.append({**item, "status": "completed"})
 
-    if finish == "length":
+    if reason == "length":
         yield _sse({"type": "response.incomplete", "response": {
             **base, **_RESPONSE_TRUNCATED, "created_at": int(time.time()),
             "output": output,
@@ -367,12 +350,7 @@ def _responses_body(backend, text, tool_calls=None, finish="stop"):
         output.append({"id": _hex("msg_"), "type": "message", "role": "assistant",
                        "status": "completed",
                        "content": [{"type": "output_text", "text": text, "annotations": []}]})
-    for c in tool_calls or []:
-        fn = c.get("function") or {}
-        output.append({"id": _hex("fc_"), "type": "function_call", "status": "completed",
-                       "call_id": str(c.get("id") or _hex("call_")),
-                       "name": fn.get("name") or "",
-                       "arguments": fn.get("arguments") or ""})
+    output += [_function_call_item(c, status="completed") for c in tool_calls or []]
     return {
         "id": _hex("resp_"), "object": "response", "created_at": int(time.time()),
         "status": "completed", "model": backend.model_id, "output": output,
@@ -382,8 +360,7 @@ def _responses_body(backend, text, tool_calls=None, finish="stop"):
 
 # --- HTTP handler -------------------------------------------------------------
 def make_handler(backend: Hub):
-    response_history: dict[str, list[dict]] = {}
-    response_history_order: list[str] = []
+    response_history: dict[str, list[dict]] = {}  # insertion-ordered
     response_history_lock = threading.Lock()
 
     def response_messages(body):
@@ -398,10 +375,8 @@ def make_handler(backend: Hub):
     def remember_response(rid, messages):
         with response_history_lock:
             response_history[str(rid)] = messages
-            response_history_order.append(str(rid))
-            while len(response_history_order) > 32:
-                old = response_history_order.pop(0)
-                response_history.pop(old, None)
+            while len(response_history) > 32:
+                del response_history[next(iter(response_history))]
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, *a):  # quiet
@@ -446,18 +421,14 @@ def make_handler(backend: Hub):
                 self._json(400, {"error": {"message": str(e),
                                            "type": "invalid_request_error"}})
                 return
+            gen = dict(max_tokens=max_tokens, tools=tools,
+                       enable_thinking=enable_thinking, sampling=sampling)
             if path == "/v1/chat/completions":
                 msgs = _messages_from_chat(body)
                 if stream:
-                    self._sse_stream(_chat_stream(
-                        backend, msgs, max_tokens, tools,
-                        enable_thinking=enable_thinking, sampling=sampling,
-                    ))
+                    self._sse_stream(_chat_stream(backend, msgs, **gen))
                 else:
-                    clean, reasoning, calls, finish = _collect_parts(
-                        backend, msgs, max_tokens, tools,
-                        enable_thinking=enable_thinking, sampling=sampling,
-                    )
+                    clean, reasoning, calls, finish = _collect_parts(backend, msgs, **gen)
                     self._json(200, _chat_body(
                         backend, clean, calls, reasoning_content=reasoning,
                         finish=finish,
@@ -466,15 +437,11 @@ def make_handler(backend: Hub):
                 msgs = response_messages(body)
                 if stream:
                     self._sse_stream(_responses_stream(
-                        backend, msgs, max_tokens, tools,
+                        backend, msgs, **gen,
                         on_complete=lambda rid, out: remember_response(rid, msgs + out),
-                        enable_thinking=enable_thinking, sampling=sampling,
                     ))
                 else:
-                    clean, _reasoning, calls, finish = _collect_parts(
-                        backend, msgs, max_tokens, tools,
-                        enable_thinking=enable_thinking, sampling=sampling,
-                    )
+                    clean, _reasoning, calls, finish = _collect_parts(backend, msgs, **gen)
                     resp = _responses_body(backend, clean, calls, finish)
                     remember_response(resp["id"], msgs + _assistant_messages(clean, calls))
                     self._json(200, resp)

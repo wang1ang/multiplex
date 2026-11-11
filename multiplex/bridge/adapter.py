@@ -167,116 +167,44 @@ def _reasoning_for_message(message: Any) -> str | None:
     return str(reasoning) if reasoning else None
 
 
-def _apply_reasoning_reconstruction(
-    *,
-    role: str,
-    content: Any,
-    reasoning: str | None,
-    native_reasoning_content: bool,
-) -> tuple[str, str | None]:
-    text = _content_to_text(content)
-    if role != "assistant" or not reasoning:
-        return text, None
-    if native_reasoning_content:
-        return text, reasoning
-    return f"<think>\n{reasoning}\n</think>\n\n{text}", None
-
-
-def normalize_messages_for_template(
-    messages: list[Any],
-    *,
-    tokenizer: Any | None = None,
-    native_reasoning_content: bool = True,
-    max_tool_result_tokens: int | None = None,
-) -> list[dict[str, Any]]:
+def normalize_messages_for_template(messages: list[Any]) -> list[dict[str, Any]]:
     """Convert OpenAI messages into Qwen-template-safe dictionaries.
 
     The important contract is preservation, not steering: assistant text stays
-    text, structured tool calls stay structured when the tokenizer supports
-    native tool calling, tool results retain their ``tool_call_id``, and Qwen
-    reasoning stays in ``reasoning_content`` when the template supports it.
+    text, structured tool calls stay structured, tool results retain their
+    ``tool_call_id``, and Qwen reasoning stays in ``reasoning_content``.
     """
 
-    del max_tool_result_tokens  # MTPLX currently does not truncate OpenCode tools here.
-    native_tools = bool(getattr(tokenizer, "has_tool_calling", True))
     processed: list[dict[str, Any]] = []
     for message in messages:
         role = _message_role(message)
         if role == "developer":
             role = "system"
-        content = _message_content(message)
-        reasoning = _reasoning_for_message(message)
-        content_text, reasoning_out = _apply_reasoning_reconstruction(
-            role=role,
-            content=content,
-            reasoning=reasoning,
-            native_reasoning_content=native_reasoning_content,
-        )
+        content_text = _content_to_text(_message_content(message))
 
         if role == "tool":
             tool_call_id = _message_extra(message, "tool_call_id", "") or ""
-            if native_tools:
-                processed.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": str(tool_call_id),
-                        "content": content_text,
-                    }
-                )
-            else:
-                processed.append(
-                    {
-                        "role": "user",
-                        "content": f"[Tool Result ({tool_call_id})]: {content_text}",
-                        _PRESERVE_BOUNDARY_KEY: True,
-                    }
-                )
+            processed.append({"role": "tool", "tool_call_id": str(tool_call_id),
+                              "content": content_text})
             continue
 
+        item: dict[str, Any] = {"role": role, "content": content_text}
+        if role == "assistant" and (reasoning := _reasoning_for_message(message)):
+            item["reasoning_content"] = reasoning
+        if name := _message_extra(message, "name"):
+            item["name"] = str(name)
+        if _message_extra(message, "partial"):
+            item["partial"] = True
         tool_calls = _message_extra(message, "tool_calls")
         if role == "assistant" and tool_calls:
-            item: dict[str, Any] = {"role": "assistant", "content": content_text}
-            if reasoning_out is not None:
-                item["reasoning_content"] = reasoning_out
-            name = _message_extra(message, "name")
-            if name:
-                item["name"] = str(name)
-            partial = _message_extra(message, "partial")
-            if partial:
-                item["partial"] = True
-            if native_tools:
-                normalized_calls = [
-                    normalized
-                    for call in tool_calls
-                    if (normalized := _tool_call_for_template(call)) is not None
-                ]
-                if normalized_calls:
-                    item["tool_calls"] = normalized_calls
-            else:
-                lines = [content_text] if content_text else []
-                for call in tool_calls:
-                    normalized = _tool_call_for_template(call)
-                    if normalized is None:
-                        continue
-                    function = normalized["function"]
-                    lines.append(
-                        f"[Calling tool: {function['name']}("
-                        f"{json.dumps(function['arguments'], ensure_ascii=False)})]"
-                    )
-                item["content"] = "\n".join(lines)
+            normalized_calls = [
+                normalized
+                for call in tool_calls
+                if (normalized := _tool_call_for_template(call)) is not None
+            ]
+            if normalized_calls:
+                item["tool_calls"] = normalized_calls
             item[_PRESERVE_BOUNDARY_KEY] = True
-            processed.append(item)
-            continue
-
-        item = {"role": role, "content": content_text}
-        if reasoning_out is not None:
-            item["reasoning_content"] = reasoning_out
-        name = _message_extra(message, "name")
-        if name:
-            item["name"] = str(name)
-        partial = _message_extra(message, "partial")
-        if partial:
-            item["partial"] = True
         processed.append(item)
 
     normalized = _merge_consecutive_roles(

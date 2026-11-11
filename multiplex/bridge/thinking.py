@@ -9,37 +9,10 @@ generation cut off while thinking is reported as finish_reason "length".
 
 from __future__ import annotations
 
-import re
-
 THINK_OPEN = "<think>"
 THINK_CLOSE = "</think>"
 _OPEN_LEN = len(THINK_OPEN)
 _CLOSE_LEN = len(THINK_CLOSE)
-_THINKING_PATTERN = re.compile(r"<think>(.*?)</think>", re.DOTALL)
-_THINKING_TAIL_PATTERN = re.compile(r"^(.*?)</think>", re.DOTALL)
-
-
-def extract_thinking(text: str) -> tuple[str, str]:
-    if not text:
-        return "", ""
-    thinking_parts: list[str] = []
-    remaining = text
-    while True:
-        match = _THINKING_PATTERN.search(remaining)
-        if not match:
-            break
-        thinking_parts.append(match.group(1))
-        remaining = remaining[: match.start()] + remaining[match.end() :]
-    if thinking_parts:
-        return "\n".join(thinking_parts).strip(), remaining.strip()
-    if THINK_CLOSE in text and THINK_OPEN not in text:
-        match = _THINKING_TAIL_PATTERN.match(text)
-        if match:
-            return match.group(1).strip(), text[match.end() :].strip()
-    if THINK_OPEN in text and THINK_CLOSE not in text:
-        index = text.index(THINK_OPEN)
-        return (text[:index] + text[index + _OPEN_LEN :]).strip(), ""
-    return "", text
 
 
 class ThinkingParser:
