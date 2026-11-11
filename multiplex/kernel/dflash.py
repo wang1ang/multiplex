@@ -653,7 +653,6 @@ class DFlashDrafter:
     supports_batching = True
 
     def __init__(self, engine, model: DFlashDraftModel):
-        self.engine = engine
         self.model = model
         model.bind(engine.model)
         self.tap_layer_ids = tuple(int(i) for i in model.config.target_layer_ids)

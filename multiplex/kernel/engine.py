@@ -164,18 +164,29 @@ def _maybe_register_model_type_alias(load_path: str) -> None:
             return
 
 
+def pair_layout(model_path: str) -> dict | None:
+    """Return an assistant-pair bundle's ``layout`` dict, or None if the model
+    at ``model_path`` is not a pair bundle. A pair bundle has ``mtplx_pair.json``
+    at its root pointing at ``target/`` and ``assistant/`` subdirectories."""
+    pair = os.path.join(os.path.expanduser(model_path), "mtplx_pair.json")
+    if not os.path.isfile(pair):
+        return None
+    try:
+        with open(pair, encoding="utf-8") as f:
+            layout = (json.load(f).get("layout") or {})
+    except (OSError, json.JSONDecodeError):
+        return None
+    return layout if isinstance(layout, dict) else {}
+
+
 def _resolve_load_path(model_path: str) -> str:
     """An MTPLX assistant-pair bundle has no config.json at its root — the
     runnable text model lives under a subdirectory named by mtplx_pair.json's
     ``layout.target`` (default ``target/``). Point the loader there. A plain
     single-model directory (config.json at root) is returned unchanged."""
-    pair = os.path.join(model_path, "mtplx_pair.json")
-    if not os.path.isfile(pair):
+    layout = pair_layout(model_path)
+    if layout is None:
         return model_path
-    try:
-        layout = (json.load(open(pair)).get("layout") or {})
-    except (OSError, json.JSONDecodeError):
-        layout = {}
     target = os.path.join(model_path, str(layout.get("target") or "target"))
     if os.path.isfile(os.path.join(target, "config.json")):
         return target

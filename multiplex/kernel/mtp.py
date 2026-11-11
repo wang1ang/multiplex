@@ -30,7 +30,7 @@ from mlx_lm.models.cache import KVCache, BatchKVCache
 from mlx_lm.models.base import create_attention_mask
 import mlx_lm.models.qwen3_5 as q5
 
-from .engine import concat_kv, row_kv
+from .engine import concat_kv, pair_layout, row_kv
 
 
 def find_mtp(model_path: str) -> str | None:
@@ -322,21 +322,6 @@ def build_qwen_head(engine, mtp_path: str):
     return head
 
 
-def _pair_layout(model_path: str) -> dict | None:
-    """Return an assistant-pair bundle's ``layout`` dict, or None if the model
-    at ``model_path`` is not a pair bundle. A pair bundle has ``mtplx_pair.json``
-    at its root pointing at ``target/`` and ``assistant/`` subdirectories."""
-    pair = os.path.join(os.path.expanduser(model_path), "mtplx_pair.json")
-    if not os.path.isfile(pair):
-        return None
-    try:
-        with open(pair, encoding="utf-8") as f:
-            layout = (json.load(f).get("layout") or {})
-    except (OSError, json.JSONDecodeError):
-        return None
-    return layout if isinstance(layout, dict) else {}
-
-
 class GemmaHead:
     """Gemma 4 external-drafter MTP head (MTPLX assistant-backed).
 
@@ -512,7 +497,6 @@ class Drafter:
     """
 
     def __init__(self, engine, head):
-        self.engine = engine
         self.head = head
         self.embed = head.embed
         # A native head stacks ``mtp_num_hidden_layers`` draft layers, each with
@@ -744,7 +728,7 @@ def find_drafter(engine, mtp_path: str | None = None):
     # engine loaded the target; the drafter is the sibling assistant dir. The
     # bundle root is the parent of the resolved target load path.
     bundle_root = os.path.dirname(os.path.normpath(engine.model_path))
-    layout = _pair_layout(bundle_root)
+    layout = pair_layout(bundle_root)
     if layout is not None:
         assistant_dir = os.path.join(
             bundle_root, str(layout.get("assistant") or "assistant"))
