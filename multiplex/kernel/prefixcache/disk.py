@@ -24,34 +24,12 @@ import numpy as np
 RECORD_FORMAT_VERSION = 1
 
 
-_MLX_TO_NUMPY_DTYPE: dict[str, Any] = {
-    "bool": np.bool_,
-    "uint8": np.uint8,
-    "uint16": np.uint16,
-    "uint32": np.uint32,
-    "uint64": np.uint64,
-    "int8": np.int8,
-    "int16": np.int16,
-    "int32": np.int32,
-    "int64": np.int64,
-    "float16": np.float16,
-    "float32": np.float32,
-    "float64": np.float64,
-}
-
-_NUMPY_TO_MLX_DTYPE: dict[str, Any] = {
-    "bool": mx.bool_,
-    "uint8": mx.uint8,
-    "uint16": mx.uint16,
-    "uint32": mx.uint32,
-    "uint64": mx.uint64,
-    "int8": mx.int8,
-    "int16": mx.int16,
-    "int32": mx.int32,
-    "int64": mx.int64,
-    "float16": mx.float16,
-    "float32": mx.float32,
-    "float64": mx.float64,
+# dtype name -> (numpy dtype, MLX dtype); bfloat16 is stored as uint16.
+_DTYPES: dict[str, tuple[Any, Any]] = {
+    "bool": (np.bool_, mx.bool_),
+    **{name: (getattr(np, name), getattr(mx, name)) for name in (
+        "uint8", "uint16", "uint32", "uint64", "int8", "int16", "int32",
+        "int64", "float16", "float32", "float64")},
 }
 
 
@@ -226,23 +204,6 @@ class BlobStore:
 
 
 @dataclass(frozen=True)
-class DiskBlockTask:
-    """One immutable prefix-cache block write handed to the disk writer."""
-
-    key: str
-    parent: str | None
-    tokens: tuple[int, ...]
-    start: int
-    pos: int
-    pool: str
-    source: str | None
-    touch: int
-    attn: Any
-    ssm: Any | None = None
-    cached_h: Any | None = None
-
-
-@dataclass(frozen=True)
 class _RecordSizes:
     """On-disk sizes measured once per cleanup, so admission can price a chain
     by table lookup instead of re-stat'ing shared files per candidate."""
@@ -332,21 +293,13 @@ class AsyncPrefixDiskStore:
         self._blob_store = BlobStore(self.base_dir)
         self._records: dict[str, DiskBlockRecord] = {}
         self._lock = threading.RLock()
-        self._queue: queue.Queue[DiskBlockTask | None] = queue.Queue(
+        # (record metadata with empty specs, attn, ssm, cached_h) per write.
+        self._queue: queue.Queue[tuple | None] = queue.Queue(
             maxsize=max(1, int(queue_depth))
         )
         self._closed = threading.Event()
         self._writes_since_cleanup = 0
         self._last_cleanup = time.monotonic()
-        self._stats = {
-            "submitted": 0,
-            "dropped": 0,
-            "written": 0,
-            "errors": 0,
-            "cleanups": 0,
-            "records_deleted": 0,
-            "blobs_deleted": 0,
-        }
 
         self.base_dir.mkdir(parents=True, exist_ok=True)
         self._load_records()
@@ -379,7 +332,7 @@ class AsyncPrefixDiskStore:
         """
         if self._closed.is_set():
             return False
-        task = DiskBlockTask(
+        meta = DiskBlockRecord(
             key=str(key),
             parent=parent,
             tokens=tuple(int(t) for t in tokens),
@@ -388,19 +341,13 @@ class AsyncPrefixDiskStore:
             pool=str(pool),
             source=source,
             touch=int(touch),
-            attn=attn,
-            ssm=ssm,
-            cached_h=cached_h,
+            attn_spec=None,
         )
         try:
-            self._queue.put_nowait(task)
+            self._queue.put_nowait((meta, attn, ssm, cached_h))
         except queue.Full:
-            with self._lock:
-                self._stats["dropped"] += 1
-            self._debug(f"WRITE DROP queue_full key={task.key[:12]}")
+            self._debug(f"WRITE DROP queue_full key={meta.key[:12]}")
             return False
-        with self._lock:
-            self._stats["submitted"] += 1
         return True
 
     def records(self) -> list[DiskBlockRecord]:
@@ -411,63 +358,33 @@ class AsyncPrefixDiskStore:
         with self._lock:
             return self._records.get(key)
 
-    def load_attn(self, record: DiskBlockRecord) -> Any:
-        return decode_tree(record.attn_spec, self._blob_store.read_blob)
-
-    def load_ssm(self, record: DiskBlockRecord) -> Any | None:
-        if record.ssm_spec is None:
-            return None
-        return decode_tree(record.ssm_spec, self._blob_store.read_blob)
-
-    def load_cached_h(self, record: DiskBlockRecord) -> Any | None:
-        if record.cached_h_spec is None:
-            return None
-        return decode_tree(record.cached_h_spec, self._blob_store.read_blob)
+    def load(self, spec: Any) -> Any:
+        """Decode one of a record's tensor specs from its blobs."""
+        return decode_tree(spec, self._blob_store.read_blob)
 
     def flush(self) -> None:
         self._queue.join()
 
-    def close(self, *, wait: bool = True) -> None:
+    def close(self) -> None:
         if self._closed.is_set():
             return
-        if wait:
-            self.flush()
+        self.flush()
         self._closed.set()
-        try:
-            if wait:
-                self._queue.put(None)
-            else:
-                self._queue.put_nowait(None)
-        except queue.Full:
-            pass
-        if wait:
-            self._thread.join(timeout=5.0)
+        self._queue.put(None)
+        self._thread.join(timeout=5.0)
 
-    @property
-    def pending_writes(self) -> int:
-        return self._queue.qsize()
-
-    @property
-    def stats(self) -> dict[str, int]:
-        with self._lock:
-            return dict(self._stats)
-
-    def cleanup(self) -> dict[str, int]:
+    def cleanup(self) -> None:
         """Enforce max_bytes and garbage-collect unreferenced blobs."""
         if self.max_bytes <= 0:
-            return {"records_deleted": 0, "blobs_deleted": 0, "bytes_before": 0}
+            return
 
         records = self._scan_record_files()
         sizes = self._record_sizes(records)
         bytes_before = (sum(sizes.record_bytes.values())
                         + sum(sizes.blob_bytes.values()))
         if bytes_before <= self.max_bytes:
-            blobs_deleted = self._delete_unreferenced_blobs(records)
-            return {
-                "records_deleted": 0,
-                "blobs_deleted": blobs_deleted,
-                "bytes_before": bytes_before,
-            }
+            self._delete_unreferenced_blobs(sizes.blob_refs.values())
+            return
 
         target = int(self.max_bytes * 0.9)
         by_key = {record.key: record for record in records}
@@ -507,23 +424,14 @@ class AsyncPrefixDiskStore:
             except OSError as e:
                 self._debug(f"CLEANUP record_delete_failed key={record.key[:12]} error={e!r}")
 
-        kept_records = [record for record in records if record.key in keep]
-        blobs_deleted = self._delete_unreferenced_blobs(kept_records)
+        blobs_deleted = self._delete_unreferenced_blobs(
+            sizes.blob_refs[key] for key in keep)
         self._cleanup_tmp_files()
         self._load_records()
-        with self._lock:
-            self._stats["cleanups"] += 1
-            self._stats["records_deleted"] += deleted
-            self._stats["blobs_deleted"] += blobs_deleted
         self._debug(
             f"CLEANUP records_deleted={deleted} blobs_deleted={blobs_deleted} "
             f"bytes_before={bytes_before}"
         )
-        return {
-            "records_deleted": deleted,
-            "blobs_deleted": blobs_deleted,
-            "bytes_before": bytes_before,
-        }
 
     def _writer_loop(self) -> None:
         while True:
@@ -534,42 +442,26 @@ class AsyncPrefixDiskStore:
                 self._write_task(task)
                 self._maybe_cleanup()
             except Exception as e:
-                with self._lock:
-                    self._stats["errors"] += 1
                 self._debug(f"WRITE FAILED error={e!r}")
             finally:
                 self._queue.task_done()
 
-    def _write_task(self, task: DiskBlockTask) -> None:
-        attn_spec, tensors = encode_tree(task.attn, block_size=self.block_size)
-        ssm_spec = None
-        cached_h_spec = None
-        all_tensors = dict(tensors)
-        if task.ssm is not None:
-            ssm_spec, tensors = encode_tree(task.ssm, block_size=self.block_size)
-            all_tensors.update(tensors)
-        if task.cached_h is not None:
-            cached_h_spec, tensors = encode_tree(task.cached_h, block_size=self.block_size)
-            all_tensors.update(tensors)
+    def _write_task(self, task: tuple) -> None:
+        record, attn, *optional = task
+        record.attn_spec, all_tensors = encode_tree(attn, block_size=self.block_size)
+        specs = []
+        for value in optional:  # ssm, cached_h: absent stays None, not "none"
+            spec = None
+            if value is not None:
+                spec, tensors = encode_tree(value, block_size=self.block_size)
+                all_tensors.update(tensors)
+            specs.append(spec)
+        record.ssm_spec, record.cached_h_spec = specs
 
         self._blob_store.write_blobs(all_tensors)
-        record = DiskBlockRecord(
-            key=task.key,
-            parent=task.parent,
-            tokens=task.tokens,
-            start=task.start,
-            pos=task.pos,
-            pool=task.pool,
-            source=task.source,
-            touch=task.touch,
-            attn_spec=attn_spec,
-            ssm_spec=ssm_spec,
-            cached_h_spec=cached_h_spec,
-        )
-        write_json_atomic(self._record_path(task.key), record.to_json())
+        write_json_atomic(self._record_path(record.key), record.to_json())
         with self._lock:
-            self._records[task.key] = record
-            self._stats["written"] += 1
+            self._records[record.key] = record
             self._writes_since_cleanup += 1
 
     def _maybe_cleanup(self) -> None:
@@ -628,9 +520,8 @@ class AsyncPrefixDiskStore:
             except OSError:
                 record_bytes[record.key] = 0
             refs: set[str] = set()
-            _collect_blob_refs(record.attn_spec, refs)
-            _collect_blob_refs(record.ssm_spec, refs)
-            _collect_blob_refs(record.cached_h_spec, refs)
+            for spec in (record.attn_spec, record.ssm_spec, record.cached_h_spec):
+                _collect_blob_refs(spec, refs)
             blob_refs[record.key] = refs
 
         # Blobs are shared, so one pass over the blob dir beats a stat per
@@ -645,12 +536,9 @@ class AsyncPrefixDiskStore:
                     pass
         return _RecordSizes(record_bytes, blob_refs, blob_bytes)
 
-    def _delete_unreferenced_blobs(self, records: list[DiskBlockRecord]) -> int:
-        keep: set[str] = set()
-        for record in records:
-            _collect_blob_refs(record.attn_spec, keep)
-            _collect_blob_refs(record.ssm_spec, keep)
-            _collect_blob_refs(record.cached_h_spec, keep)
+    def _delete_unreferenced_blobs(self, refs) -> int:
+        """Delete every blob outside the union of the given reference sets."""
+        keep: set[str] = set().union(*refs)
 
         deleted = 0
         blob_root = self.base_dir / "blobs"
@@ -728,10 +616,8 @@ def _decode_tensor(spec: dict[str, Any], read_blob: Callable[[str], bytes]) -> m
     if dtype == "bfloat16":
         arr = mx.array(np.frombuffer(raw, dtype=np.uint16)).view(mx.bfloat16)
     else:
-        arr = mx.array(
-            np.frombuffer(raw, dtype=_MLX_TO_NUMPY_DTYPE[dtype]),
-            dtype=_NUMPY_TO_MLX_DTYPE[dtype],
-        )
+        np_dtype, mx_dtype = _DTYPES[dtype]
+        arr = mx.array(np.frombuffer(raw, dtype=np_dtype), dtype=mx_dtype)
     arr = arr.reshape(tuple(int(dim) for dim in spec["shape"]))
     mx.eval(arr)
     return arr
@@ -741,6 +627,6 @@ def _dtype_name(dtype: Any) -> str:
     raw = str(dtype)
     if raw.startswith("mlx.core."):
         raw = raw.removeprefix("mlx.core.")
-    if raw == "bfloat16" or raw in _MLX_TO_NUMPY_DTYPE:
+    if raw == "bfloat16" or raw in _DTYPES:
         return raw
     raise TypeError(f"unsupported MLX dtype for prefix cache SSD: {dtype!r}")

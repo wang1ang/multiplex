@@ -190,10 +190,8 @@ class PrefixCache:
             return ROOT_KEY
         if pos % self.chunk or pos > len(token_ids):
             return None
-        parent = ROOT_KEY
-        for start in range(0, pos, self.chunk):
-            parent = block_key(token_ids[start:start + self.chunk], parent=parent)
-        return parent
+        *_, key = self._iter_chain_keys(token_ids[:pos])
+        return key
 
     # ---------------------------------------------------------------- disk load
 
@@ -207,8 +205,6 @@ class PrefixCache:
             self._debug(f"LOAD SKIP incompatible_format path={manifest}")
         elif legacy.exists():
             self._debug(f"LOAD SKIP incompatible_legacy path={legacy}")
-        if self._disk is None:
-            return
 
         loaded = skipped = 0
         for record in sorted(self._disk.records(), key=lambda r: r.pos):
@@ -346,9 +342,7 @@ class PrefixCache:
 
             self._clock += 1
             best.touch = self._clock
-            payload = ("blocks", blocks, best.ssm, best.pos)
-            if best.cached_h is not None:
-                payload += (best.cached_h,)
+            payload = ("blocks", blocks, best.ssm, best.pos, best.cached_h)
             self._evict()
             return Match(prefix_len=best.pos, payload=payload, source=best.source,
                          pool=best.pool, key=best.key)
@@ -374,7 +368,7 @@ class PrefixCache:
         record = self._disk_record(node)
         if record is None:
             return False
-        node.attn = self._disk.load_attn(record)
+        node.attn = self._disk.load(record.attn_spec)
         return node.attn is not None
 
     def _load_reusable_payload(self, node: Node) -> bool:
@@ -382,10 +376,10 @@ class PrefixCache:
             record = self._disk_record(node)
             if record is None or record.ssm_spec is None:
                 return False
-            node.ssm = self._disk.load_ssm(record)
+            node.ssm = self._disk.load(record.ssm_spec)
             node.reusable = True
             if node.cached_h is None and record.cached_h_spec is not None:
-                node.cached_h = self._disk.load_cached_h(record)
+                node.cached_h = self._disk.load(record.cached_h_spec)
         return node.ssm is not None
 
     # ---------------------------------------------------------------- store

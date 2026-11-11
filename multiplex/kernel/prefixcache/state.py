@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Any
 import mlx.core as mx
 from mlx_lm.models.cache import ArraysCache, BatchKVCache
 
-from ..engine import BatchState, make_batch_cache
+from ..engine import BatchState, concat_kv, make_batch_cache, row_kv
 
 if TYPE_CHECKING:
     from ..engine import Engine
@@ -48,7 +48,7 @@ class PrefixCacheState:
             if isinstance(c, ArraysCache):
                 block.append(None)
                 continue
-            keys, values, length = self._row_view(c)
+            keys, values, length = row_kv(c)
             if start < 0 or pos > length or pos <= start:
                 raise ValueError(
                     f"invalid attention block slice [{start}:{pos}] for length={length}"
@@ -107,8 +107,7 @@ class PrefixCacheState:
         kind = payload[0] if payload else None
         if kind != "blocks":
             raise ValueError(f"unsupported prefix-cache payload: {kind!r}")
-        _kind, blocks, ssm, pos = payload[:4]
-        cached_h = payload[4] if len(payload) > 4 else None
+        _kind, blocks, ssm, pos, cached_h = payload
         attn_blocks, mtp_blocks = self.split_cache_blocks(blocks)
         state = self.restore_blocks(attn_blocks, ssm, pos)
         return RestoredPrefix(
@@ -130,24 +129,10 @@ class PrefixCacheState:
             parts = [block[layer_idx] for block in blocks if block[layer_idx] is not None]
             if not parts:
                 continue
-            keys = mx.concatenate([p[0] for p in parts], axis=2) \
-                if len(parts) > 1 else parts[0][0] + 0
-            values = mx.concatenate([p[1] for p in parts], axis=2) \
-                if len(parts) > 1 else parts[0][1] + 0
+            keys, values = concat_kv(parts)
             mx.eval(keys, values)
             self._assign_attention(c, keys, values)
         return BatchState(cache=cache, lengths=[int(pos)])
-
-    @staticmethod
-    def _row_view(c):
-        """Return valid single-row attention KV, skipping any left padding."""
-        off = c.offset
-        if hasattr(off, "shape") and off.shape:
-            pad = int(c.left_padding[0])
-            end = int(c._idx)
-            return c.keys[:, :, pad:end, :], c.values[:, :, pad:end, :], end - pad
-        n = int(off)
-        return c.keys[..., :n, :], c.values[..., :n, :], n
 
     @staticmethod
     def _assign_attention(c, keys, values) -> None:

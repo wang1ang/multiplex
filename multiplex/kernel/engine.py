@@ -85,6 +85,29 @@ _ARCH_ALIAS_MODULES: tuple[tuple[str, str], ...] = (
 )
 
 
+def row_kv(c):
+    """Return (valid_keys, valid_values, length) for a SINGLE-row attention
+    cache, skipping any existing left_padding. Handles both a plain KVCache
+    (from extract; scalar offset, no padding) and a 1-row BatchKVCache (from
+    a prior merge; [1] offset with left_padding)."""
+    off = c.offset
+    if hasattr(off, "shape") and off.shape:      # BatchKVCache (1 row)
+        pad = int(c.left_padding[0])
+        end = int(c._idx)
+        return c.keys[:, :, pad:end, :], c.values[:, :, pad:end, :], end - pad
+    n = int(off)                                  # plain KVCache
+    return c.keys[..., :n, :], c.values[..., :n, :], n
+
+
+def concat_kv(parts):
+    """Join per-block ``[k, v]`` deltas along the sequence axis into new
+    arrays (a single part is copied, never aliased)."""
+    if len(parts) > 1:
+        return (mx.concatenate([p[0] for p in parts], axis=2),
+                mx.concatenate([p[1] for p in parts], axis=2))
+    return parts[0][0] + 0, parts[0][1] + 0
+
+
 def _maybe_register_model_type_alias(load_path: str) -> None:
     """Let a checkpoint with an unknown ``model_type`` but a known ``architectures``
     schema load through the implementing module.
@@ -498,20 +521,6 @@ class Engine:
         self.last_trunk_cache = merged
         return BatchState(cache=merged, lengths=lengths)
 
-    @staticmethod
-    def _row_view(c):
-        """Return (valid_keys, valid_values, length) for a SINGLE-row attention
-        cache, skipping any existing left_padding. Handles both a plain KVCache
-        (from extract; scalar offset, no padding) and a 1-row BatchKVCache (from
-        a prior merge; [1] offset with left_padding)."""
-        off = c.offset
-        if hasattr(off, "shape") and off.shape:      # BatchKVCache (1 row)
-            pad = int(c.left_padding[0])
-            end = int(c._idx)
-            return c.keys[:, :, pad:end, :], c.values[:, :, pad:end, :], end - pad
-        n = int(off)                                  # plain KVCache
-        return c.keys[..., :n, :], c.values[..., :n, :], n
-
     def _merge_layer(self, caches):
         if isinstance(caches[0], ArraysCache):
             out = ArraysCache(len(caches[0].cache))
@@ -522,7 +531,7 @@ class Engine:
             ]
             return out
         # Attention: left-pad each row's valid KV to the max length.
-        views = [self._row_view(c) for c in caches]
+        views = [row_kv(c) for c in caches]
         lengths = [v[2] for v in views]
         max_len = max(lengths)
         B = len(caches)

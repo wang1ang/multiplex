@@ -30,6 +30,8 @@ from mlx_lm.models.cache import KVCache, BatchKVCache
 from mlx_lm.models.base import create_attention_mask
 import mlx_lm.models.qwen3_5 as q5
 
+from .engine import concat_kv, row_kv
+
 
 def find_mtp(model_path: str) -> str | None:
     """Return the model's MTP sidecar path, or None for pure AR/headless."""
@@ -375,22 +377,9 @@ class GemmaHead:
         """Reset the per-block draft position counter (called once per block)."""
         self._draft_step = 0
 
-    @staticmethod
-    def _valid_kv(c):
-        """Return a source layer's committed K/V ``[1, n_kv, L, D]``, skipping
-        any left-padding (BatchKVCache/BatchRotatingKVCache carry a padded
-        offset; a plain KVCache has a scalar offset and none)."""
-        off = c.offset
-        if hasattr(off, "shape") and off.shape:        # batched (1 row)
-            pad = int(c.left_padding[0])
-            end = int(c._idx)
-            return c.keys[:, :, pad:end, :], c.values[:, :, pad:end, :]
-        n = int(off)
-        return c.keys[..., :n, :], c.values[..., :n, :]
-
     def _shared_kv(self, cache):
-        ks, vs = self._valid_kv(cache[self._sliding_src])
-        kf, vf = self._valid_kv(cache[self._full_src])
+        ks, vs, _ = row_kv(cache[self._sliding_src])
+        kf, vf, _ = row_kv(cache[self._full_src])
         return {"sliding_attention": (ks, vs), "full_attention": (kf, vf)}
 
     def _trunk_cache(self):
@@ -670,10 +659,7 @@ class Drafter:
             ]
             if not parts:
                 continue
-            keys = mx.concatenate([p[0] for p in parts], axis=2) \
-                if len(parts) > 1 else parts[0][0] + 0
-            values = mx.concatenate([p[1] for p in parts], axis=2) \
-                if len(parts) > 1 else parts[0][1] + 0
+            keys, values = concat_kv(parts)
             mx.eval(keys, values)
             c.state = [keys, values]
         return cache

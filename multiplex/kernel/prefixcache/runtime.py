@@ -111,7 +111,7 @@ class PrefixCacheRuntime:
 
     def store_prompt_block(self, req: Any, group: Any, ids: list[int],
                            start: int, end: int, h) -> None:
-        if self.cache is None or self.state is None or not self.chunk:
+        if self.cache is None:
             return
         if end - start != self.chunk:
             return
@@ -145,7 +145,7 @@ class PrefixCacheRuntime:
 
     def capture_session_blocks(self, rows: list[Any], state: BatchState, *,
                                dcache=None, h=None) -> None:
-        if self.cache is None or self.state is None or not self.chunk:
+        if self.cache is None:
             return
         for i, req in enumerate(rows):
             if not req.session_cache:
@@ -158,10 +158,7 @@ class PrefixCacheRuntime:
                 continue
             single = self.engine.extract_row(state, i)
             start = pos - self.chunk
-            prefix = req.prompt + req.out
-            if len(prefix) < pos or start < 0:
-                continue
-            prefix = prefix[:pos]
+            prefix = (req.prompt + req.out)[:pos]
             block_payload = self._pack_block(
                 self.state.clone_attention_block(single, start, pos),
                 dcache, start, pos, row=i,
