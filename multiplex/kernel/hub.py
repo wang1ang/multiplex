@@ -147,24 +147,6 @@ class Hub:
         self._ready.wait()
 
     # --- API side (any HTTP thread) -----------------------------------------
-    def stream_messages(self, messages, max_tokens, tools=None,
-                        add_generation_prompt=True, enable_thinking=None):
-        """Yield decoded text deltas for one request.
-
-        L5 passes protocol-normalized messages here. L4 owns chat-template
-        rendering, tokenization, generation-prompt handling, and submission to
-        L3. L5 never sees prompt token ids.
-        """
-        for field, text in self.stream_message_parts(
-            messages,
-            max_tokens,
-            tools=tools,
-            add_generation_prompt=add_generation_prompt,
-            enable_thinking=enable_thinking,
-        ):
-            if field == "content":
-                yield text
-
     def stream_message_parts(self, messages, max_tokens, tools=None,
                              add_generation_prompt=True, enable_thinking=None,
                              temperature=None, top_p=None, top_k=None):
@@ -178,11 +160,6 @@ class Hub:
         Sampling values the client sent win; the thinking-mode defaults only
         fill the ones it left out.
         """
-        # if self._cfg["debug"]:
-        #     print(f"[hub] L4 IN messages={messages!r} tools={tools!r} "
-        #           f"max_tokens={max_tokens!r} "
-        #           f"add_generation_prompt={add_generation_prompt!r}",
-        #           file=sys.stderr, flush=True)
         effective_enable_thinking = self._effective_enable_thinking(enable_thinking)
         if getattr(self, "_cfg", {}).get("debug"):
             print(f"[hub] REQUEST enable_thinking={effective_enable_thinking}",

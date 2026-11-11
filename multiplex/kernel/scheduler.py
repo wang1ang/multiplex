@@ -25,7 +25,7 @@ from dataclasses import dataclass, field
 
 import mlx.core as mx
 
-from .engine import Engine, BatchState
+from .engine import Engine, BatchState, env_flag
 from .context_copy import ContextCopy
 from .mtp import Drafter
 from .prefixcache.runtime import PrefixCacheRuntime
@@ -62,7 +62,6 @@ class Req:
     advance_window: deque = field(
         default_factory=lambda: deque(maxlen=ADVANCE_WINDOW))
     accept_counts: list[int] = field(default_factory=list)
-    accept_trials: int = 0
     accept_trials_by_depth: list[int] = field(default_factory=list)
     context_copy: ContextCopy | None = None       # built lazily by the copy lane
     finish_reason: str | None = None   # "stop" (EOS) or "length" (max_tokens)
@@ -189,7 +188,6 @@ class DynamicDepthController:
 class PrefillGroup:
     """One request being prefetched before it joins the live decode batch."""
     req: Req
-    single: BatchState | None = None
     first: int | None = None
     last_h: object = None
     state: BatchState | None = None               # single-row chunked prefill
@@ -222,17 +220,18 @@ class Scheduler:
         # (SSM / rotating-KV rollback is not per-row and falls back to take-min).
         # Default from MULTIPLEX_PER_ROW_COMMIT (0/1); explicit arg wins.
         if per_row_commit is None:
-            self.per_row_commit = os.environ.get("MULTIPLEX_PER_ROW_COMMIT", "0") not in ("0", "", "false", "False")
+            self.per_row_commit = env_flag("MULTIPLEX_PER_ROW_COMMIT", "0")
         else:
             self.per_row_commit = bool(per_row_commit)
         self._per_row_fallback_logged = False
+        self._clear_cache_mark = 0
         # Context-copy block speculation (prompt n-gram lookup, see
         # context_copy.py). On by default; MULTIPLEX_CONTEXT_COPY=0 disables.
         # Runs only where the draft-history bookkeeping is known: no drafter
         # (pure AR) or the native MTP head; DFlash (not a Drafter) and the
         # Gemma shared-KV head (begin_draft) keep their own lanes.
         self.context_copy = (
-            os.environ.get("MULTIPLEX_CONTEXT_COPY", "1") not in ("0", "", "false", "False")
+            env_flag("MULTIPLEX_CONTEXT_COPY", "1")
             and (drafter is None
                  or (isinstance(drafter, Drafter) and not hasattr(drafter.head, "begin_draft")))
         )
@@ -373,9 +372,7 @@ class Scheduler:
             self.prefix_cache.begin_prefill(req, group)
             group.started = True
 
-        if cancelled and cancelled(req.rid):
-            self._log(f"PREFILL CANCELLED rid={req.rid}")
-            self.prefix_cache.prune_unreferenced()
+        if self._prefill_cancelled(req, cancelled):
             return None
 
         h = group.cached_h if group.pos == len(ids) else None
@@ -396,26 +393,15 @@ class Scheduler:
                     self.eng, h, group.drafter_ctx
                 )
             self.prefix_cache.store_prompt_block(req, group, ids, start, end, h)
-            if cancelled and cancelled(req.rid):
-                self._log(f"PREFILL CANCELLED rid={req.rid}")
-                self.prefix_cache.prune_unreferenced()
+            if self._prefill_cancelled(req, cancelled):
                 return None
             if group.pos < len(ids):
                 return False
 
+        # A full prefix-cache hit runs no chunk, so the context starts here.
         if self.dr is not None and group.drafter_ctx is None:
             group.drafter_ctx = self.dr.update_prefill_context(eng, h, None)
-        # Only the final prefill position can produce the first token. Avoid
-        # projecting the whole prompt through the vocabulary head.
-        first = int(mx.argmax(eng.last_logits(h)[0, -1]))
-        h = h[:, -1:, :]
-
-        req.out.append(first)
-        self._log_output(req, [first])
-        group.single = group.state
-        group.first = first
-        group.last_h = h
-        return True
+        return self._finish_prefill(group, h)
 
     def _prefill_embeds(self, group: PrefillGroup, cancelled=None):
         """Single-shot prefill from precomputed input embeddings (image request).
@@ -432,8 +418,7 @@ class Scheduler:
             if self.dr is not None:
                 group.dcache = self.dr.make_cache()
             group.started = True
-        if cancelled and cancelled(req.rid):
-            self._log(f"PREFILL CANCELLED rid={req.rid}")
+        if self._prefill_cancelled(req, cancelled, prune=False):
             return None
 
         ids = req.prompt
@@ -448,21 +433,28 @@ class Scheduler:
                 self.eng, h, group.drafter_ctx
             )
 
-        if cancelled and cancelled(req.rid):
-            self._log(f"PREFILL CANCELLED rid={req.rid}")
+        if self._prefill_cancelled(req, cancelled, prune=False):
             return None
+        return self._finish_prefill(group, h)
 
-        if self.dr is not None and group.drafter_ctx is None:
-            group.drafter_ctx = self.dr.update_prefill_context(eng, h, None)
+    def _finish_prefill(self, group: PrefillGroup, h) -> bool:
+        """Emit the first token from the last prefill position; ready to merge."""
+        req = group.req
         # Only the final prefill position can produce the first token. Avoid
         # projecting the whole prompt through the vocabulary head.
-        first = int(mx.argmax(eng.last_logits(h)[0, -1]))
-        h = h[:, -1:, :]
+        first = int(mx.argmax(self.eng.last_logits(h)[0, -1]))
         req.out.append(first)
         self._log_output(req, [first])
-        group.single = group.state
         group.first = first
-        group.last_h = h
+        group.last_h = h[:, -1:, :]
+        return True
+
+    def _prefill_cancelled(self, req: Req, cancelled, *, prune=True) -> bool:
+        if not (cancelled and cancelled(req.rid)):
+            return False
+        self._log(f"PREFILL CANCELLED rid={req.rid}")
+        if prune:
+            self.prefix_cache.prune_unreferenced()
         return True
 
     def merge_ready(self, group: PrefillGroup) -> list[tuple[int, int]]:
@@ -472,7 +464,7 @@ class Scheduler:
 
         # First row can keep its single-row cache; avoid rebuilding long KV.
         if not self.rows:
-            self.state = group.single
+            self.state = group.state
             self.h = group.last_h
             self.primary = mx.array([group.first])
             self.rows = [r]
@@ -492,7 +484,7 @@ class Scheduler:
                 dcaches.append(self.dr.extract_cache_row(self.dcache, i))
                 if self.ctx is not None:
                     ctxs.append(self.ctx[i:i + 1])
-        singles.append(group.single)
+        singles.append(group.state)
         hs.append(group.last_h)
         prims.append(mx.array([group.first]))
         reqs.append(r)
@@ -527,13 +519,12 @@ class Scheduler:
 
     def _maybe_clear_allocator_cache(self, state) -> None:
         live = max(state.lengths) if state.lengths else 0
-        mark = getattr(self, "_clear_cache_mark", 0)
-        if live < mark:                 # rows changed: restart the cadence
-            mark = 0
-        if live >= self.CLEAR_CACHE_CONTEXT_THRESHOLD and live - mark >= self.CLEAR_CACHE_EVERY:
+        if live < self._clear_cache_mark:   # rows changed: restart the cadence
+            self._clear_cache_mark = 0
+        if (live >= self.CLEAR_CACHE_CONTEXT_THRESHOLD
+                and live - self._clear_cache_mark >= self.CLEAR_CACHE_EVERY):
             mx.clear_cache()
-            mark = live
-        self._clear_cache_mark = mark
+            self._clear_cache_mark = live
 
     # --- context-copy round: verify a prompt-copied block -----------------
     def _copy_round(self, t0):
@@ -590,7 +581,6 @@ class Scheduler:
         primary = trunk_pred[:, m]
         state, h = self._rollback(state, snap, lengths_before, verify_in,
                                   blocks, vhidden, m, T)
-        self.state, self.h, self.primary = state, h, primary
         if dr is not None:
             hist_h = mx.concatenate([prev_h, vhidden[:, :m, :]], axis=1) if m else prev_h
             dr.append_history(self.dcache, hist_h, verify_in[:, :m + 1])
@@ -667,7 +657,6 @@ class Scheduler:
                     rows[i].accept_trials_by_depth.extend(
                         [0] * (k - len(rows[i].accept_trials_by_depth))
                     )
-                rows[i].accept_trials += 1
                 for n in range(k):
                     rows[i].accept_trials_by_depth[n] += 1
                 for n in range(a):
@@ -708,7 +697,6 @@ class Scheduler:
             state, h, primary = self._commit_per_row(
                 state, vhidden, trunk_pred, draft_ids, accs,
                 lengths_before, k)
-            self.state, self.h, self.primary = state, h, primary
             self.ctx = dr.update_context_after_commit(eng, h, accs)
             self._finish_step(state, h, primary, rows, emitted, finished,
                               accs, m, k, trunk_logits, trunk_pred, t0)
@@ -723,7 +711,6 @@ class Scheduler:
             dr.commit(self.dcache, m, draft_ids, vhidden)
         state, h = self._rollback(state, snap, lengths_before, verify_in,
                                   draft_ids, vhidden, m, k)
-        self.state, self.h, self.primary = state, h, primary
         if dr is not None:
             self.ctx = dr.update_context_after_commit(eng, h, m)
         self._finish_step(state, h, primary, rows, emitted, finished,

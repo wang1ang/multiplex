@@ -85,6 +85,11 @@ _ARCH_ALIAS_MODULES: tuple[tuple[str, str], ...] = (
 )
 
 
+def env_flag(name: str, default: str) -> bool:
+    """A boolean environment switch: unset uses ``default``; 0/false/empty is off."""
+    return os.environ.get(name, default) not in ("0", "", "false", "False")
+
+
 def row_kv(c):
     """Return (valid_keys, valid_values, length) for a SINGLE-row attention
     cache, skipping any existing left_padding. Handles both a plain KVCache
@@ -431,7 +436,7 @@ class Engine:
             layers = self.model.language_model.model.layers
         except AttributeError:
             return
-        want_fused = os.environ.get("MULTIPLEX_GDN_FUSED", "1") not in ("0", "", "false", "False")
+        want_fused = env_flag("MULTIPLEX_GDN_FUSED", "1")
         for i, layer in enumerate(layers):
             mixer = getattr(layer, "linear_attn", None)
             if mixer is not None and type(mixer).__name__ == "GatedDeltaNet":
@@ -479,7 +484,6 @@ class Engine:
         rewinds the write index — it does NOT restore the buffer contents. So a
         rejected speculative tail cannot be rolled back by trimming; the round
         must instead be fully rewound and the committed prefix replayed."""
-        from mlx_lm.models.cache import BatchRotatingKVCache, RotatingKVCache
         return any(
             isinstance(c, (BatchRotatingKVCache, RotatingKVCache))
             for c in state.cache
