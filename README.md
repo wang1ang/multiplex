@@ -57,6 +57,9 @@ export CUDA_HOME="$(python -c 'import nvidia, pathlib
 print(pathlib.Path(list(nvidia.__path__)[0]) / "cu13")')"
 ```
 
+On NVIDIA GPUs a CUDA-native engine is currently faster. See
+[docs/CUDA.md](docs/CUDA.md) for measured numbers and a comparison.
+
 ## Quick start
 
 ```bash
