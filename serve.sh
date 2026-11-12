@@ -114,7 +114,10 @@ main() {
 
   # Backgrounded so traps run on arrival (bash defers them while waiting on a
   # foreground child); `<&0` keeps the tty the model picker needs.
-  "$PYTHON" -m multiplex.server "$@" <&0 &
+  # Measured best on M3 Max / Qwen3.8-27B-MTPLX-4bit (with the small-M verify
+  # kernel): fixed MTP depth 4 beats dynamic depth on long-context analysis
+  # and prose alike. Placed first so any flag you pass overrides it.
+  "$PYTHON" -m multiplex.server --depth 4 --no-dynamic-depth "$@" <&0 &
   local server=$!
   attach "$host" "$port" &
   # Not EXIT alone: Ctrl-C kills a trap-less bash outright, skipping it.

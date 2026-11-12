@@ -105,6 +105,9 @@ clients, see [`docs/CLIENTS.md`](docs/CLIENTS.md).
 - `--mtp /path/to/sidecar.safetensors` — override automatic MTP discovery.
 - `--no-debug` — silence scheduler/request logs.
 
+`serve.sh` defaults to `--depth 4 --no-dynamic-depth` (measured fastest on an
+M3 Max with the 27B 4-bit model); any flag you pass overrides it.
+
 `serve.sh` also points local coding agents (pi, Codex) at the running server
 for the duration, restoring their config on exit. It uses the project-local
 `.venv` and custom-built MLX by default; override with `MULTIPLEX_PYTHON` only
