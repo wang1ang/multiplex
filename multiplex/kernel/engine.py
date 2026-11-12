@@ -42,6 +42,8 @@ from mlx_lm.models.cache import (
     RotatingKVCache,
 )
 
+from multiplex.lib.dspark import small_m_qmm
+
 from . import gdn_fused
 
 
@@ -88,6 +90,16 @@ _ARCH_ALIAS_MODULES: tuple[tuple[str, str], ...] = (
 def env_flag(name: str, default: str) -> bool:
     """A boolean environment switch: unset uses ``default``; 0/false/empty is off."""
     return os.environ.get(name, default) not in ("0", "", "false", "False")
+
+
+def _small_m_supported() -> bool:
+    """skinny_qmm runs on Metal up to M4-class GPUs (applegpu_g13..g16); upstream
+    disables it on M5+ (g17+), where the kernel stalls."""
+    if not mx.metal.is_available():
+        return False
+    arch = str(mx.device_info().get("architecture", ""))
+    digits = "".join(ch for ch in arch.removeprefix("applegpu_g") if ch.isdigit())
+    return bool(digits) and int(digits) <= 16
 
 
 def row_kv(c):
@@ -308,6 +320,18 @@ class Engine:
         self._gdn_inputs: dict = {}
         self._gdn_layers: list = []
         self._setup_gdn_capture()
+        # Small-M quantized matmul for verify widths 5..16 (multiplex/lib/dspark):
+        # calibrated per shape at load (numerics + speed race on this chip), then
+        # patched in around forward()/logits(). Not bit-identical to stock (1-2
+        # bf16 ulps); MULTIPLEX_SMALL_M=0 keeps the stock kernel everywhere.
+        self.small_m_ids = frozenset()
+        if env_flag("MULTIPLEX_SMALL_M", "1") and _small_m_supported():
+            t1 = time.time()
+            shapes = small_m_qmm.measure_shapes(self.model)
+            self.small_m_ids = small_m_qmm.ids_for_shapes(shapes, self.model)
+            print(f"[engine] small-M qmm: {len(self.small_m_ids)} modules on "
+                  f"{','.join(shapes) or 'no shapes'} ({time.time() - t1:.1f}s)",
+                  file=sys.stderr, flush=True)
 
     def enable_hidden_taps(self, layer_ids) -> None:
         """Capture the outputs of trunk decoder layers ``layer_ids`` on every
@@ -342,9 +366,10 @@ class Engine:
         only the final position is needed (for example after prefill).
         """
         lm = self.model.language_model
-        if lm.args.tie_word_embeddings:
-            return lm.model.embed_tokens.as_linear(hidden)
-        return lm.lm_head(hidden)
+        with small_m_qmm.small_m_matmul(self.small_m_ids):
+            if lm.args.tie_word_embeddings:
+                return lm.model.embed_tokens.as_linear(hidden)
+            return lm.lm_head(hidden)
 
     def last_logits(self, hidden: mx.array) -> mx.array:
         """Project only the final hidden position to vocabulary logits.
@@ -410,7 +435,8 @@ class Engine:
         """
         k = int(tokens.shape[1])
         self._gdn_capture_on = bool(self._gdn_layers)
-        h = self.model.language_model.model(tokens, cache=state.cache)
+        with small_m_qmm.small_m_matmul(self.small_m_ids):
+            h = self.model.language_model.model(tokens, cache=state.cache)
         self._gdn_capture_on = False
         state.lengths = [n + k for n in state.lengths]
         self.last_trunk_cache = state.cache
