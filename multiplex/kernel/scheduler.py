@@ -94,10 +94,10 @@ class DynamicDepthController:
         max_depth: int | None,
         *,
         min_depth: int = 1,
-        window: int = 16,
+        window: int = 32,
         min_samples: int = 8,
         up_threshold: float = 0.80,
-        down_threshold: float = 0.50,
+        down_threshold: float = 0.05,
         retry_cooldown: int = 24,
         initial_depth: int | None = None,
     ) -> None:
@@ -205,10 +205,16 @@ class Scheduler:
                  eos_token_ids, k=3, chunk=DEFAULT_PREFILL_CHUNK, prefix_cache="8GiB",
                  prefix_cache_dir=None, output_log_dir=None,
                  output_decode=None, debug=False, log=None,
-                 dynamic_depth=True, dynamic_depth_window=16,
+                 # Tuned on an M3 Max / 27B 4-bit with the small-M verify
+                 # kernel: one more draft costs almost nothing there, so a
+                 # depth pays off even when its full-depth hit rate is ~15%
+                 # (prose at D4). Step down only when nearly every round
+                 # rejects early; a wide window keeps short bad stretches
+                 # from dropping a good depth.
+                 dynamic_depth=True, dynamic_depth_window=32,
                  dynamic_depth_min_samples=8,
                  dynamic_depth_up_threshold=0.80,
-                 dynamic_depth_down_threshold=0.50,
+                 dynamic_depth_down_threshold=0.05,
                  dynamic_depth_retry_cooldown=24,
                  adaptive_verify_start=7,
                  per_row_commit=None):

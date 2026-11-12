@@ -226,10 +226,10 @@ def main() -> int:
         "dynamic_depth_policy": {
             "start_depth": args.depth,
             "min_depth": 1,
-            "window": 16,
+            "window": 32,
             "min_samples": 8,
             "up_threshold": 0.80,
-            "down_threshold": 0.50,
+            "down_threshold": 0.05,
             "retry_cooldown": 24,
         },
         "rows": [],
