@@ -5,8 +5,11 @@ copy of the official DFlash MLX code
 (z-lab/dflash `dflash/model_mlx.py`, MIT License, Copyright (c) 2026 Z Lab),
 kept bit-for-bit; its ``stream_generate`` loop is single-sequence. Below it,
 ``DFlashDrafter`` adapts the model to multiplex's batched scheduler (B>1). Local
-edits to the vendored part are limited to this header and ``load_draft``
-accepting a local directory in addition to a Hugging Face repo id.
+edits to the vendored part are this header, ``load_draft`` (local directory,
+``dflash_config``-nested fields, optional load-time quantization) and DFlash 2
+support: the conv/selector components from ``multiplex/lib/dspark/dflash2.py``
+are wired into the decoder layer and draft model (config-gated; DFlash 1 heads
+run unchanged) and ``DFlashDraftModel.select_greedy`` drafts through the selector.
 
 DFlash drafts a whole block in ONE parallel forward (mask tokens), not the
 AR-chained single-token drafting used by ``kernel/mtp.py``'s ``Drafter``. Its
@@ -35,6 +38,8 @@ from mlx_lm.models.qwen3 import MLP
 from mlx_lm.models.rope_utils import initialize_rope
 from mlx_lm.sample_utils import make_sampler
 from mlx_lm.tokenizer_utils import TokenizerWrapper
+
+from multiplex.lib.dspark.dflash2 import CandidateSelector, DFlashGroupedConv
 
 try:
     import mlx_lm.models.gated_delta as _gd_mod
@@ -66,6 +71,12 @@ class DFlashConfig:
     layer_types: Tuple[str, ...] = field(default_factory=tuple)
     sliding_window: Optional[int] = None
     final_logit_softcapping: Optional[float] = None
+    # DFlash 2 (0 = absent -> DFlash 1, unchanged); see multiplex/lib/dspark/dflash2.py
+    selector_rank: int = 0
+    selector_top_k: int = 0
+    conv_kernel_size: int = 0
+    conv_group_size: int = 16
+    output_multiplier: float = 1.0
 
 
 def _build_rope(
@@ -143,10 +154,21 @@ class DFlashDecoderLayer(nn.Module):
         self.mlp = MLP(config.hidden_size, config.intermediate_size)
         self.input_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = nn.RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.attention_conv = self.mlp_conv = None
+        if config.conv_kernel_size:   # DFlash 2: dynamic conv around each sublayer
+            self.attention_conv = DFlashGroupedConv(
+                config.hidden_size, config.conv_kernel_size, config.conv_group_size)
+            self.mlp_conv = DFlashGroupedConv(
+                config.hidden_size, config.conv_kernel_size, config.conv_group_size)
 
     def __call__(self, x, x_ctx, rope, cache):
-        h = x + self.self_attn(self.input_layernorm(x), x_ctx, rope, cache)
-        return h + self.mlp(self.post_attention_layernorm(h))
+        if self.attention_conv is None:
+            h = x + self.self_attn(self.input_layernorm(x), x_ctx, rope, cache)
+            return h + self.mlp(self.post_attention_layernorm(h))
+        a, out_coeff = self.attention_conv.prepare(self.input_layernorm(x))
+        h = x + self.attention_conv.finish(self.self_attn(a, x_ctx, rope, cache), out_coeff)
+        m, out_coeff = self.mlp_conv.prepare(self.post_attention_layernorm(h))
+        return h + self.mlp_conv.finish(self.mlp(m), out_coeff)
 
 
 class DFlashDraftModel(nn.Module):
@@ -166,6 +188,10 @@ class DFlashDraftModel(nn.Module):
             config.max_position_embeddings,
             config.rope_scaling,
         )
+        self.candidate_selector = (
+            CandidateSelector(config.hidden_size, config.vocab_size,
+                              config.selector_rank, config.selector_top_k)
+            if config.selector_rank else None)
         self.embed_tokens = None
         self.lm_head = None
         self.embed_scale = 1.0
@@ -217,13 +243,35 @@ class DFlashDraftModel(nn.Module):
             logits = mx.tanh(logits / cap) * cap
         return logits
 
+    def select_greedy(self, block, target_hidden, cache, anchor):
+        """DFlash 2 greedy drafting (mlx-dspark ``select_block``): post-norm hidden of
+        the mask slots -> target-head top-K per slot -> selector lattice -> chain-argmax
+        walk from ``anchor`` (a [1] array, so no host sync). Returns ``[1, L-1]`` ids."""
+        sel = self.candidate_selector
+        h = self.embed_tokens(block) * self.embed_scale                       # == __call__
+        h_ctx = self.hidden_norm(self.fc(target_hidden))
+        for layer, c in zip(self.layers, cache):
+            h = layer(h, h_ctx, self.rope, c)
+        hidden = self.norm(h[0, 1:])                                          # [g, H]
+        logits = self.lm_head(hidden)[..., : self.config.vocab_size]          # [g, V]
+        k = sel.top_k
+        candidate_ids = mx.argpartition(logits, kth=-k, axis=-1)[:, -k:].astype(mx.int32)
+        unary = mx.take_along_axis(logits, candidate_ids, axis=-1).astype(mx.float32)
+        if self.config.output_multiplier != 1.0:
+            unary = unary * self.config.output_multiplier
+        if self.config.final_logit_softcapping is not None:
+            cap = self.config.final_logit_softcapping
+            unary = mx.tanh(unary / cap) * cap
+        scores = sel.lattice(candidate_ids, unary, hidden, anchor)
+        return sel.walk_greedy(scores, candidate_ids)[None]
+
 
 def load(model_id: str):
     from mlx_lm import load as mlx_lm_load
     return mlx_lm_load(model_id)
 
 
-def load_draft(draft_id: str) -> DFlashDraftModel:
+def load_draft(draft_id: str, quantize_bits: int = 0) -> DFlashDraftModel:
     # Accept a local directory (multiplex resolves models on disk) or fall back
     # to a Hugging Face repo id (reference behaviour).
     if os.path.isdir(os.path.expanduser(draft_id)):
@@ -231,6 +279,11 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
     else:
         path = Path(snapshot_download(draft_id, allow_patterns=["*.safetensors", "*.json"]))
     cfg = json.loads((path / "config.json").read_text())
+    # DFlash fields live at the top level (early heads) or under dflash_config.
+    dfc = cfg.get("dflash_config", {})
+    if "DFlash2DraftModel" in (cfg.get("architectures") or []) and not (
+            dfc.get("selector_rank") and dfc.get("selector_top_k")):
+        raise ValueError(f"{path}: DFlash2DraftModel without selector_rank/selector_top_k")
     layer_types = tuple(cfg.get("layer_types") or ["full_attention"] * cfg["num_hidden_layers"])
     if len(layer_types) != cfg["num_hidden_layers"]:
         raise ValueError("Draft config layer_types length must match num_hidden_layers.")
@@ -248,16 +301,22 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
         intermediate_size=cfg["intermediate_size"],
         vocab_size=cfg["vocab_size"],
         rms_norm_eps=cfg["rms_norm_eps"],
-        rope_theta=cfg["rope_theta"],
+        rope_theta=cfg["rope_theta"] if "rope_theta" in cfg else cfg["rope_parameters"]["rope_theta"],
         max_position_embeddings=cfg["max_position_embeddings"],
-        block_size=cfg["block_size"],
-        target_layer_ids=tuple(cfg["dflash_config"]["target_layer_ids"]),
+        block_size=dfc["block_size"] if "block_size" in dfc else cfg["block_size"],
+        target_layer_ids=tuple(dfc["target_layer_ids"]),
         num_target_layers=cfg["num_target_layers"],
-        mask_token_id=cfg["dflash_config"]["mask_token_id"],
+        mask_token_id=dfc["mask_token_id"],
         rope_scaling=cfg.get("rope_scaling"),
         layer_types=layer_types,
         sliding_window=cfg.get("sliding_window"),
-        final_logit_softcapping=cfg.get("final_logit_softcapping"),
+        final_logit_softcapping=dfc.get("final_logit_softcapping",
+                                        cfg.get("final_logit_softcapping")),
+        selector_rank=int(dfc.get("selector_rank", 0)),
+        selector_top_k=int(dfc.get("selector_top_k", 0)),
+        conv_kernel_size=int(dfc.get("conv_kernel_size", 0)),
+        conv_group_size=int(dfc.get("conv_group_size", 16)),
+        output_multiplier=float(dfc.get("output_multiplier", 1.0)),
     )
     weights = {k: v for f in path.glob("*.safetensors") for k, v in mx.load(str(f)).items()}
     model = DFlashDraftModel(config)
@@ -266,6 +325,13 @@ def load_draft(draft_id: str) -> DFlashDraftModel:
         nn.quantize(model, group_size=q["group_size"], bits=q["bits"],
                     class_predicate=lambda _p, m: isinstance(m, nn.Linear))
     model.load_weights(list(weights.items()))
+    if not q and quantize_bits:
+        # bf16 checkpoint: quantize the backbone Linears at load (mlx-dspark's default).
+        # DFlash 2's conv/selector projections stay bf16, as in the reference.
+        nn.quantize(model, group_size=64, bits=quantize_bits,
+                    class_predicate=lambda p, m: isinstance(m, nn.Linear)
+                    and "_conv" not in p and "candidate_selector" not in p)
+    mx.eval(model.parameters())
     return model
 
 
@@ -720,6 +786,9 @@ class DFlashDrafter:
             prim = primary[i:i + 1]                                   # [1]
             masks = mx.full((1, k), self.mask_id, dtype=primary.dtype)
             block = mx.concatenate([prim[:, None], masks], axis=1)    # [1, 1+k]
+            if self.model.candidate_selector is not None:
+                outs.append(self.model.select_greedy(block, ctx[i], cache[i], prim))
+                continue
             logits = self.model(block, ctx[i], cache[i], logits_start=1)  # [1,k,V]
             outs.append(mx.argmax(logits, axis=-1))                   # [1, k]
         return mx.concatenate(outs, axis=0)                          # [B, k]
